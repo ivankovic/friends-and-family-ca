@@ -1,0 +1,42 @@
+# This file is part of Friends and Family CA.
+#
+# Copyright (C) 2026 Marko Ivankovic
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+# The enrollment page, as a service for a docker-compose.yml that already runs nginx. Copy it under
+# `services:` and adjust the three marked lines - see packaging/README.md.
+  ffca:
+    build:
+      context: /home/marko/src/friends-and-family-ca      # <- your checkout
+      dockerfile: packaging/docker/Dockerfile
+    image: friends-and-family-ca
+    container_name: ffca                                   # nginx reaches it as http://ffca:8080
+    mem_limit: 128m
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    user: "65534:65534"                                    # <- "Page runs as" on the Nginx tab
+    volumes:
+      - /var/lib/ffca/invites:/invites                     # <- the CA's invites folder; nothing else
+    healthcheck:
+      test: ["CMD", "/ffca", "healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+    networks:
+      - gateway                                            # a network nginx is on

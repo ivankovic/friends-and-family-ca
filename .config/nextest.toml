@@ -1,0 +1,28 @@
+# This file is part of Friends and Family CA.
+#
+# Copyright (C) 2026 Marko Ivankovic
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+# cargo-nextest's settings for this repository.
+
+# The tests that start nginx in a container (tests/nginx.rs). Rootless podman serialises container
+# creation through one database, and eight at once time out waiting for it ("database is locked");
+# two at a time keeps the suite's wall-clock and avoids that.
+[test-groups]
+containers = { max-threads = 2 }
+
+[[profile.default.overrides]]
+filter = "binary(nginx)"
+test-group = "containers"

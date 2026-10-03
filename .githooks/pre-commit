@@ -1,0 +1,97 @@
+#!/bin/bash
+#
+#  This file is part of Friends and Family CA.
+#
+#  Copyright (C) 2026 Marko Ivankovic
+#
+#  This program is free software: you can redistribute it and/or modify
+#  it under the terms of the GNU Affero General Public License as published
+#  by the Free Software Foundation, either version 3 of the License, or
+#  (at your option) any later version.
+#
+#  This program is distributed in the hope that it will be useful,
+#  but WITHOUT ANY WARRANTY; without even the implied warranty of
+#  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+#  GNU Affero General Public License for more details.
+#
+#  You should have received a copy of the GNU Affero General Public License
+#  along with this program. If not, see <https://www.gnu.org/licenses/>.
+#
+# Formats what is being committed (cargo fmt, ruff format).
+#
+# Nothing unstaged is ever staged: a file with further unstaged changes is reported and left
+# alone. rustfmt cannot format one file without the modules it declares, so `cargo fmt --all`
+# runs and any other file it touches is listed, not staged.
+#
+# Enable with `make install-hooks`; skip once with `git commit --no-verify`.
+
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+# Staged files, and the subset of them that carry *no* further unstaged changes - the only files
+# this hook will ever re-stage.
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
+unstaged_too="$(git diff --name-only)"
+safe_to_restage() {
+    local file="$1"
+    ! grep -qxF "$file" <<<"$unstaged_too"
+}
+
+staged_rust="$(grep -E '\.rs$' <<<"$staged" || true)"
+if [ -n "$staged_rust" ]; then
+    # The cheap path: the crate is already formatted, which is almost every commit.
+    if ! cargo fmt --all --check >/dev/null 2>&1; then
+        echo "pre-commit: running cargo fmt --all"
+        before="$(git diff --name-only; git diff --cached --name-only)"
+        cargo fmt --all
+        restaged=()
+        while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            if safe_to_restage "$file" && git diff --quiet -- "$file"; then
+                continue  # untouched by the formatter
+            fi
+            if safe_to_restage "$file"; then
+                git add -- "$file"
+                restaged+=("$file")
+            fi
+        done <<<"$staged_rust"
+        [ ${#restaged[@]} -eq 0 ] || echo "pre-commit: reformatted and staged ${restaged[*]}"
+        # Anything else the formatter reached: not staged by this hook, but say so out loud.
+        collateral="$(git diff --name-only | grep -E '\.rs$' | grep -vxF "$before" || true)"
+        if [ -n "$collateral" ]; then
+            echo "pre-commit: cargo fmt also reformatted files this commit does not stage:" >&2
+            sed 's/^/    /' <<<"$collateral" >&2
+            echo "  (rustfmt formats the modules a file declares; they are left for you to review)" >&2
+        fi
+    fi
+fi
+
+staged_python="$(grep -E '\.py$' <<<"$staged" || true)"
+if [ -n "$staged_python" ]; then
+    if ! command -v ruff >/dev/null 2>&1; then
+        echo "pre-commit: ruff not on PATH - skipping Python formatting (CI still checks it)" >&2
+    else
+        formattable=()
+        skipped=()
+        while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            if safe_to_restage "$file"; then
+                formattable+=("$file")
+            else
+                skipped+=("$file")
+            fi
+        done <<<"$staged_python"
+        if [ ${#formattable[@]} -gt 0 ]; then
+            ruff format --quiet "${formattable[@]}"
+            for file in "${formattable[@]}"; do
+                git diff --quiet -- "$file" || {
+                    git add -- "$file"
+                    echo "pre-commit: reformatted and staged $file"
+                }
+            done
+        fi
+        if [ ${#skipped[@]} -gt 0 ]; then
+            echo "pre-commit: not formatting ${skipped[*]} - staged with further unstaged changes" >&2
+        fi
+    fi
+fi

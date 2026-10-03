@@ -1,0 +1,174 @@
+# This file is part of Friends and Family CA.
+#
+# Copyright (C) 2026 Marko Ivankovic
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Read-only: CI builds and tests, it never writes to the repository.
+permissions:
+  contents: read
+
+# A new push to a pull request supersedes the run for the previous one. Runs on main are never
+# cancelled, so every commit there keeps a complete result.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt --check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - run: cargo fmt --check
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: clippy
+
+      - run: cargo clippy --tests -- -D warnings
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: audit
+
+      - run: cargo install cargo-audit --locked
+
+      # No --ignore flags, and it should stay that way. An advisory that looks pinned by a
+      # dependency is usually held back by this crate's own `rust-version` instead: the
+      # MSRV-aware resolver will not take a fixed release that needs a newer Rust than the one
+      # claimed here. Raise the MSRV, do not ignore.
+      - run: cargo audit
+
+  # The pinned ruff version and rule set (ruff.toml) keep a linter upgrade from turning CI red on a
+  # day nobody touched the Python. scripts/ is the directory `make lint-python` covers.
+  python-lint:
+    name: ruff (scripts/) + third-party notices
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/ruff-action@v3
+        with:
+          version: 0.16.4
+          args: check
+          src: scripts
+
+      - uses: astral-sh/ruff-action@v3
+        with:
+          version: 0.16.4
+          args: format --check
+          src: scripts
+
+      # THIRD-PARTY-NOTICES.md ships beside every binary and LICENSE-COMMERCIAL points at it, so a
+      # dependency change has to reach it; generated from Cargo.lock, so checked against it.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-about
+
+      - name: Third-party notices are in sync with Cargo.lock
+        run: make check-third-party-notices
+
+  # Cargo.toml's `rust-version` is a promise to `cargo install` users on an older toolchain, and
+  # only a build on exactly that toolchain keeps it: a dependency bump can raise the real floor
+  # without any line of this crate changing. The version appears twice below on purpose - the
+  # action needs a literal ref - and the first step fails if it drifts from Cargo.toml.
+  msrv:
+    name: cargo check (MSRV)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: The toolchain below is Cargo.toml's rust-version
+        run: grep -q '^rust-version = "1.90"$' Cargo.toml
+
+      - uses: dtolnay/rust-toolchain@1.90
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv
+
+      - run: cargo check --locked
+
+  # `cargo publish --dry-run` without the upload: packages the crate from `include` and builds it
+  # from its own tarball, so a file the allow-list dropped fails here rather than at publish time,
+  # which cannot be undone.
+  package:
+    name: cargo package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: package
+
+      - run: cargo package --locked
+
+  build-and-test:
+    name: build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: test
+
+      - uses: taiki-e/install-action@nextest
+
+      - name: Build
+        run: cargo build --locked
+
+      # Includes tests/: the real binary under `script`, `openssl` and `curl`, and nginx in a
+      # rootless podman container - all of which ubuntu-latest has.
+      - name: Test
+        run: cargo nextest run --locked

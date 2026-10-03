@@ -1,0 +1,39 @@
+# This file is part of Friends and Family CA.
+#
+# Copyright (C) 2026 Marko Ivankovic
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+# Linting for every Python file in the repository (scripts/), run by `make lint-python`, the
+# pre-push hook, and CI's python-lint job.
+#
+# `select` is pinned explicitly rather than left on ruff's defaults, which move between releases:
+# an unpinned set means a ruff upgrade can turn CI red on a day nobody touched Python. What is
+# listed is ruff's own default core (E4/E7/E9 + pyflakes) plus:
+#
+#   I        import order, so a diff of a script is about its logic, not its imports
+#   UP       syntax that `target-version` below makes available
+#   C4       needless generators/comprehensions
+#   ISC      implicit string concatenation, which silently glues two list elements into one
+#   EXE      a shebang and the executable bit have to agree
+#
+# The two pylint rules are named individually, not as the `PL` family, for the same
+# version-stability reason: `PLR` in particular grows new opinions (magic values, argument counts)
+# that would fail on a ruff upgrade without a line of Python changing.
+target-version = "py312"
+# 100, not ruff's default 88: the width the Rust half of the repository uses (rustfmt's default).
+line-length = 100
+
+[lint]
+select = ["E4", "E7", "E9", "F", "I", "UP", "C4", "ISC", "EXE", "PLR0402", "PLW1510"]

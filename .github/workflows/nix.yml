@@ -1,0 +1,61 @@
+# This file is part of Friends and Family CA.
+#
+# Copyright (C) 2026 Marko Ivankovic
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+# Builds the Nix recipe (flake.nix + packaging/nix/package.nix), the one packaging path that works
+# straight from the repository. Its own workflow rather than a CI job: it runs only when an input
+# of the recipe changes and once a week - the weekly run is what catches nixpkgs moving underneath
+# a lock file nobody touched.
+name: Nix
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - flake.nix
+      - flake.lock
+      - packaging/nix/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/nix.yml
+  pull_request:
+    paths:
+      - flake.nix
+      - flake.lock
+      - packaging/nix/**
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/nix.yml
+  schedule:
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: nix build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: DeterminateSystems/nix-installer-action@v16
+
+      # Evaluates every output for every default system (packages, app, devShell), which is where
+      # a typo in the flake surfaces, without building any of them.
+      - run: nix flake check -L --no-build
+
+      - run: nix build .#ffca -L
+
+      - run: ./result/bin/ffca --version

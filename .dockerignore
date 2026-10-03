@@ -1,0 +1,17 @@
+# What the container build does not need: build output, history, and any CA state folder made in
+# the checkout (its key above all).
+target
+.git
+.claude
+AGENT_LOG.md
+ca.key
+*.key
+*.crt
+ca.crt
+crl.pem
+ledger.toml
+config.toml
+issued
+invites
+*.p12
+*.mobileconfig
