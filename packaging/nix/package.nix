@@ -26,6 +26,9 @@
 {
   lib,
   rustPlatform,
+  makeWrapper,
+  openssl,
+  python3,
   src ? ../..,
   version ? "0.1.0",
 }:
@@ -39,6 +42,21 @@ rustPlatform.buildRustPackage {
 
   # cargo-nextest, as CI and the Makefile run the suite: one process per test.
   useNextest = true;
+
+  # The library's tests only: they check certificates with the `openssl` command and the Apple
+  # profile with Python's plistlib. The end-to-end tests in tests/ start nginx in a container and
+  # the UI under a pseudo-terminal, which the build sandbox cannot.
+  cargoTestFlags = [ "--lib" ];
+  nativeCheckInputs = [
+    openssl
+    python3
+  ];
+
+  # ffca makes the .p12 files with the `openssl` command.
+  nativeBuildInputs = [ makeWrapper ];
+  postInstall = ''
+    wrapProgram $out/bin/ffca --prefix PATH : ${lib.makeBinPath [ openssl ]}
+  '';
 
   meta = {
     description = "A small certificate authority for mutual-TLS client certificates";
