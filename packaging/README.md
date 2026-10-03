@@ -50,7 +50,8 @@ On the **Nginx** tab, press `e`:
 | Page runs as | the page's `uid:gid`; it is given the invites folder | `65534:65534` |
 
 Saving copies the CA's files where nginx reads them and hands `/var/lib/ffca/invites` to the
-page's user. The tab then lists every HTTPS site; nothing has changed in them yet.
+page's user. If nginx runs in a container, mount that folder into it as a folder, not file by
+file: ffca replaces the files, and a file mounted on its own would keep showing the old one. The tab then lists every HTTPS site; nothing has changed in them yet.
 
 A wildcard DNS record and a wildcard certificate cover the enrollment site already. Otherwise,
 add a DNS record for it and get it a certificate before step 5.

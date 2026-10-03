@@ -165,9 +165,16 @@ impl Nginx {
     }
 
     /// Copies the CA's certificate and CRL to where nginx reads them, as a deployment does.
+    ///
+    /// Each file is replaced by a rename, as ffca publishes them, not copied over: nginx 1.27.4 and
+    /// later keep a CRL across a reload when its file looks unchanged (same inode, size and
+    /// modification time), and an empty CRL re-signed within the same second is all three.
     fn publish(&self, ffca: &Ffca) {
-        std::fs::copy(ffca.ca_certificate(), self.config.path().join("ca.crt")).unwrap();
-        std::fs::copy(ffca.crl(), self.config.path().join("crl.pem")).unwrap();
+        for (from, to) in [(ffca.ca_certificate(), "ca.crt"), (ffca.crl(), "crl.pem")] {
+            let staged = self.config.path().join(format!(".{to}.new"));
+            std::fs::copy(from, &staged).unwrap();
+            std::fs::rename(&staged, self.config.path().join(to)).unwrap();
+        }
     }
 
     /// Publishes the CA's files and reloads nginx, then waits until `client` gets `verdict`: a

@@ -483,3 +483,20 @@ fn off_comments_out_only_what_asks_for_a_certificate() {
         Mode::Off
     );
 }
+
+/// nginx keeps a CRL across a reload when its file looks unchanged; a new inode every time is what
+/// makes it read the new one.
+#[test]
+fn every_publish_is_a_new_file_for_nginx_to_notice() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = crate::test_dir();
+    let nginx = settings(dir.path());
+    let ca = ca(dir.path());
+    publish(&nginx, &ca).unwrap();
+    let first = fs::metadata(nginx.ca_files.join(CRL_FILE)).unwrap().ino();
+    publish(&nginx, &ca).unwrap();
+    assert_ne!(
+        fs::metadata(nginx.ca_files.join(CRL_FILE)).unwrap().ino(),
+        first
+    );
+}
