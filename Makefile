@@ -20,15 +20,35 @@
 .PHONY: test build install install-hooks lint-python ci third-party-notices \
 	check-third-party-notices
 
+# Where `make install` puts ffca. `sudo ffca` and the refresh timer the CA tab sets up both run
+# the binary there.
+PREFIX ?= /usr/local
+BINDIR := $(PREFIX)/bin
+
+# Every test, the end-to-end ones included (see CONTRIBUTING.md for what those need).
 test:
-	cargo nextest run
+	@command -v cargo-nextest >/dev/null 2>&1 || { \
+		echo "make test needs cargo-nextest: cargo install cargo-nextest --locked" >&2; \
+		exit 1; \
+	}
+	cargo nextest run --locked
 
+# The release build, from the committed lock file.
 build:
-	cargo build --release
+	cargo build --release --locked
 
-# Installs this working tree, uncommitted changes included, over whatever `ffca` is on PATH.
+# Tests this working tree, builds the release and installs it as $(BINDIR)/ffca - with sudo if
+# that folder is not writable. Nothing is installed if a test fails.
 install:
-	cargo install --path . --force
+	$(MAKE) test
+	$(MAKE) build
+	@if [ -w "$(BINDIR)" ]; then \
+		install -m 0755 target/release/ffca "$(BINDIR)/ffca"; \
+	else \
+		echo "sudo install -m 0755 target/release/ffca $(BINDIR)/ffca"; \
+		sudo install -m 0755 target/release/ffca "$(BINDIR)/ffca"; \
+	fi
+	@echo "Installed $$("$(BINDIR)/ffca" --version) as $(BINDIR)/ffca."
 
 # One-time per clone: makes git use the checked-in .githooks/ (the fast subset of CI).
 install-hooks:
