@@ -21,12 +21,13 @@ The first release.
   retired device or agent is issued nothing more under its name.
 - **Invites.** A new or renewed device gets a one-time link, shown with its QR code, valid for a
   day. It holds the certificate packed for the device - a configuration profile for iPhone and
-  iPad, a `.p12` and its password for Android, Windows, macOS and the browsers - sealed so that
-  only the link opens it. The Invites tab shows each one open, collected (when, and from where),
+  iPad, a `.p12` for Android, Windows, macOS and the browsers, either locked with a password the
+  page shows - sealed so that only the link opens it. The device's key is never written to disk. The Invites tab shows each one open, collected (when, and from where),
   expired or cancelled.
 - **The enrollment page**, `ffca serve`: opening a link shows whose certificate it is, and only
   pressing the button uses the invite up. It runs as nobody with the invites folder and nothing
   else - an image is published on ghcr.io - and keeps invite secrets out of its log and nginx's.
+  It is its own small HTTP server, with every request bounded in time and size.
 - **nginx.** The Nginx tab says where nginx's sites and CA files are and how to test and reload it;
   lists every HTTPS site with its client-certificate mode - off, optional or required - and changes
   it with the lines shown first, `nginx -t`, and the file put back if nginx refuses; and writes the
@@ -36,5 +37,5 @@ The first release.
   days), records collected invites, and revokes the certificates of invites that expired
   uncollected.
 - **The command line**, for scripts: `ffca init`, `issue` (an agent may send its own certificate
-  signing request), `revoke`, `rename`, `list`, `crl-refresh`, `serve`.
+  signing request, for a P-256, P-384, Ed25519 or RSA key), `revoke`, `rename`, `list`, `crl-refresh`, `serve`.
 - **Deployment**: a guide, a Compose service for the enrollment page, and `make install`.
