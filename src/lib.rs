@@ -37,14 +37,21 @@ pub mod tui;
 /// A temporary folder for a test, in memory where the system has `/dev/shm`. [`store::Store`]
 /// syncs every write to disk, which on a busy disk makes a test that issues a few certificates
 /// take a second; on tmpfs a sync costs nothing. It is its owner's alone, as the folder the CA
-/// lives in must be, whatever the umask.
+/// lives in must be, whatever the umask. A `/dev/shm` mounted `noexec` (a container's) is passed
+/// over: some tests run scripts they write there.
 #[cfg(test)]
 pub(crate) fn test_dir() -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
     let shm = std::path::Path::new("/dev/shm");
     let mut builder = tempfile::Builder::new();
     builder.permissions(std::fs::Permissions::from_mode(0o700));
-    if shm.is_dir() {
+    let executable = || {
+        // SAFETY: statvfs fills the zeroed struct it is given from a NUL-terminated path.
+        let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+        let rc = unsafe { libc::statvfs(c"/dev/shm".as_ptr(), &mut stat) };
+        rc == 0 && stat.f_flag & libc::ST_NOEXEC == 0
+    };
+    if shm.is_dir() && executable() {
         builder.tempdir_in(shm).unwrap()
     } else {
         builder.tempdir().unwrap()
