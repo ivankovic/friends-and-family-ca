@@ -163,6 +163,9 @@ impl NginxTab {
         } else if site.mode != Mode::Off && !site.uses_ca {
             note.push_str("  another CA's certificate");
         }
+        if site.any_issuer {
+            note.push_str("  optional_no_ca: any issuer gets in");
+        }
         ListItem::new(Line::from(vec![
             format!(" {:<34}", site.name()).into(),
             format!("{:<22}", site.file_name()).dim(),

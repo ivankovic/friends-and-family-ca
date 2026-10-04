@@ -997,6 +997,13 @@ fn t_sets_up_the_refresh_timer_after_showing_its_units() {
     let mut app = fixture.app(NOW);
     app.systemctl = systemctl.display().to_string();
     app.unit_dir = units.clone();
+    // As `make install` leaves it: the test's own, writable by nobody else.
+    let bin = fixture.out.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(bin.join("ffca"), "").unwrap();
+    std::fs::set_permissions(bin.join("ffca"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    app.binary = bin.join("ffca");
     go_to(&mut app, Tab::Ca);
     key(&mut app, KeyCode::Char('T'));
     let screen = screen(&mut app);

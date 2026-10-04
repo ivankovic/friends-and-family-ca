@@ -421,3 +421,23 @@ fn replacing_a_holder_spares_its_newest_certificate() {
         "{again}"
     );
 }
+
+/// Person "A" with device "B (C" and person "A (B" with device "C" would both be `CN=A (B (C)`.
+#[test]
+fn a_person_or_device_name_cannot_hold_parentheses() {
+    let mut ledger = Ledger::default();
+    for (person, device) in [("A", "B (C"), ("A (B", "C"), ("Anna", "phone)")] {
+        let error = ledger
+            .place_for_issue(Holder::Device { person, device })
+            .unwrap_err();
+        assert!(error.to_string().contains("parentheses"), "{error}");
+    }
+    issue(&mut ledger, anna("phone"));
+    let error = ledger
+        .rename(Target::Person("Anna"), "Anna (mum)")
+        .unwrap_err();
+    assert!(error.to_string().contains("parentheses"), "{error}");
+    ledger
+        .place_for_issue(Holder::Agent("backup (nas)"))
+        .unwrap();
+}

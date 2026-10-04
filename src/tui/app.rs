@@ -97,6 +97,8 @@ pub struct App {
     /// How the UI reaches systemd: replaced in tests.
     pub(crate) systemctl: String,
     pub(crate) unit_dir: PathBuf,
+    /// The binary the timer runs: this one.
+    pub(crate) binary: PathBuf,
     tab: Tab,
     people: People,
     invites: InvitesTab,
@@ -120,6 +122,7 @@ impl App {
             timer: timer::state("systemctl"),
             systemctl: "systemctl".into(),
             unit_dir: timer::UNIT_DIR.into(),
+            binary: timer::this_binary().unwrap_or_default(),
             tab: Tab::People,
             people: People::default(),
             invites: InvitesTab::default(),
@@ -364,9 +367,8 @@ impl App {
             Action::SaveNginxSettings(values) => self.save_nginx_settings(&values),
             Action::AskEnrollmentSite => self.ask_enrollment_site(),
             Action::AskTimer => {
-                let binary = timer::this_binary().unwrap_or_default();
                 let mut lines: Vec<Line> = Vec::new();
-                for (name, text) in timer::units(&binary, self.ca.store().dir()) {
+                for (name, text) in timer::units(&self.binary, self.ca.store().dir()) {
                     lines.push(format!("{}:", self.unit_dir.join(name).display()).into());
                     lines.extend(text.lines().map(|l| Line::from(format!("  {l}")).dim()));
                     lines.push(Line::default());
@@ -388,14 +390,12 @@ impl App {
             }
             Action::InstallTimer => {
                 self.dialog = None;
-                let installed = timer::this_binary().and_then(|binary| {
-                    timer::install(
-                        &self.unit_dir,
-                        &self.systemctl,
-                        &binary,
-                        self.ca.store().dir(),
-                    )
-                });
+                let installed = timer::install(
+                    &self.unit_dir,
+                    &self.systemctl,
+                    &self.binary,
+                    self.ca.store().dir(),
+                );
                 match installed {
                     Ok(()) => self.tell("The refresh timer is set up: hourly.".into()),
                     Err(error) => {
@@ -703,6 +703,12 @@ impl App {
             Ok(tended) => {
                 for holder in &tended.collected {
                     self.tell(format!("{holder} collected their invite."));
+                }
+                if !tended.problems.is_empty() {
+                    self.fail(format!(
+                        "In the invites folder: {}",
+                        tended.problems.join("; ")
+                    ));
                 }
                 if tended.revoked {
                     self.reach_nginx();

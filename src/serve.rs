@@ -42,6 +42,9 @@ use time::{Duration, OffsetDateTime};
 
 use crate::invite::{self, Payload, Unavailable};
 
+/// Requests answered at once; beyond, the page says it is busy.
+const MAX_IN_FLIGHT: usize = 32;
+
 /// How long the files of a collected invite can be downloaded.
 pub const DOWNLOAD_WINDOW: Duration = Duration::minutes(10);
 
@@ -72,13 +75,8 @@ impl Page {
     /// Answers `method` on `path`, for a client described as `client` (its address and device).
     pub fn answer(&mut self, method: &str, path: &str, client: &str, now: OffsetDateTime) -> Reply {
         self.downloads.retain(|_, (_, until)| *until > now);
-        let parts: Vec<&str> = path
-            .split('?')
-            .next()
-            .unwrap_or("")
-            .trim_matches('/')
-            .split('/')
-            .collect();
+        let segments = route(path);
+        let parts: Vec<&str> = segments.iter().map(String::as_str).collect();
         match (method, parts.as_slice()) {
             ("GET", ["healthz"]) => Reply {
                 status: 200,
@@ -86,7 +84,7 @@ impl Page {
                 body: b"ok\n".to_vec(),
                 attachment: None,
             },
-            ("GET", [""]) => html(
+            ("GET", []) => html(
                 200,
                 "Friends and Family CA",
                 "<h1>Friends and Family CA</h1><p>Invites are collected here, by their own links.</p>",
@@ -142,40 +140,59 @@ pub fn run(listen: &str, folder: PathBuf) -> Result<()> {
         "ffca serve: listening on {listen}, invites in {}",
         folder.display()
     );
-    let mut page = Page::new(folder);
-    for mut request in server.incoming_requests() {
-        let method = request.method().as_str().to_owned();
-        let path = request.url().to_owned();
-        let header = |name: &str| {
-            request
-                .headers()
-                .iter()
-                .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
-                .map(|h| h.value.as_str().to_owned())
-        };
-        let address = header("X-Real-IP")
-            .or_else(|| request.remote_addr().map(|a| a.ip().to_string()))
-            .unwrap_or_default();
-        let device = device(&header("User-Agent").unwrap_or_default());
-        // The button's form has no fields; whatever came is read and dropped.
-        let _ = std::io::copy(
-            &mut request.as_reader().take(64 * 1024),
-            &mut std::io::sink(),
-        );
-        let reply = page.answer(
-            &method,
-            &path,
-            &format!("{address}, {device}"),
-            OffsetDateTime::now_utc(),
-        );
-        eprintln!(
-            "{method} {} {} ({address}, {device})",
-            redact(&path),
-            reply.status
-        );
-        let mut response =
-            tiny_http::Response::from_data(reply.body).with_status_code(reply.status);
-        let mut headers = vec![
+    // A thread per request: one that is slow to send its body holds up only itself. Bounded, so
+    // that a flood of them cannot exhaust the container.
+    let page = std::sync::Arc::new(std::sync::Mutex::new(Page::new(folder)));
+    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for request in server.incoming_requests() {
+        use std::sync::atomic::Ordering;
+        if in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            let _ = request.respond(tiny_http::Response::empty(503));
+            continue;
+        }
+        let (page, in_flight) = (page.clone(), in_flight.clone());
+        std::thread::spawn(move || {
+            handle(request, &page);
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+        });
+    }
+    Ok(())
+}
+
+/// Answers one request.
+fn handle(mut request: tiny_http::Request, page: &std::sync::Mutex<Page>) {
+    let method = request.method().as_str().to_owned();
+    let path = request.url().to_owned();
+    let header = |name: &str| {
+        request
+            .headers()
+            .iter()
+            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+            .map(|h| h.value.as_str().to_owned())
+    };
+    let address = header("X-Real-IP")
+        .or_else(|| request.remote_addr().map(|a| a.ip().to_string()))
+        .unwrap_or_default();
+    let device = device(&header("User-Agent").unwrap_or_default());
+    // The button's form has no fields; whatever came is read and dropped.
+    let _ = std::io::copy(
+        &mut request.as_reader().take(64 * 1024),
+        &mut std::io::sink(),
+    );
+    let reply = page.lock().unwrap_or_else(|p| p.into_inner()).answer(
+        &method,
+        &path,
+        &format!("{address}, {device}"),
+        OffsetDateTime::now_utc(),
+    );
+    eprintln!(
+        "{method} {} {} ({address}, {device})",
+        redact(&path),
+        reply.status
+    );
+    let mut response = tiny_http::Response::from_data(reply.body).with_status_code(reply.status);
+    let mut headers = vec![
             ("Content-Type", reply.content_type.to_owned()),
             ("Cache-Control", "no-store".to_owned()),
             ("Referrer-Policy", "no-referrer".to_owned()),
@@ -185,32 +202,92 @@ pub fn run(listen: &str, folder: PathBuf) -> Result<()> {
                 "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'".to_owned(),
             ),
         ];
-        if let Some(name) = reply.attachment {
-            headers.push((
-                "Content-Disposition",
-                format!("attachment; filename=\"{name}\""),
-            ));
-        }
-        for (name, value) in headers {
-            if let Ok(header) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
-                response = response.with_header(header);
-            }
-        }
-        if let Err(error) = request.respond(response) {
-            eprintln!("ffca serve: cannot answer: {error}");
+    if let Some(name) = reply.attachment {
+        headers.push(("Content-Disposition", disposition(&name)));
+    }
+    for (name, value) in headers {
+        if let Ok(header) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
+            response = response.with_header(header);
         }
     }
-    Ok(())
+    if let Err(error) = request.respond(response) {
+        eprintln!("ffca serve: cannot answer: {error}");
+    }
 }
 
-/// A path as the log shows it: tokens and download addresses left out.
-fn redact(path: &str) -> String {
-    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-    match parts.as_slice() {
-        ["i", _] => "/i/…".to_owned(),
-        ["d", _, file] => format!("/d/…/{file}"),
-        _ => path.to_owned(),
+/// A path as the page reads it: without its query, in segments, each percent-decoded - a browser
+/// sends "Čedo" as "%C4%8Cedo" - and empty segments dropped, so `/i/<token>/` is `/i/<token>`.
+fn route(path: &str) -> Vec<String> {
+    path.split('?')
+        .next()
+        .unwrap_or("")
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .map(percent_decode)
+        .collect()
+}
+
+fn percent_decode(segment: &str) -> String {
+    let bytes = segment.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let hex = |b: u8| (b as char).to_digit(16);
+        match (
+            bytes[i],
+            bytes.get(i + 1).copied().and_then(hex),
+            bytes.get(i + 2).copied().and_then(hex),
+        ) {
+            (b'%', Some(high), Some(low)) => {
+                out.push((high * 16 + low) as u8);
+                i += 3;
+            }
+            (byte, _, _) => {
+                out.push(byte);
+                i += 1;
+            }
+        }
     }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A path as the log shows it: from the same segments the page answers by, with tokens and
+/// download addresses left out, and nothing that could forge a log line.
+fn redact(path: &str) -> String {
+    let parts = route(path);
+    let shown = match parts.as_slice() {
+        [i, _] if i == "i" => "/i/…".to_owned(),
+        [d, _, file] if d == "d" => format!("/d/…/{file}"),
+        _ => format!("/{}", parts.join("/")),
+    };
+    shown
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(200)
+        .collect()
+}
+
+/// A `Content-Disposition` for `name`: a plain-ASCII `filename` for old browsers, and the exact
+/// name as `filename*` (RFC 6266).
+fn disposition(name: &str) -> String {
+    let plain: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() && c != '"' && c != '\\' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let exact: String = name
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'.' | b'-' | b'_' => (b as char).to_string(),
+            _ => format!("%{b:02X}"),
+        })
+        .collect();
+    format!("attachment; filename=\"{plain}\"; filename*=UTF-8''{exact}")
 }
 
 /// The kind of device a browser says it runs on.

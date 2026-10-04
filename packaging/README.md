@@ -64,7 +64,8 @@ add a DNS record for it and get it a certificate before step 5.
 
 Add the service in [`compose/ffca.yml`](compose/ffca.yml) to your `docker-compose.yml`, under
 `services:`. Adjust the build context (your checkout), the user (as on the Nginx tab), and the
-network (one that nginx is on). Then:
+network: one nginx is on, and nothing else - a container on the same network could reach the page
+directly, past nginx and its limits. Then:
 
 ```sh
 sudo docker compose up -d --build ffca
@@ -93,7 +94,9 @@ Pressing `w` again later keeps whatever block another tool wrote into the file.
 ## 6. Set up the refresh timer
 
 On the **CA** tab, press `T`. It writes `ffca-crl-refresh.service` and `.timer` to
-`/etc/systemd/system` and enables them. Every hour, the timer re-signs the revocation list (valid
+`/etc/systemd/system` and enables them, naming the `ffca` you are running - which must be the one
+`make install` put in `/usr/local/bin`: the timer runs it as root, so ffca refuses a binary, or a
+folder, that anyone but root could change. Every hour, the timer re-signs the revocation list (valid
 for 30 days), records collected invites, revokes the certificates of invites that expired
 uncollected, and reloads nginx with the result. The CA tab shows whether it runs; so does
 

@@ -462,3 +462,41 @@ fn the_enrollment_page_stops_on_sigterm() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
+
+/// The invites folder is the enrollment page's to write: whatever it leaves there, the CRL is
+/// still signed and handed on, and only then is the trouble reported.
+#[test]
+fn crl_refresh_signs_the_crl_whatever_is_in_the_invites_folder() {
+    let ffca = Ffca::initialised();
+    let number = || {
+        let output = std::process::Command::new("openssl")
+            .args(["crl", "-noout", "-crlnumber", "-in"])
+            .arg(ffca.crl())
+            .output()
+            .unwrap();
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    };
+    // An invite whose receipt the page left damaged.
+    let store = friends_and_family_ca::store::Store::new(&ffca.state);
+    let ca = friends_and_family_ca::ca::Ca::open(&store).unwrap();
+    let folder = friends_and_family_ca::invite::dir(&store);
+    let made = friends_and_family_ca::invite::make(
+        &ca,
+        &folder,
+        friends_and_family_ca::ledger::Holder::Device {
+            person: "Anna",
+            device: "phone",
+        },
+        "k.example.org",
+        time::OffsetDateTime::now_utc(),
+    )
+    .unwrap();
+    let id = friends_and_family_ca::invite::id(made.link.rsplit('/').next().unwrap()).unwrap();
+    std::fs::remove_file(folder.join(format!("{id}.invite"))).unwrap();
+    std::fs::write(folder.join(format!("{id}.collected")), "garbage").unwrap();
+    let before = number();
+    let (code, error) = ffca.fails(&["crl-refresh"]);
+    assert_eq!(code, 1);
+    assert!(error.contains("its receipt is damaged"), "{error}");
+    assert_ne!(number(), before, "the CRL was signed all the same");
+}

@@ -41,7 +41,7 @@ use std::io::ErrorKind;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
@@ -225,11 +225,26 @@ pub struct Tended {
     pub closed: Vec<String>,
     /// Whether it revoked anything, and so signed a new CRL.
     pub revoked: bool,
+    /// What it could not make sense of in the folder, one line each; the rest was still tended.
+    pub problems: Vec<String>,
 }
 
+/// How long a claim - an invite the page is handing over - may take before it counts as
+/// abandoned.
+const CLAIM_GRACE: Duration = Duration::minutes(10);
+/// The most a receipt can be: a time and a line naming an address and a device.
+const RECEIPT_LIMIT: u64 = 4096;
+
 /// Brings the ledger's open invites up to date with the folder; see the module documentation.
+///
+/// The folder is written by the enrollment page, which faces the internet, and this runs as
+/// root, holding the CA's lock: nothing in the folder is followed through a link, read without
+/// a size limit, or allowed to stop the rest. An invite is looked at in the order the page
+/// changes it - the invite file, then the claim, then the receipt - so a collection in progress
+/// is never mistaken for one that never happened.
 pub fn tend(ca: &Ca, folder: &Path, now: OffsetDateTime) -> Result<Tended> {
     let ledger = ca.ledger()?;
+    let present = |path: PathBuf| fs::symlink_metadata(path).is_ok();
     let due = |invite: &Invite| {
         let Some(id) = id(&invite.token) else {
             return true;
@@ -237,10 +252,7 @@ pub fn tend(ca: &Ca, folder: &Path, now: OffsetDateTime) -> Result<Tended> {
         let valid = ledger
             .find(&invite.serial.to_string())
             .is_ok_and(|(_, c)| c.status(now) == Status::Valid);
-        folder.join(format!("{id}.collected")).exists()
-            || !folder.join(format!("{id}.invite")).exists()
-            || now >= invite.expires
-            || !valid
+        !valid || now >= invite.expires || !present(folder.join(format!("{id}.invite")))
     };
     if !ledger
         .invites
@@ -250,7 +262,7 @@ pub fn tend(ca: &Ca, folder: &Path, now: OffsetDateTime) -> Result<Tended> {
         return Ok(Tended::default());
     }
     let mut to_revoke = Vec::new();
-    let tended = ca.change(|ledger| {
+    let mut tended = ca.change(|ledger| {
         let mut tended = Tended::default();
         let valid: Vec<bool> = ledger
             .invites
@@ -265,47 +277,125 @@ pub fn tend(ca: &Ca, folder: &Path, now: OffsetDateTime) -> Result<Tended> {
             if invite.state != InviteState::Open {
                 continue;
             }
-            let id = id(&invite.token).unwrap_or_default();
-            let receipt_file = folder.join(format!("{id}.collected"));
-            if let Ok(text) = fs::read_to_string(&receipt_file) {
-                let receipt: Receipt = serde_json::from_str(&text)
-                    .with_context(|| format!("{} is damaged", receipt_file.display()))?;
-                invite.state = InviteState::Collected;
-                invite.closed = Some(receipt.at);
-                invite.collected_by = Some(receipt.by);
-                tended.collected.push(invite.holder.clone());
-                fs::remove_file(&receipt_file)?;
-                continue;
-            }
-            let file = folder.join(format!("{id}.invite"));
-            let state = if !valid {
-                InviteState::Cancelled
-            } else if now >= invite.expires {
-                InviteState::Expired
-            } else if !file.exists() {
-                InviteState::Cancelled
-            } else {
+            let Some(id) = id(&invite.token) else {
+                tended.problems.push(format!(
+                    "the invite for {} has a damaged token",
+                    invite.holder
+                ));
                 continue;
             };
-            remove_if_there(&file)?;
-            invite.state = state;
-            invite.closed = Some(now);
-            tended.closed.push(invite.holder.clone());
-            if valid {
+            let file = folder.join(format!("{id}.invite"));
+            let mut close = |invite: &mut Invite, state| {
+                invite.state = state;
+                invite.closed = Some(now);
+                tended.closed.push(invite.holder.clone());
+            };
+            if !valid {
+                close(invite, InviteState::Cancelled);
+            } else if present(file.clone()) {
+                if now < invite.expires {
+                    continue;
+                }
+                close(invite, InviteState::Expired);
                 to_revoke.push(invite.serial);
+            } else if claim_age(&folder.join(format!("{id}.claimed")), now)
+                .is_some_and(|age| age < CLAIM_GRACE)
+            {
+                // The page is handing it over this moment; its receipt follows.
+                continue;
+            } else {
+                let receipt_file = folder.join(format!("{id}.collected"));
+                match read_receipt(&receipt_file) {
+                    Ok(Some(receipt)) => {
+                        invite.state = InviteState::Collected;
+                        invite.closed = Some(receipt.at);
+                        invite.collected_by = Some(receipt.by);
+                        tended.collected.push(invite.holder.clone());
+                    }
+                    Ok(None) => {
+                        close(invite, InviteState::Cancelled);
+                        to_revoke.push(invite.serial);
+                    }
+                    Err(problem) => {
+                        tended.problems.push(format!(
+                            "the invite for {}: {problem}; its certificate is revoked",
+                            invite.holder
+                        ));
+                        close(invite, InviteState::Cancelled);
+                        to_revoke.push(invite.serial);
+                    }
+                }
+                if let Err(error) = remove_if_there(&receipt_file) {
+                    tended.problems.push(format!("{error:#}"));
+                }
+            }
+            for leftover in [file, folder.join(format!("{id}.claimed"))] {
+                if invite.state != InviteState::Open
+                    && let Err(error) = remove_if_there(&leftover)
+                {
+                    tended.problems.push(format!("{error:#}"));
+                }
             }
         }
         Ok(tended)
     })?;
-    let mut tended = tended;
     for serial in to_revoke {
-        ca.revoke(Target::Certificate(serial), Reason::Retired, now)?;
-        tended.revoked = true;
+        match ca.revoke(Target::Certificate(serial), Reason::Retired, now) {
+            Ok(_) => tended.revoked = true,
+            Err(error) => tended.problems.push(format!("{error:#}")),
+        }
     }
     Ok(tended)
 }
 
-/// Cancels the open invite for `serial`: its file goes and its certificate is revoked.
+/// How long ago `claim` was made, if there is one.
+fn claim_age(claim: &Path, now: OffsetDateTime) -> Option<Duration> {
+    let modified = fs::symlink_metadata(claim).ok()?.modified().ok()?;
+    Some(now - OffsetDateTime::from(modified))
+}
+
+/// The receipt at `path`, if there is one. Only a small, ordinary file counts: the page could
+/// leave a link, a pipe or a huge file there, and this runs as root, under the CA's lock.
+fn read_receipt(path: &Path) -> std::result::Result<Option<Receipt>, String> {
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("its receipt is not an ordinary file".to_owned()),
+    };
+    let metadata = file.metadata().map_err(|e| e.to_string())?;
+    if !metadata.file_type().is_file() {
+        return Err("its receipt is not an ordinary file".to_owned());
+    }
+    if metadata.len() > RECEIPT_LIMIT {
+        return Err("its receipt is too large".to_owned());
+    }
+    let mut text = String::new();
+    file.take(RECEIPT_LIMIT)
+        .read_to_string(&mut text)
+        .map_err(|_| "its receipt is not text".to_owned())?;
+    let receipt: Receipt =
+        serde_json::from_str(&text).map_err(|_| "its receipt is damaged".to_owned())?;
+    Ok(Some(Receipt {
+        at: receipt.at,
+        by: printable(&receipt.by),
+    }))
+}
+
+/// `text` with control characters dropped and its length capped: what the page sends is shown in
+/// the UI and kept in the ledger.
+fn printable(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).take(300).collect()
+}
+
+/// Cancels the open invite for `serial`: its file goes and its certificate is revoked. If the
+/// invite has been collected meanwhile, nothing is revoked, and that is the error: whoever
+/// collected it holds a valid certificate, which only revoking the device stops.
 pub fn cancel(
     ca: &Ca,
     folder: &Path,
@@ -320,24 +410,65 @@ pub fn cancel(
         .context("that invite is no longer open")?;
     let id = id(&invite.token).context("the invite's token is damaged")?;
     remove_if_there(&folder.join(format!("{id}.invite")))?;
-    tend(ca, folder, now)?;
-    Ok(())
+    // A claim in progress would leave the invite open: let it finish, then look again.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        tend(ca, folder, now)?;
+        let after = ca
+            .ledger()?
+            .invites
+            .into_iter()
+            .find(|i| i.serial == serial);
+        match after.map(|i| (i.state, i.collected_by)) {
+            Some((InviteState::Collected, by)) => bail!(
+                "{} collected the invite already, from {}: if that was not them, revoke the device",
+                invite.holder,
+                by.unwrap_or_else(|| "an unknown place".to_owned())
+            ),
+            Some((InviteState::Open, _)) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            Some((InviteState::Open, _)) => {
+                bail!("the invite is being collected right now; look again in a moment")
+            }
+            _ => return Ok(()),
+        }
+    }
 }
 
-/// Gives the invites folder, and what is in it, to the user the enrollment page runs as,
-/// creating it if needed. Run by the UI when the enrollment settings are saved.
+/// Gives the invites folder, and the ordinary files in it, to the user the enrollment page runs
+/// as, creating it if needed. Run by the UI when the enrollment settings are saved. Each file is
+/// opened without following links and given away through that open file: a link the page left
+/// in its folder hands over nothing.
 pub fn hand_over_folder(folder: &Path, uid: u32, gid: u32) -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     prepare_folder(folder)?;
-    let owned = |path: &Path| fs::metadata(path).is_ok_and(|m| (m.uid(), m.gid()) == (uid, gid));
-    let mut paths = vec![folder.to_owned()];
-    paths.extend(fs::read_dir(folder)?.filter_map(|e| e.ok().map(|e| e.path())));
-    for path in paths.iter().filter(|p| !owned(p)) {
-        std::os::unix::fs::chown(path, Some(uid), Some(gid)).with_context(|| {
+    let give = |file: &fs::File, path: &Path| {
+        std::os::unix::fs::fchown(file, Some(uid), Some(gid)).with_context(|| {
             format!(
                 "cannot give {} to {uid}:{gid}, who the enrollment page runs as; run ffca as root",
                 path.display()
             )
-        })?;
+        })
+    };
+    let directory = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(folder)
+        .with_context(|| format!("{} is not a folder", folder.display()))?;
+    give(&directory, folder)?;
+    for entry in fs::read_dir(folder)?.filter_map(|e| e.ok()) {
+        let path = entry.path();
+        let Ok(file) = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&path)
+        else {
+            continue;
+        };
+        if file.metadata().is_ok_and(|m| m.file_type().is_file()) {
+            give(&file, &path)?;
+        }
     }
     Ok(())
 }
@@ -374,8 +505,14 @@ fn seal(folder: &Path, token: &str, payload: &Payload, expires: OffsetDateTime) 
         sealed: STANDARD.encode(data),
     };
     let name = format!("{id}.invite");
-    Store::new(folder).write(&name, serde_json::to_string(&sealed)?.as_bytes(), PRIVATE)?;
-    hand_to_folder_owner(folder, &folder.join(&name))
+    // The folder's owner - the user the page runs as - owns what is written into it.
+    let owner = fs::symlink_metadata(folder)?;
+    Store::new(folder).write_owned(
+        &name,
+        serde_json::to_string(&sealed)?.as_bytes(),
+        PRIVATE,
+        Some((owner.uid(), owner.gid())),
+    )
 }
 
 fn unseal(text: &str, token: &str, id: &str, now: OffsetDateTime) -> Result<Payload, Unavailable> {
@@ -439,25 +576,6 @@ fn random_token() -> Result<String> {
     let mut bytes = [0u8; 32];
     getrandom::fill(&mut bytes).map_err(|e| anyhow!("no randomness available: {e}"))?;
     Ok(URL_SAFE_NO_PAD.encode(bytes))
-}
-
-/// Gives `file` to whoever owns `folder`: run as root, the UI writes invites that the enrollment
-/// page, running as another user, has to read and delete.
-fn hand_to_folder_owner(folder: &Path, file: &Path) -> Result<()> {
-    let (owner, mine) = (fs::metadata(folder)?, fs::metadata(file)?);
-    if (owner.uid(), owner.gid()) != (mine.uid(), mine.gid()) {
-        std::os::unix::fs::chown(file, Some(owner.uid()), Some(owner.gid())).with_context(
-            || {
-                format!(
-                    "cannot give {} to the owner of {} (uid {}); run ffca as root",
-                    file.display(),
-                    folder.display(),
-                    owner.uid()
-                )
-            },
-        )?;
-    }
-    Ok(())
 }
 
 fn remove_if_there(file: &Path) -> Result<()> {

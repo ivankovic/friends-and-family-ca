@@ -205,3 +205,79 @@ fn devices_are_named_from_their_browsers() {
     );
     assert_eq!(device("curl/8.5.0"), "an unknown device");
 }
+
+/// However a path is written - a trailing slash, a query, percent-encoding - the log never shows
+/// the secret in it, because it reads the path as the page does.
+#[test]
+fn no_way_of_writing_a_path_puts_a_secret_in_the_log() {
+    let token = "lKrtAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANdr8";
+    for path in [
+        format!("/i/{token}"),
+        format!("/i/{token}/"),
+        format!("//i//{token}"),
+        format!("/i/{token}?x=1"),
+        format!("/%69/{token}"),
+    ] {
+        assert_eq!(redact(&path), "/i/…", "{path}");
+    }
+    assert_eq!(redact("/d/secret/anna-phone.p12/"), "/d/…/anna-phone.p12");
+    assert_eq!(
+        redact("/a\u{1b}[31m%0Ab"),
+        "/a[31mb",
+        "nothing that forges a log line"
+    );
+}
+
+/// Browsers percent-encode what is not ASCII: a Croatian name's files still download.
+#[test]
+fn a_name_that_is_not_ascii_still_downloads() {
+    let dir = crate::test_dir();
+    let ca = Ca::create(
+        &Store::new(dir.path().join("state")),
+        "Test",
+        NOW,
+        ca::DEFAULT_CA_VALIDITY,
+    )
+    .unwrap();
+    let folder = dir.path().join("invites");
+    let made = invite::make(
+        &ca,
+        &folder,
+        Holder::Device {
+            person: "Čedo",
+            device: "mobitel",
+        },
+        "k.example.org",
+        NOW,
+    )
+    .unwrap();
+    let token = made.link.rsplit('/').next().unwrap();
+    let mut page = Page::new(folder);
+    let body = text(&page.answer("POST", &format!("/i/{token}/"), "x", NOW));
+    let address = link(&body, "p12");
+    assert!(address.ends_with("/čedo-mobitel.p12"), "{address}");
+    let encoded = address.replace("čedo", "%C4%8Dedo");
+    let reply = page.answer("GET", &encoded, "x", NOW);
+    assert_eq!(reply.status, 200);
+    assert_eq!(
+        disposition(reply.attachment.as_deref().unwrap()),
+        "attachment; filename=\"_edo-mobitel.p12\"; filename*=UTF-8''%C4%8Dedo-mobitel.p12"
+    );
+}
+
+#[test]
+fn percent_decoding_leaves_what_is_not_an_escape() {
+    assert_eq!(percent_decode("a%20b%zz%4"), "a b%zz%4");
+    assert_eq!(route("/i//x/?q=/y"), ["i", "x"]);
+}
+
+#[test]
+fn the_root_says_what_the_site_is() {
+    let dir = crate::test_dir();
+    let mut page = Page::new(dir.path().to_owned());
+    for path in ["/", "", "//", "/?x"] {
+        let reply = page.answer("GET", path, "x", NOW);
+        assert_eq!(reply.status, 200, "{path:?}");
+        assert!(text(&reply).contains("Invites are collected here"));
+    }
+}

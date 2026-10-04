@@ -54,6 +54,7 @@ pub fn units(binary: &Path, state: &Path) -> [(&'static str, String); 2] {
                  Description=Friends and Family CA: re-sign the revocation list, tidy invites, reload nginx\n\n\
                  [Service]\n\
                  Type=oneshot\n\
+                 TimeoutStartSec=15min\n\
                  Environment=FFCA_STATE_DIR={state}\n\
                  ExecStart={binary} crl-refresh\n",
                 state = quote(state),
@@ -79,6 +80,8 @@ pub fn units(binary: &Path, state: &Path) -> [(&'static str, String); 2] {
 /// Writes the units into `unit_dir` and enables the timer with `systemctl` (a command, split at
 /// spaces, so that tests can stand in for it).
 pub fn install(unit_dir: &Path, systemctl: &str, binary: &Path, state: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    check_binary(binary, std::fs::metadata(unit_dir)?.uid())?;
     let store = Store::new(unit_dir);
     for (name, text) in units(binary, state) {
         store.write(name, text.as_bytes(), PUBLIC)?;
@@ -102,6 +105,26 @@ pub fn state(systemctl: &str) -> String {
                 .to_owned()
         }
     }
+}
+
+/// Refuses a binary that anyone but `owner` - root, who owns the unit folder - could change, or
+/// whose folder they could: the timer runs it hourly as root. `sudo ./target/release/ffca` from a
+/// checkout is the case this catches; `make install` puts it in `/usr/local/bin`.
+pub fn check_binary(binary: &Path, owner: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let folder = binary.parent().unwrap_or(Path::new("/"));
+    for path in [binary, folder] {
+        let metadata =
+            std::fs::metadata(path).with_context(|| format!("cannot read {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.uid() == owner && metadata.mode() & 0o022 == 0,
+            "the timer would run {} as root hourly, and {} can be changed by others than root: install ffca \
+             with `make install` and run that one",
+            binary.display(),
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// This binary, as the units should name it.
@@ -131,6 +154,40 @@ mod tests {
         );
     }
 
+    /// A stand-in for the binary, as `make install` leaves it: its owner's, writable by nobody else.
+    pub(crate) fn fake_binary(dir: &Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let folder = dir.join("bin");
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let binary = folder.join("ffca");
+        std::fs::write(&binary, "").unwrap();
+        std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        binary
+    }
+
+    #[test]
+    fn a_binary_others_could_change_is_refused() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = crate::test_dir();
+        let binary = fake_binary(dir.path());
+        let me = std::fs::metadata(&binary).unwrap().uid();
+        check_binary(&binary, me).unwrap();
+        assert!(
+            check_binary(&binary, me + 1)
+                .unwrap_err()
+                .to_string()
+                .contains("can be changed by others")
+        );
+        std::fs::set_permissions(
+            binary.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o775),
+        )
+        .unwrap();
+        let error = check_binary(&binary, me).unwrap_err().to_string();
+        assert!(error.contains("make install"), "{error}");
+    }
+
     #[test]
     fn install_writes_the_units_and_enables_the_timer() {
         let dir = crate::test_dir();
@@ -144,10 +201,11 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let binary = fake_binary(dir.path());
         install(
             dir.path(),
             script.to_str().unwrap(),
-            Path::new("/usr/local/bin/ffca"),
+            &binary,
             Path::new("/var/lib/ffca"),
         )
         .unwrap();

@@ -160,7 +160,8 @@ fn tend_records_a_collected_invite_and_keeps_its_certificate() {
         Tended {
             collected: vec!["Anna (phone)".into()],
             closed: vec![],
-            revoked: false
+            revoked: false,
+            problems: vec![]
         }
     );
     let ledger = ca.ledger().unwrap();
@@ -268,4 +269,171 @@ fn the_folder_is_owner_only() {
         fs::metadata(file).unwrap().permissions().mode() & 0o777,
         0o600
     );
+}
+
+/// The enrollment page writes the folder and could be compromised: what it leaves there is read as
+/// root, under the CA's lock. Each of these is reported and closes its invite - revoking a
+/// certificate nobody can show was handed over - and none stops the rest.
+fn hostile_receipt(make: impl Fn(&Path)) -> (Tended, Status) {
+    let dir = crate::test_dir();
+    let ca = ca(dir.path());
+    let folder = dir.path().join("invites");
+    let made = make_invite(&ca, &folder);
+    let id = id(&token(&made)).unwrap();
+    fs::remove_file(folder.join(format!("{id}.invite"))).unwrap();
+    make(&folder.join(format!("{id}.collected")));
+    let tended = tend(&ca, &folder, NOW).unwrap();
+    (tended, status(&ca, made.invite.serial, NOW))
+}
+
+fn make_invite(ca: &Ca, folder: &Path) -> Made {
+    make(ca, folder, ANNA_PHONE, "k.example.org", NOW).unwrap()
+}
+
+#[test]
+fn a_receipt_that_is_a_link_is_not_followed() {
+    let outside = crate::test_dir();
+    let target = outside.path().join("secret");
+    fs::write(&target, r#"{"at":"2026-10-03T12:00:00Z","by":"x"}"#).unwrap();
+    let (tended, status) =
+        hostile_receipt(|path| std::os::unix::fs::symlink(&target, path).unwrap());
+    assert!(
+        tended.problems[0].contains("not an ordinary file"),
+        "{tended:?}"
+    );
+    assert_eq!(status, Status::Revoked);
+    assert!(
+        target.exists(),
+        "the link is removed, not what it points to"
+    );
+}
+
+#[test]
+fn a_receipt_that_is_a_pipe_does_not_block() {
+    let (tended, status) = hostile_receipt(|path| {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    });
+    assert!(
+        tended.problems[0].contains("not an ordinary file"),
+        "{tended:?}"
+    );
+    assert_eq!(status, Status::Revoked);
+}
+
+#[test]
+fn a_huge_or_damaged_receipt_is_refused() {
+    let (tended, _) = hostile_receipt(|path| fs::write(path, vec![b' '; 1 << 20]).unwrap());
+    assert!(tended.problems[0].contains("too large"), "{tended:?}");
+    let (tended, _) = hostile_receipt(|path| fs::write(path, "garbage").unwrap());
+    assert!(tended.problems[0].contains("damaged"), "{tended:?}");
+}
+
+#[test]
+fn one_bad_receipt_does_not_stop_the_others() {
+    let dir = crate::test_dir();
+    let ca = ca(dir.path());
+    let folder = dir.path().join("invites");
+    let bad = make_invite(&ca, &folder);
+    let good = make(
+        &ca,
+        &folder,
+        Holder::Device {
+            person: "Ben",
+            device: "tablet",
+        },
+        "k.example.org",
+        NOW,
+    )
+    .unwrap();
+    let bad_id = id(&token(&bad)).unwrap();
+    fs::remove_file(folder.join(format!("{bad_id}.invite"))).unwrap();
+    fs::write(folder.join(format!("{bad_id}.collected")), "garbage").unwrap();
+    collect(&folder, &token(&good), NOW, "203.0.113.7, iPad").unwrap();
+    let tended = tend(&ca, &folder, NOW).unwrap();
+    assert_eq!(tended.collected, ["Ben (tablet)"]);
+    assert_eq!(tended.problems.len(), 1);
+}
+
+#[test]
+fn what_the_page_writes_in_a_receipt_is_made_printable() {
+    let dir = crate::test_dir();
+    let ca = ca(dir.path());
+    let folder = dir.path().join("invites");
+    let made = make_invite(&ca, &folder);
+    let id = id(&token(&made)).unwrap();
+    fs::remove_file(folder.join(format!("{id}.invite"))).unwrap();
+    let by = format!("\u{1b}[31mevil\nline{}", "x".repeat(1000));
+    let receipt = Receipt { at: NOW, by };
+    fs::write(
+        folder.join(format!("{id}.collected")),
+        serde_json::to_string(&receipt).unwrap(),
+    )
+    .unwrap();
+    tend(&ca, &folder, NOW).unwrap();
+    let by = ca.ledger().unwrap().invites[0]
+        .collected_by
+        .clone()
+        .unwrap();
+    assert!(!by.chars().any(char::is_control), "{by:?}");
+    assert_eq!(by.chars().count(), 300);
+}
+
+/// The page renames the invite to a claim, writes the receipt, then removes the claim: a tend in
+/// between must not take the invite for one never collected and revoke what is being handed over.
+#[test]
+fn an_invite_being_collected_is_left_alone() {
+    let dir = crate::test_dir();
+    let ca = ca(dir.path());
+    let folder = dir.path().join("invites");
+    let made = make_invite(&ca, &folder);
+    let id = id(&token(&made)).unwrap();
+    fs::rename(
+        folder.join(format!("{id}.invite")),
+        folder.join(format!("{id}.claimed")),
+    )
+    .unwrap();
+    let now = OffsetDateTime::now_utc();
+    assert_eq!(tend(&ca, &folder, now).unwrap(), Tended::default());
+    assert_eq!(invite_state(&ca.ledger().unwrap()), InviteState::Open);
+    // A claim never finished: after a while it counts as abandoned.
+    let tended = tend(&ca, &folder, now + CLAIM_GRACE + Duration::seconds(1)).unwrap();
+    assert_eq!(tended.closed, ["Anna (phone)"]);
+    assert!(!folder.join(format!("{id}.claimed")).exists());
+}
+
+/// Cancelling because a link leaked, just after someone collected it: the certificate they hold
+/// is valid, and saying it was revoked would be the worst answer.
+#[test]
+fn cancelling_a_collected_invite_says_so_instead_of_claiming_a_revocation() {
+    let dir = crate::test_dir();
+    let ca = ca(dir.path());
+    let folder = dir.path().join("invites");
+    let made = make_invite(&ca, &folder);
+    collect(&folder, &token(&made), NOW, "198.51.100.9, Android").unwrap();
+    let error = cancel(&ca, &folder, made.invite.serial, NOW)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("collected the invite already, from 198.51.100.9, Android"),
+        "{error}"
+    );
+    assert!(error.contains("revoke the device"), "{error}");
+    assert_eq!(status(&ca, made.invite.serial, NOW), Status::Valid);
+}
+
+/// Handing the folder over gives away only what is really in it: a link left there by the page
+/// points nowhere it can reach.
+#[test]
+fn handing_the_folder_over_never_follows_a_link() {
+    use std::os::unix::fs::MetadataExt;
+    let dir = crate::test_dir();
+    let folder = dir.path().join("invites");
+    fs::create_dir(&folder).unwrap();
+    // Owned by root: following the link and changing it would fail, and did.
+    std::os::unix::fs::symlink("/etc/passwd", folder.join("x")).unwrap();
+    fs::write(folder.join("an.invite"), "{}").unwrap();
+    let me = fs::metadata(&folder).unwrap();
+    hand_over_folder(&folder, me.uid(), me.gid()).unwrap();
+    assert_eq!(fs::metadata("/etc/passwd").unwrap().uid(), 0);
 }

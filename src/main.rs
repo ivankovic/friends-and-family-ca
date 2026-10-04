@@ -281,12 +281,17 @@ fn main() -> Result<()> {
         }
         Command::CrlRefresh => {
             let ca = Ca::open(&store)?;
-            let tended = invite::tend(&ca, &invite::dir(&store), now)?;
-            for holder in &tended.collected {
-                println!("Recorded the invite collected for {holder}.");
-            }
-            for holder in &tended.closed {
-                println!("Closed the invite for {holder}; its certificate is revoked.");
+            // The CRL comes first in importance: whatever is wrong with the invites folder, which
+            // the enrollment page can write, the CRL is still signed and handed to nginx, and only
+            // then is the trouble reported.
+            let tended = invite::tend(&ca, &invite::dir(&store), now);
+            if let Ok(tended) = &tended {
+                for holder in &tended.collected {
+                    println!("Recorded the invite collected for {holder}.");
+                }
+                for holder in &tended.closed {
+                    println!("Closed the invite for {holder}.");
+                }
             }
             ca.refresh_crl(now)?;
             println!(
@@ -294,6 +299,11 @@ fn main() -> Result<()> {
                 (now + ca::CRL_VALIDITY).date()
             );
             reach_nginx(&store, &ca)?;
+            match tended {
+                Ok(tended) if tended.problems.is_empty() => {}
+                Ok(tended) => bail!("in the invites folder:\n{}", tended.problems.join("\n")),
+                Err(error) => return Err(error.context("the invites were not tidied")),
+            }
         }
     }
     Ok(())

@@ -554,6 +554,7 @@ server {
     # An invite's link carries its secret: these requests are not logged.
     location ~ ^/(i|d)/ {
         access_log off;
+        error_log /dev/null crit;
         proxy_pass $ffca_enrollment;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
@@ -621,4 +622,42 @@ fn a_file_that_is_not_ffcas_is_neither_read_for_blocks_nor_written() {
     let error = write_enrollment_site(&nginx, &ca(dir.path()), &file, &text).unwrap_err();
     assert!(error.to_string().contains("is not ffca's"), "{error}");
     assert_eq!(fs::read_to_string(&file).unwrap(), theirs);
+}
+
+/// A site linked into the folder stays linked, and its file keeps its permissions.
+#[test]
+fn a_linked_site_is_changed_where_the_link_points() {
+    let (dir, nginx) = folder(&[]);
+    let available = dir.path().join("available");
+    fs::create_dir(&available).unwrap();
+    fs::write(available.join("books.conf"), BOOKS).unwrap();
+    fs::set_permissions(
+        available.join("books.conf"),
+        fs::Permissions::from_mode(0o640),
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(available.join("books.conf"), nginx.sites.join("books.conf"))
+        .unwrap();
+    let ca = ca(dir.path());
+    assert!(set_mode(&nginx, &ca, &only_site(&nginx), Mode::Required).unwrap());
+    let link = fs::symlink_metadata(nginx.sites.join("books.conf")).unwrap();
+    assert!(link.file_type().is_symlink(), "still a link");
+    let real = fs::read_to_string(available.join("books.conf")).unwrap();
+    assert!(real.contains("ssl_verify_client on;"), "{real}");
+    assert_eq!(
+        fs::metadata(available.join("books.conf"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o640
+    );
+}
+
+#[test]
+fn optional_no_ca_is_marked_for_what_it_lets_in() {
+    let (_dir, nginx) = folder(&[]);
+    let text = "server {\n    listen 443 ssl;\n    server_name a.example.org;\n    ssl_verify_client optional_no_ca;\n}\n";
+    let site = &sites_in(Path::new("a.conf"), text, &nginx).unwrap()[0];
+    assert_eq!((site.mode, site.any_issuer), (Mode::Optional, true));
 }

@@ -642,6 +642,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "getrandom 0.4.3",
+ "libc",
  "qrcode",
  "ratatui",
  "rcgen",

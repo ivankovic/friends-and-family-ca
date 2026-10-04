@@ -110,17 +110,39 @@ impl Store {
 
     /// Replaces `name` with `contents` atomically, with permissions `mode`.
     pub fn write(&self, name: &str, contents: &[u8], mode: u32) -> Result<()> {
+        self.write_owned(name, contents, mode, None)
+    }
+
+    /// As [`Store::write`], the file given to `owner` (`uid`, `gid`) before it takes its name:
+    /// ownership is set on the open file, never by path, where a link put in its place would
+    /// hand over whatever it points to.
+    ///
+    /// The temporary file has a random name and is created anew (`O_EXCL`), so a link planted in
+    /// the folder can neither be predicted nor followed.
+    pub fn write_owned(
+        &self,
+        name: &str,
+        contents: &[u8],
+        mode: u32,
+        owner: Option<(u32, u32)>,
+    ) -> Result<()> {
         let path = self.path(name);
         let parent = path.parent().unwrap_or(&self.dir);
         let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or(name);
-        let temporary = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+        let mut suffix = [0u8; 8];
+        getrandom::fill(&mut suffix)
+            .map_err(|e| anyhow::anyhow!("no randomness available: {e}"))?;
+        let suffix: String = suffix.iter().map(|b| format!("{b:02x}")).collect();
+        let temporary = parent.join(format!(".{file_name}.{suffix}.tmp"));
         let result = (|| {
             let mut file = OpenOptions::new()
-                .create(true)
-                .truncate(true)
+                .create_new(true)
                 .write(true)
                 .mode(mode)
                 .open(&temporary)?;
+            if let Some((uid, gid)) = owner {
+                std::os::unix::fs::fchown(&file, Some(uid), Some(gid))?;
+            }
             // `mode` above is filtered through the umask; this is not.
             file.set_permissions(fs::Permissions::from_mode(mode))?;
             file.write_all(contents)?;
@@ -212,5 +234,40 @@ mod tests {
             .unwrap();
         drop(first);
         assert_eq!(waiter.join().unwrap(), "written under the first lock");
+    }
+}
+
+#[cfg(test)]
+mod safety {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// A link where the temporary file would go is never followed: the name is random and the
+    /// file is created anew.
+    #[test]
+    fn a_planted_link_is_not_written_through() {
+        let dir = crate::test_dir();
+        let store = Store::new(dir.path());
+        let target = dir.path().join("target");
+        fs::write(&target, "untouched").unwrap();
+        for pid in [std::process::id(), 1, 2] {
+            std::os::unix::fs::symlink(&target, dir.path().join(format!(".file.{pid}.tmp")))
+                .unwrap();
+        }
+        store.write("file", b"written", PRIVATE).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "untouched");
+        assert_eq!(store.read("file").unwrap(), "written");
+    }
+
+    #[test]
+    fn write_owned_sets_the_owner_on_the_file_it_writes() {
+        let dir = crate::test_dir();
+        let store = Store::new(dir.path());
+        let mine = fs::metadata(dir.path()).unwrap();
+        store
+            .write_owned("file", b"x", PRIVATE, Some((mine.uid(), mine.gid())))
+            .unwrap();
+        let written = fs::metadata(store.path("file")).unwrap();
+        assert_eq!((written.uid(), written.gid()), (mine.uid(), mine.gid()));
     }
 }

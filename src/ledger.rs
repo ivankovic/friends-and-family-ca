@@ -292,8 +292,8 @@ impl Ledger {
             Some(place) => place,
             None => match holder {
                 Holder::Device { person, device } => {
-                    let person = checked_name("person", person)?;
-                    let device = checked_name("device", device)?;
+                    let person = checked_holder_name("person", person)?;
+                    let device = checked_holder_name("device", device)?;
                     let p = match self.people.iter().position(|p| same_name(&p.name, person)) {
                         Some(p) => p,
                         None => {
@@ -451,7 +451,7 @@ impl Ledger {
         match target {
             Target::Certificate(_) => bail!("a certificate cannot be renamed; rename its holder"),
             Target::Person(name) => {
-                let new_name = checked_name("person", new_name)?;
+                let new_name = checked_holder_name("person", new_name)?;
                 let p = self
                     .people
                     .iter()
@@ -472,7 +472,7 @@ impl Ledger {
                     .ok_or_else(|| anyhow!("there is no {holder}"))?;
                 let new_name = match place {
                     Place::Device(p, d) => {
-                        let new_name = checked_name("device", new_name)?;
+                        let new_name = checked_holder_name("device", new_name)?;
                         let devices = &self.people[p].devices;
                         let taken = devices
                             .iter()
@@ -537,6 +537,17 @@ fn same_name(a: &str, b: &str) -> bool {
 /// server's logs: trimmed, not empty, short, and free of control characters, which could forge
 /// log lines.
 pub fn checked_name<'a>(what: &str, name: &'a str) -> Result<&'a str> {
+    checked_name_with(what, name, false)
+}
+
+/// As [`checked_name`], for a person or a device, whose names meet in a subject as
+/// `CN=<person> (<device>)`: no parentheses, which would let two holders share one - person
+/// "A" with device "B (C" and person "A (B" with device "C".
+pub fn checked_holder_name<'a>(what: &str, name: &'a str) -> Result<&'a str> {
+    checked_name_with(what, name, true)
+}
+
+fn checked_name_with<'a>(what: &str, name: &'a str, holder: bool) -> Result<&'a str> {
     let name = name.trim();
     ensure!(!name.is_empty(), "the {what} cannot be empty");
     ensure!(
@@ -546,6 +557,10 @@ pub fn checked_name<'a>(what: &str, name: &'a str) -> Result<&'a str> {
     ensure!(
         !name.chars().any(char::is_control),
         "the {what} contains a control character"
+    );
+    ensure!(
+        !holder || !name.contains(['(', ')']),
+        "the {what} cannot contain parentheses: they mark the device in a certificate's name"
     );
     Ok(name)
 }

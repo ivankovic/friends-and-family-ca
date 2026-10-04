@@ -91,7 +91,12 @@ pub fn file_stem(name: &str) -> String {
             stem.push('-');
         }
     }
-    stem.trim_end_matches('-').to_owned()
+    match stem.trim_end_matches('-') {
+        // A name of emoji or punctuation only: an empty stem would make `<out>/.crt`, or worse,
+        // a file beside the folder.
+        "" => "certificate".to_owned(),
+        stem => stem.to_owned(),
+    }
 }
 
 /// Creates a file that must not exist yet: a key is never silently replaced.
@@ -134,6 +139,7 @@ mod tests {
             "ana-marija-iphone-old"
         );
         assert_eq!(file_stem("Čedo ../phone"), "čedo-phone");
+        assert_eq!(file_stem("😀"), "certificate", "never an empty stem");
     }
 
     #[test]

@@ -43,4 +43,6 @@
       retries: 3
     restart: unless-stopped
     networks:
-      - gateway                                            # a network nginx is on
+      - gateway                                            # a network only nginx shares with it:
+                                                           # anything else on it could reach the
+                                                           # page directly, not through nginx

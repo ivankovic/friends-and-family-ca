@@ -18,9 +18,10 @@
 //! nginx: which sites ask for a client certificate, and changing that safely.
 //!
 //! A site is a `server` block that listens with `ssl`, in a `*.conf` file of the folder the
-//! settings name. Its mode is its `ssl_verify_client`: `on` is required; `optional` (and
-//! `optional_no_ca`) let a visitor without a certificate in but still refuse a bad one - revoked,
-//! expired, another CA's - so a lost phone stays out even there.
+//! settings name. Its mode is its `ssl_verify_client`: `on` is required; `optional` lets a visitor
+//! without a certificate in but still refuses a bad one - revoked, expired, another CA's - so a
+//! lost phone stays out even there. ffca never writes `optional_no_ca`, which also lets in a
+//! certificate from any issuer; a site written that way by hand reads as optional, and is marked.
 //!
 //! ffca writes its three lines in a block of its own, inside the `server` block, after its
 //! `server_name`:
@@ -111,6 +112,8 @@ pub struct Site {
     pub mode: Mode,
     /// Whether its `ssl_client_certificate` is this CA's.
     pub uses_ca: bool,
+    /// Whether it says `optional_no_ca`: any issuer's certificate gets in.
+    pub any_issuer: bool,
 }
 
 impl Site {
@@ -190,6 +193,9 @@ fn sites_in(file: &Path, text: &str, nginx: &config::Nginx) -> Result<Vec<Site>>
             uses_ca: directive("ssl_client_certificate")
                 .last()
                 .is_some_and(|d| d.args.first() == Some(&ca_path)),
+            any_issuer: directive("ssl_verify_client")
+                .last()
+                .is_some_and(|d| d.args.first().is_some_and(|v| v == "optional_no_ca")),
         });
     }
     Ok(sites)
@@ -480,6 +486,8 @@ pub fn enrollment_site(
     );
     lines.push("    location ~ ^/(i|d)/ {".to_owned());
     lines.push("        access_log off;".to_owned());
+    // nginx names the request in an error too - the page being down, say.
+    lines.push("        error_log /dev/null crit;".to_owned());
     proxy(&mut lines);
     lines.push("    }".to_owned());
     lines.push("}".to_owned());
@@ -618,12 +626,19 @@ pub fn run(command: &str) -> Result<String> {
 
 /// Writes `text` over `path`, keeping its permissions, through a temporary file and a rename.
 fn replace(path: &Path, text: &str) -> Result<()> {
-    let mode = fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o7777)
-        .unwrap_or(0o644);
-    let dir = path.parent().unwrap_or(Path::new("."));
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    Store::new(dir).write(&name, text.as_bytes(), mode)
+    use std::os::unix::fs::MetadataExt;
+    // A site linked into the folder (`sites-enabled/x -> ../sites-available/x`) is written where
+    // the link points, and stays linked; the file keeps its owner as well as its permissions.
+    let real = fs::canonicalize(path).with_context(|| format!("cannot find {}", path.display()))?;
+    let metadata = fs::metadata(&real)?;
+    let dir = real.parent().unwrap_or(Path::new("."));
+    let name = real.file_name().unwrap_or_default().to_string_lossy();
+    Store::new(dir).write_owned(
+        &name,
+        text.as_bytes(),
+        metadata.permissions().mode() & 0o7777,
+        Some((metadata.uid(), metadata.gid())),
+    )
 }
 
 /// nginx's configuration as statements: a directive ends with `;`, a block is `{ ... }`.
