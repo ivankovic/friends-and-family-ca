@@ -6,9 +6,9 @@ that directory.
 
 ## Branches
 
-- Do not commit to `main`. Work happens on a branch named for it (e.g. `invite-links`); check
-`git branch --show-current` before the first commit of a task.
-- Merging a branch into `main` is Marko's call. Releases are cut from `main`.
+- Until v0.0.1, commit straight to `main` and push: Marko is the only developer. No branches, no
+pull requests.
+- Releases are cut from `main`.
 
 ## Markdown files
 

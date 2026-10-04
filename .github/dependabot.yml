@@ -30,3 +30,7 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # Its refs name Rust toolchains, not releases of the action: `@1.90` is Cargo.toml's
+      # rust-version, which CI's MSRV job checks on purpose, and `@stable` needs no update.
+      - dependency-name: "dtolnay/rust-toolchain"
