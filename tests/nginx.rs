@@ -165,9 +165,16 @@ impl Nginx {
     }
 
     /// Copies the CA's certificate and CRL to where nginx reads them, as a deployment does.
+    ///
+    /// Each file is replaced by a rename, as ffca publishes them, not copied over: nginx 1.27.4 and
+    /// later keep a CRL across a reload when its file looks unchanged (same inode, size and
+    /// modification time), and an empty CRL re-signed within the same second is all three.
     fn publish(&self, ffca: &Ffca) {
-        std::fs::copy(ffca.ca_certificate(), self.config.path().join("ca.crt")).unwrap();
-        std::fs::copy(ffca.crl(), self.config.path().join("crl.pem")).unwrap();
+        for (from, to) in [(ffca.ca_certificate(), "ca.crt"), (ffca.crl(), "crl.pem")] {
+            let staged = self.config.path().join(format!(".{to}.new"));
+            std::fs::copy(from, &staged).unwrap();
+            std::fs::rename(&staged, self.config.path().join(to)).unwrap();
+        }
     }
 
     /// Publishes the CA's files and reloads nginx, then waits until `client` gets `verdict`: a
@@ -409,7 +416,10 @@ fn a_revoked_device_is_refused_once_nginx_reloads_and_the_others_stay_in() {
         "revoke", "--person", "Anna", "--device", "phone", "--reason", "lost",
     ]);
     nginx.reload_until(&ffca, phone, "FAILED:certificate revoked");
-    assert_eq!(nginx.get(phone).0, 400);
+    until(
+        || nginx.get(phone).0 == 400,
+        "the revoked phone is refused by every worker",
+    );
     assert_eq!(nginx.get(laptop).0, 200);
 }
 
@@ -429,7 +439,10 @@ fn an_expired_crl_locks_everyone_out_until_it_is_refreshed() {
 
     ffca.ok(&["crl-refresh"]);
     nginx.reload_until(&ffca, anna, "SUCCESS");
-    assert_eq!(nginx.get(anna).0, 200);
+    until(
+        || nginx.get(anna).0 == 200,
+        "Anna gets in once the CRL is fresh",
+    );
 }
 
 #[test]
@@ -479,6 +492,21 @@ const BOOKS: &str = r#"server {
 "#;
 
 impl Nginx {
+    /// Waits until nginx's verdict on `client` is `verdict`. After a reload, a worker of the old
+    /// configuration can still answer for a moment: one answer of the new kind does not mean every
+    /// next one is.
+    fn until_verdict(&self, client: Client, verdict: &str) {
+        let deadline = Instant::now() + RELOAD_TIMEOUT;
+        loop {
+            let seen = self.verdict(client);
+            if seen == verdict {
+                return;
+            }
+            assert!(Instant::now() < deadline, "still {seen:?}, not {verdict:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
     /// Waits until the site answers `client` with `status`: a reload replaces workers gracefully.
     fn until_status(&self, client: Client, status: u16) {
         let deadline = Instant::now() + RELOAD_TIMEOUT;
@@ -525,17 +553,16 @@ fn ffca_requires_certificates_on_a_site_and_its_revocations_reach_nginx() {
     let site = nginx::survey(&settings).unwrap().sites.remove(0);
     assert!(nginx::set_mode(&settings, &ca, &site, nginx::Mode::Required).unwrap());
     nginx.until_status(Client::Anonymous, 400);
-    assert_eq!(
-        nginx.get(anna),
-        (200, "CN=Anna (phone),OU=people\n".to_owned())
+    until(
+        || nginx.get(anna) == (200, "CN=Anna (phone),OU=people\n".to_owned()),
+        "nginx asks Anna's phone for its certificate and sees who it is",
     );
 
     let printed = ffca.ok(&[
         "revoke", "--person", "Anna", "--device", "phone", "--reason", "lost",
     ]);
     assert!(printed.contains("nginx reloaded with it."), "{printed}");
-    nginx.until_status(anna, 400);
-    assert_eq!(nginx.verdict(anna), "FAILED:certificate revoked");
+    nginx.until_verdict(anna, "FAILED:certificate revoked");
 
     let site = nginx::survey(&settings).unwrap().sites.remove(0);
     assert!(nginx::set_mode(&settings, &ca, &site, nginx::Mode::Off).unwrap());
@@ -702,14 +729,14 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         std::thread::sleep(Duration::from_millis(100));
     };
     assert!(page.contains("A certificate for Anna (phone)"), "{page}");
-    assert_eq!(
-        fetch(&nginx, "https://books.example.test/", &[]).0,
-        400,
-        "the protected site wants a certificate"
+    until(
+        || fetch(&nginx, "https://books.example.test/", &[]).0 == 400,
+        "the protected site wants a certificate",
     );
 
-    // The button.
-    let (status, body) = fetch(&nginx, &made.link, &["-X", "POST"]);
+    // The button. A refusal by nginx itself (a worker from before the enrollment site existed)
+    // never reached the page, so it used nothing up: ask again.
+    let (status, body) = fetch_through(&nginx, &made.link, &["-X", "POST"]);
     assert_eq!(status, 200);
     let page = String::from_utf8(body).unwrap();
     let password = page
@@ -726,7 +753,7 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         .split('"')
         .next()
         .unwrap();
-    let (status, p12) = fetch(&nginx, &format!("https://k.example.test{p12_path}"), &[]);
+    let (status, p12) = fetch_through(&nginx, &format!("https://k.example.test{p12_path}"), &[]);
     assert_eq!(status, 200);
 
     // What a device does with the file and its password.
@@ -752,23 +779,22 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         );
     }
     let (certificate, key) = (dir.join("anna.crt"), dir.join("anna.key"));
-    let (status, body) = fetch(
-        &nginx,
-        "https://books.example.test/",
-        &[
-            "--cert",
-            certificate.to_str().unwrap(),
-            "--key",
-            key.to_str().unwrap(),
-        ],
-    );
-    assert_eq!(
-        (status, String::from_utf8(body).unwrap()),
-        (200, "CN=Anna (phone),OU=people\n".to_owned())
+    let with_certificate = [
+        "--cert",
+        certificate.to_str().unwrap(),
+        "--key",
+        key.to_str().unwrap(),
+    ];
+    until(
+        || {
+            fetch(&nginx, "https://books.example.test/", &with_certificate)
+                == (200, b"CN=Anna (phone),OU=people\n".to_vec())
+        },
+        "Anna gets in with the certificate the invite handed over",
     );
 
     // Used up; and the CA learns who collected it.
-    let (status, body) = fetch(&nginx, &made.link, &["-X", "POST"]);
+    let (status, body) = fetch_through(&nginx, &made.link, &["-X", "POST"]);
     assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
     let printed = ffca.ok(&["crl-refresh"]);
     assert!(
@@ -785,4 +811,27 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         invite.collected_by.as_deref(),
         Some("127.0.0.1, an unknown device")
     );
+}
+
+/// `fetch`, asked again while nginx refuses it with 400 itself: after a reload, a worker of the
+/// old configuration can still answer for a moment, without the site the request is for.
+fn fetch_through(nginx: &Nginx, url: &str, extra: &[&str]) -> (u16, Vec<u8>) {
+    let deadline = Instant::now() + RELOAD_TIMEOUT;
+    loop {
+        let answer = fetch(nginx, url, extra);
+        if answer.0 != 400 || Instant::now() >= deadline {
+            return answer;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+/// Waits until `condition` holds: after a reload, a worker of the old configuration can still
+/// answer for a moment.
+fn until(condition: impl Fn() -> bool, what: &str) {
+    let deadline = Instant::now() + RELOAD_TIMEOUT;
+    while !condition() {
+        assert!(Instant::now() < deadline, "never: {what}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

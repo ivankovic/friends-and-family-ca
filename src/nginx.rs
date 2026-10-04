@@ -520,7 +520,12 @@ fn quote(argument: &str) -> String {
     }
 }
 
-/// Copies the CA's certificate and CRL to where nginx reads them.
+/// Copies the CA's certificate and CRL to where nginx reads them. Each is replaced by a rename -
+/// a new file, never one written over - because nginx 1.27.4 and later keep a CRL across a reload
+/// when its file looks unchanged (same inode, size and modification time): an empty CRL re-signed
+/// within the same second would be all three, and nginx would go on refusing every client with the
+/// expired one. The folder must be mounted into nginx's container as a folder, not file by file,
+/// for a rename to reach it.
 pub fn publish(nginx: &config::Nginx, ca: &Ca) -> Result<()> {
     fs::create_dir_all(&nginx.ca_files)
         .with_context(|| format!("cannot create {}", nginx.ca_files.display()))?;

@@ -20,6 +20,9 @@
 #
 # Build from the repository root:
 #     docker build -f packaging/docker/Dockerfile -t friends-and-family-ca .
+#
+# Run it with an init (Compose's `init: true`, `docker run --init`): as a container's first
+# process, the page would not stop on SIGTERM by itself.
 
 FROM docker.io/library/rust:1-alpine AS build
 RUN apk add --no-cache musl-dev

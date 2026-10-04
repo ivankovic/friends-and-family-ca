@@ -23,6 +23,8 @@
       dockerfile: packaging/docker/Dockerfile
     image: friends-and-family-ca
     container_name: ffca                                   # nginx reaches it as http://ffca:8080
+    init: true                                             # stops at once when told to: the
+                                                           # page is the container's first process
     mem_limit: 128m
     read_only: true
     security_opt:
