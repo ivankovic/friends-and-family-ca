@@ -103,6 +103,39 @@ impl Store {
         Ok(Lock { _file: file })
     }
 
+    /// Refuses the folder if anyone but `owner` could change it, the folder it sits in, or one of
+    /// `files` in it: whoever can change `config.toml` chooses the commands that root runs to test
+    /// and reload nginx, and whoever can change the folder can put another CA in it. What does not
+    /// exist yet is not checked.
+    pub fn check_owner(&self, owner: u32, files: &[&str]) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let parent = self.dir.parent().unwrap_or(Path::new("/"));
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let files = files.iter().map(|name| self.path(name));
+        for path in [parent.to_owned(), self.dir.clone()]
+            .into_iter()
+            .chain(files)
+        {
+            let Ok(metadata) = fs::metadata(&path) else {
+                continue;
+            };
+            anyhow::ensure!(
+                metadata.uid() == owner && metadata.mode() & 0o022 == 0,
+                "{} can be changed by others than {}, and ffca, running as root, takes the \
+                 commands it runs from {}: make it {}'s, writable by no one else",
+                path.display(),
+                if owner == 0 { "root" } else { "its owner" },
+                self.dir.display(),
+                if owner == 0 { "root" } else { "the owner" },
+            );
+        }
+        Ok(())
+    }
+
     pub fn read(&self, name: &str) -> Result<String> {
         let path = self.path(name);
         fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))
@@ -269,5 +302,39 @@ mod safety {
             .unwrap();
         let written = fs::metadata(store.path("file")).unwrap();
         assert_eq!((written.uid(), written.gid()), (mine.uid(), mine.gid()));
+    }
+
+    /// Root runs the commands `config.toml` names: a folder or file others could change is refused.
+    #[test]
+    fn a_folder_others_could_change_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = crate::test_dir();
+        let store = Store::new(dir.path().join("state"));
+        let me = fs::metadata(dir.path()).unwrap().uid();
+        store.check_owner(me, &["config.toml"]).unwrap();
+        store.create_dir().unwrap();
+        store.write("config.toml", b"", PRIVATE).unwrap();
+        store.check_owner(me, &["config.toml"]).unwrap();
+        let error = store.check_owner(me + 1, &["config.toml"]).unwrap_err();
+        assert!(
+            error.to_string().contains("can be changed by others"),
+            "{error}"
+        );
+
+        fs::set_permissions(store.path("config.toml"), fs::Permissions::from_mode(0o666)).unwrap();
+        let error = store.check_owner(me, &["config.toml"]).unwrap_err();
+        assert!(error.to_string().contains("config.toml"), "{error}");
+        fs::set_permissions(store.path("config.toml"), fs::Permissions::from_mode(0o600)).unwrap();
+
+        fs::set_permissions(store.dir(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(store.check_owner(me, &["config.toml"]).is_err());
+        fs::set_permissions(store.dir(), fs::Permissions::from_mode(0o700)).unwrap();
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o1777)).unwrap();
+        assert!(
+            store.check_owner(me, &["config.toml"]).is_err(),
+            "a folder in /tmp could be moved aside and replaced"
+        );
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     }
 }

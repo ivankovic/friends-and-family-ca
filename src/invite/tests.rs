@@ -17,6 +17,8 @@
  */
 use time::macros::datetime;
 
+use std::os::unix::fs::MetadataExt;
+
 use super::*;
 use crate::ledger::Ledger;
 
@@ -388,18 +390,144 @@ fn an_invite_being_collected_is_left_alone() {
     let folder = dir.path().join("invites");
     let made = make_invite(&ca, &folder);
     let id = id(&token(&made)).unwrap();
-    fs::rename(
-        folder.join(format!("{id}.invite")),
-        folder.join(format!("{id}.claimed")),
-    )
-    .unwrap();
-    let now = OffsetDateTime::now_utc();
-    assert_eq!(tend(&ca, &folder, now).unwrap(), Tended::default());
+    let claim = folder.join(format!("{id}.claimed"));
+    // Claimed hours after it was made, as `collect` claims it.
+    let claimed = NOW + Duration::hours(5);
+    fs::rename(folder.join(format!("{id}.invite")), &claim).unwrap();
+    touch(&claim, claimed).unwrap();
+    let ledger_file = ca.store().path(crate::ledger::FILE);
+    let inode = || fs::metadata(&ledger_file).unwrap().ino();
+    let before = inode();
+    assert_eq!(tend(&ca, &folder, claimed).unwrap(), Tended::default());
     assert_eq!(invite_state(&ca.ledger().unwrap()), InviteState::Open);
+    assert_eq!(inode(), before, "nothing changed, so nothing is written");
     // A claim never finished: after a while it counts as abandoned.
-    let tended = tend(&ca, &folder, now + CLAIM_GRACE + Duration::seconds(1)).unwrap();
+    let tended = tend(&ca, &folder, claimed + CLAIM_GRACE + Duration::seconds(1)).unwrap();
     assert_eq!(tended.closed, ["Anna (phone)"]);
-    assert!(!folder.join(format!("{id}.claimed")).exists());
+    assert!(tended.revoked);
+    assert!(!claim.exists());
+}
+
+/// The page sets the claim's time, and could set it far ahead to keep the invite open for ever.
+#[test]
+fn a_claim_from_the_future_counts_as_abandoned() {
+    use std::time::{Duration as StdDuration, SystemTime};
+    for claimed in [
+        SystemTime::from(NOW + Duration::days(365 * 70)),
+        SystemTime::UNIX_EPOCH,
+        SystemTime::UNIX_EPOCH + StdDuration::from_secs(1 << 33),
+    ] {
+        let dir = crate::test_dir();
+        let ca = ca(dir.path());
+        let folder = dir.path().join("invites");
+        let made = make_invite(&ca, &folder);
+        let id = id(&token(&made)).unwrap();
+        let claim = folder.join(format!("{id}.claimed"));
+        fs::rename(folder.join(format!("{id}.invite")), &claim).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&claim)
+            .unwrap()
+            .set_modified(claimed)
+            .unwrap();
+        let tended = tend(&ca, &folder, NOW + Duration::hours(1)).unwrap();
+        assert_eq!(tended.closed, ["Anna (phone)"], "{claimed:?}");
+        assert_eq!(
+            status(&ca, made.invite.serial, NOW + Duration::hours(1)),
+            Status::Revoked
+        );
+    }
+}
+
+/// `collect` claims no expired invite, so a claim kept fresh past the expiry is abandoned too.
+#[test]
+fn a_claim_is_abandoned_once_the_invite_is_long_expired() {
+    let dir = crate::test_dir();
+    let ca = ca(dir.path());
+    let folder = dir.path().join("invites");
+    let made = make_invite(&ca, &folder);
+    let id = id(&token(&made)).unwrap();
+    let claim = folder.join(format!("{id}.claimed"));
+    fs::rename(folder.join(format!("{id}.invite")), &claim).unwrap();
+    let late = made.invite.expires + CLAIM_GRACE;
+    touch(&claim, late).unwrap();
+    let tended = tend(&ca, &folder, late).unwrap();
+    assert_eq!(tended.closed, ["Anna (phone)"]);
+    assert_eq!(status(&ca, made.invite.serial, late), Status::Revoked);
+}
+
+/// Making an invite records it in the ledger before its file is written: a crash in between
+/// leaves an invite without a file, whose certificate - its key was only ever in that file - is
+/// revoked.
+#[test]
+fn an_invite_whose_file_was_never_written_is_cancelled_and_revoked() {
+    let dir = crate::test_dir();
+    let ca = ca(dir.path());
+    let folder = dir.path().join("invites");
+    let made = make_invite(&ca, &folder);
+    fs::remove_file(folder.join(format!("{}.invite", id(&token(&made)).unwrap()))).unwrap();
+    let tended = tend(&ca, &folder, NOW).unwrap();
+    assert_eq!(tended.closed, ["Anna (phone)"]);
+    assert!(tended.revoked);
+    assert_eq!(invite_state(&ca.ledger().unwrap()), InviteState::Cancelled);
+    assert_eq!(status(&ca, made.invite.serial, NOW), Status::Revoked);
+}
+
+/// The CRL cannot be written: cancelling says so, and the revocation, saved with the invite's
+/// closing, reaches the next CRL.
+#[test]
+fn a_cancel_whose_crl_cannot_be_written_fails_and_the_revocation_is_kept() {
+    let dir = crate::test_dir();
+    let ca = ca(dir.path());
+    let folder = dir.path().join("invites");
+    let made = make_invite(&ca, &folder);
+    let crl_path = ca.store().path(ca::CRL_FILE);
+    let crl = fs::read(&crl_path).unwrap();
+    fs::remove_file(&crl_path).unwrap();
+    fs::create_dir_all(crl_path.join("in-the-way")).unwrap();
+    assert!(cancel(&ca, &folder, made.invite.serial, NOW).is_err());
+    assert_eq!(invite_state(&ca.ledger().unwrap()), InviteState::Cancelled);
+    assert_eq!(status(&ca, made.invite.serial, NOW), Status::Revoked);
+
+    fs::remove_dir_all(&crl_path).unwrap();
+    fs::write(&crl_path, crl).unwrap();
+    ca.refresh_crl(NOW).unwrap();
+    let pem = fs::read_to_string(&crl_path).unwrap();
+    let (_, pem) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).unwrap();
+    let (_, parsed) = x509_parser::parse_x509_crl(&pem.contents).unwrap();
+    assert!(
+        parsed
+            .iter_revoked_certificates()
+            .any(|r| r.raw_serial() == made.invite.serial.0.as_slice())
+    );
+}
+
+/// The page reads the invite file for every request: a link, a pipe or a huge file there opens
+/// nothing, and blocks nothing.
+#[test]
+fn an_invite_file_that_is_not_an_ordinary_small_file_is_gone() {
+    let dir = crate::test_dir();
+    let ca = ca(dir.path());
+    let folder = dir.path().join("invites");
+    let made = make_invite(&ca, &folder);
+    let token = token(&made);
+    let file = folder.join(format!("{}.invite", id(&token).unwrap()));
+    let sealed = fs::read(&file).unwrap();
+    let elsewhere = dir.path().join("elsewhere");
+    fs::write(&elsewhere, &sealed).unwrap();
+    fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &file).unwrap();
+    assert_eq!(open(&folder, &token, NOW), Err(Unavailable::Gone));
+    assert_eq!(collect(&folder, &token, NOW, "x"), Err(Unavailable::Gone));
+    fs::remove_file(&file).unwrap();
+    let path = std::ffi::CString::new(file.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    assert_eq!(open(&folder, &token, NOW), Err(Unavailable::Gone));
+    fs::remove_file(&file).unwrap();
+    fs::write(&file, vec![b' '; 1 << 20]).unwrap();
+    assert_eq!(open(&folder, &token, NOW), Err(Unavailable::Gone));
+    fs::write(&file, sealed).unwrap();
+    assert!(open(&folder, &token, NOW).is_ok());
 }
 
 /// Cancelling because a link leaked, just after someone collected it: the certificate they hold
@@ -422,11 +550,44 @@ fn cancelling_a_collected_invite_says_so_instead_of_claiming_a_revocation() {
     assert_eq!(status(&ca, made.invite.serial, NOW), Status::Valid);
 }
 
+/// A second link to a file outside the folder - with `fs.protected_hardlinks` off, the page could
+/// make one to any file - is not handed over: root would give that file away.
+#[test]
+fn handing_the_folder_over_skips_files_linked_from_elsewhere() {
+    use std::os::unix::fs::MetadataExt;
+    let mut groups = [0; 64];
+    let count = unsafe { libc::getgroups(64, groups.as_mut_ptr()) };
+    let mine = unsafe { libc::getegid() };
+    let Some(&other) = groups[..count.max(0) as usize].iter().find(|&&g| g != mine) else {
+        eprintln!("skipped: this user is in one group only");
+        return;
+    };
+    let dir = crate::test_dir();
+    let folder = dir.path().join("invites");
+    fs::create_dir(&folder).unwrap();
+    let outside = dir.path().join("outside");
+    fs::write(&outside, "").unwrap();
+    let id = "ab".repeat(32);
+    fs::hard_link(&outside, folder.join(format!("{id}.collected"))).unwrap();
+    fs::write(folder.join(format!("{id}.invite")), "{}").unwrap();
+    fs::write(folder.join("unrelated"), "").unwrap();
+    let me = fs::metadata(&folder).unwrap().uid();
+    hand_over_folder(&folder, me, other).unwrap();
+    assert_eq!(fs::metadata(&folder).unwrap().gid(), other);
+    assert_eq!(
+        fs::metadata(folder.join(format!("{id}.invite")))
+            .unwrap()
+            .gid(),
+        other
+    );
+    assert_eq!(fs::metadata(&outside).unwrap().gid(), mine);
+    assert_eq!(fs::metadata(folder.join("unrelated")).unwrap().gid(), mine);
+}
+
 /// Handing the folder over gives away only what is really in it: a link left there by the page
 /// points nowhere it can reach.
 #[test]
 fn handing_the_folder_over_never_follows_a_link() {
-    use std::os::unix::fs::MetadataExt;
     let dir = crate::test_dir();
     let folder = dir.path().join("invites");
     fs::create_dir(&folder).unwrap();

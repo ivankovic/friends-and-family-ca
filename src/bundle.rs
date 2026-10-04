@@ -24,9 +24,10 @@
 //!   its key only: a CA certificate in the file would be installed as a trusted authority on
 //!   Android, which this CA has no business being.
 //! * An Apple configuration profile (`.mobileconfig`) for iPhone and iPad, which carries the same
-//!   file and its password, so installing it asks for nothing but a confirmation. Its identifier
-//!   is the CA's and the device's, so a renewed profile replaces the one before it. It is not
-//!   signed: iOS shows it as "unverified", which is accurate.
+//!   file but not its password: iOS asks for the password while it installs the profile, and the
+//!   profile, which lands in Downloads, iCloud or a forwarded mail, is then no more use than the
+//!   `.p12` to whoever finds it. Its identifier is the CA's and the device's, so a renewed profile
+//!   replaces the one before it. It is not signed: iOS shows it as "unverified", which is accurate.
 
 use std::fmt::Write as _;
 use std::process::Command;
@@ -63,14 +64,7 @@ pub fn make(ca: &Ca, issued: &Issued, stem: &str) -> Result<Bundle> {
         identifier_part(ca.name()),
         identifier_part(stem)
     );
-    let mobileconfig = mobileconfig(
-        ca.name(),
-        &issued.holder,
-        stem,
-        &identifier,
-        &password,
-        &p12,
-    )?;
+    let mobileconfig = mobileconfig(ca.name(), &issued.holder, stem, &identifier, &p12)?;
     Ok(Bundle {
         holder: issued.holder.clone(),
         stem: stem.to_owned(),
@@ -97,19 +91,13 @@ fn password() -> Result<String> {
     Ok(password)
 }
 
+/// Runs `openssl pkcs12 -export` with the key and certificate on its input and the file on its
+/// output: the key never touches a disk, where anyone who can read `/tmp` could take it.
 fn pkcs12(certificate: &str, key: &str, name: &str, password: &str) -> Result<Vec<u8>> {
-    let dir = tempfile::tempdir().context("cannot make a temporary folder")?;
-    let key_file = dir.path().join("key.pem");
-    let certificate_file = dir.path().join("certificate.pem");
-    let out = dir.path().join("bundle.p12");
-    std::fs::write(&key_file, key)?;
-    std::fs::write(&certificate_file, certificate)?;
-    let output = Command::new("openssl")
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new("openssl")
         .args(["pkcs12", "-export"])
-        .arg("-inkey")
-        .arg(&key_file)
-        .arg("-in")
-        .arg(&certificate_file)
         .args(["-name", name])
         .args([
             "-certpbe",
@@ -123,17 +111,25 @@ fn pkcs12(certificate: &str, key: &str, name: &str, password: &str) -> Result<Ve
         // other users can read in the process list.
         .args(["-passout", "env:FFCA_P12_PASSWORD"])
         .env("FFCA_P12_PASSWORD", password)
-        .arg("-out")
-        .arg(&out)
-        .output()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .context("cannot run `openssl`, which makes the .p12 files")?;
-    if !output.status.success() {
+    // A few kilobytes, which the pipe takes whole before openssl reads them.
+    let written = child
+        .stdin
+        .take()
+        .context("openssl's input")?
+        .write_all(format!("{key}{certificate}").as_bytes());
+    let output = child.wait_with_output()?;
+    if !output.status.success() || written.is_err() || output.stdout.is_empty() {
         bail!(
             "openssl pkcs12 failed:\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
     }
-    Ok(std::fs::read(&out)?)
+    Ok(output.stdout)
 }
 
 fn mobileconfig(
@@ -141,7 +137,6 @@ fn mobileconfig(
     holder: &str,
     stem: &str,
     identifier: &str,
-    password: &str,
     p12: &[u8],
 ) -> Result<Vec<u8>> {
     let data = STANDARD.encode(p12);
@@ -170,8 +165,6 @@ fn mobileconfig(
             <string>{holder}</string>
             <key>PayloadCertificateFileName</key>
             <string>{stem}.p12</string>
-            <key>Password</key>
-            <string>{password}</string>
             <key>PayloadContent</key>
             <data>
 {wrapped}            </data>
@@ -201,7 +194,6 @@ fn mobileconfig(
         profile_uuid = uuid()?,
         holder = x(holder),
         stem = x(stem),
-        password = x(password),
         ca = x(ca),
     );
     Ok(profile.into_bytes())
