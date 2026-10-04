@@ -845,8 +845,15 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
     // answered, nor from those the bot filter turned away before nginx chose a location - as it
     // turns away chat apps fetching a link to preview it.
     let download = format!("https://k.example.test{p12_path}");
-    assert_eq!(fetch(&nginx, &made.link, &["-A", "BadBot"]).0, 403);
-    assert_eq!(fetch(&nginx, &download, &["-A", "BadBot"]).0, 403);
+    // Until the workers from before the reload are gone, one may answer without the filter.
+    until(
+        || fetch(&nginx, &made.link, &["-A", "BadBot"]).0 == 403,
+        "the bot filter turns away a bot fetching the invite",
+    );
+    until(
+        || fetch(&nginx, &download, &["-A", "BadBot"]).0 == 403,
+        "the bot filter turns away a bot fetching the download",
+    );
     let log = || {
         let output = Command::new(&nginx.engine)
             .args(["exec", &nginx.container, "cat", "/tmp/access.log"])
