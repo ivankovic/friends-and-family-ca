@@ -734,8 +734,9 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         "the protected site wants a certificate",
     );
 
-    // The button.
-    let (status, body) = fetch(&nginx, &made.link, &["-X", "POST"]);
+    // The button. A refusal by nginx itself (a worker from before the enrollment site existed)
+    // never reached the page, so it used nothing up: ask again.
+    let (status, body) = fetch_through(&nginx, &made.link, &["-X", "POST"]);
     assert_eq!(status, 200);
     let page = String::from_utf8(body).unwrap();
     let password = page
@@ -752,7 +753,7 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         .split('"')
         .next()
         .unwrap();
-    let (status, p12) = fetch(&nginx, &format!("https://k.example.test{p12_path}"), &[]);
+    let (status, p12) = fetch_through(&nginx, &format!("https://k.example.test{p12_path}"), &[]);
     assert_eq!(status, 200);
 
     // What a device does with the file and its password.
@@ -793,7 +794,7 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
     );
 
     // Used up; and the CA learns who collected it.
-    let (status, body) = fetch(&nginx, &made.link, &["-X", "POST"]);
+    let (status, body) = fetch_through(&nginx, &made.link, &["-X", "POST"]);
     assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
     let printed = ffca.ok(&["crl-refresh"]);
     assert!(
@@ -810,6 +811,19 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         invite.collected_by.as_deref(),
         Some("127.0.0.1, an unknown device")
     );
+}
+
+/// `fetch`, asked again while nginx refuses it with 400 itself: after a reload, a worker of the
+/// old configuration can still answer for a moment, without the site the request is for.
+fn fetch_through(nginx: &Nginx, url: &str, extra: &[&str]) -> (u16, Vec<u8>) {
+    let deadline = Instant::now() + RELOAD_TIMEOUT;
+    loop {
+        let answer = fetch(nginx, url, extra);
+        if answer.0 != 400 || Instant::now() >= deadline {
+            return answer;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// Waits until `condition` holds: after a reload, a worker of the old configuration can still
