@@ -147,7 +147,7 @@ fn plist(dir: &std::path::Path, profile: &[u8], expression: &str) -> String {
 }
 
 #[test]
-fn the_profile_carries_the_p12_and_its_password_for_ios() {
+fn the_profile_carries_the_p12_but_not_its_password_for_ios() {
     let dir = crate::test_dir();
     let (ca, issued) = issued(dir.path(), "Anna", "phone");
     let bundle = make(&ca, &issued, "anna-phone").unwrap();
@@ -164,9 +164,14 @@ fn the_profile_carries_the_p12_and_its_password_for_ios() {
         plist(
             dir.path(),
             &bundle.mobileconfig,
-            &format!("{payload}['Password']")
+            &format!("'Password' in {payload}")
         ),
-        bundle.password
+        "False",
+        "iOS asks for it while installing"
+    );
+    assert!(
+        !String::from_utf8_lossy(&bundle.mobileconfig).contains(&bundle.password),
+        "the profile alone is no use to whoever finds it"
     );
     assert_eq!(
         plist(

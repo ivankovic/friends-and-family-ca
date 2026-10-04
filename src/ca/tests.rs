@@ -31,6 +31,8 @@ use webpki::{
 
 use super::*;
 
+mod requests;
+
 const NOW: OffsetDateTime = datetime!(2026-10-03 12:00 UTC);
 
 fn device<'a>(person: &'a str, device: &'a str) -> Holder<'a> {
@@ -863,4 +865,283 @@ fn a_subject_escapes_what_rfc_4514_reserves() {
         "CN=Anna\\, the elder (#1 phone),OU=people"
     );
     assert_eq!(rfc4514_escape("#a b "), "\\#a b\\ ");
+}
+
+/// nginx's `$ssl_client_s_dn` is OpenSSL's RFC 2253 form, which writes each byte beyond ASCII as
+/// `\XX`: the UI shows the same text, so a `map` copied from it matches.
+#[test]
+fn a_subject_reads_as_nginx_shows_it() {
+    let dir = crate::test_dir();
+    let ca = new_ca(dir.path());
+    let issued = ca
+        .issue(
+            device("Željko", "telefon, \"novi\""),
+            Key::Generate,
+            NOW,
+            DEFAULT_CLIENT_VALIDITY,
+        )
+        .unwrap();
+    let path = dir.path().join("client.crt");
+    std::fs::write(&path, &issued.certificate_pem).unwrap();
+    let output = Command::new("openssl")
+        .args(["x509", "-noout", "-subject", "-nameopt", "RFC2253", "-in"])
+        .arg(&path)
+        .output()
+        .expect("these tests need the `openssl` command");
+    let printed = String::from_utf8(output.stdout).unwrap();
+    let subject = ca.subject(issued.certificate.serial).unwrap();
+    assert_eq!(printed.trim_end(), format!("subject={subject}"));
+    assert_eq!(
+        subject,
+        "CN=\\C5\\BDeljko (telefon\\, \\\"novi\\\"),OU=people"
+    );
+}
+
+/// A crash after the ledger is saved and before the CRL is written must not lose the revocation,
+/// nor sign two different CRLs with one number.
+#[test]
+fn a_revocation_whose_crl_was_never_written_reaches_the_next_one() {
+    let dir = crate::test_dir();
+    let ca = new_ca(dir.path());
+    let lost = ca
+        .issue(
+            device("Anna", "phone"),
+            Key::Generate,
+            NOW,
+            DEFAULT_CLIENT_VALIDITY,
+        )
+        .unwrap();
+    let before = crl(&ca);
+    // A folder in the CRL's place: the CRL cannot be written.
+    let crl_path = ca.store().path(CRL_FILE);
+    std::fs::remove_file(&crl_path).unwrap();
+    std::fs::create_dir_all(crl_path.join("in-the-way")).unwrap();
+    assert!(
+        ca.revoke(
+            Target::Certificate(lost.certificate.serial),
+            Reason::Lost,
+            NOW
+        )
+        .is_err()
+    );
+    std::fs::remove_dir_all(&crl_path).unwrap();
+    std::fs::write(&crl_path, &before).unwrap();
+    assert_eq!(ca.ledger().unwrap().crl_number, 2, "the number is spent");
+
+    ca.refresh_crl(NOW).unwrap();
+    assert_eq!(ca.crl_status().unwrap().number, 3);
+    assert_eq!(
+        verify(&ca, &lost.certificate_pem, Some(&crl(&ca)), NOW),
+        Err(webpki::Error::CertRevoked)
+    );
+}
+
+/// A ledger behind the CRL on disk - restored from a backup, or edited by hand - still never
+/// signs a number that CRL used.
+#[test]
+fn the_next_crl_number_passes_the_one_on_disk() {
+    let dir = crate::test_dir();
+    let ca = new_ca(dir.path());
+    for _ in 0..4 {
+        ca.refresh_crl(NOW).unwrap();
+    }
+    assert_eq!(ca.crl_status().unwrap().number, 5);
+    ca.change(|ledger| {
+        ledger.crl_number = 2;
+        Ok(())
+    })
+    .unwrap();
+    ca.refresh_crl(NOW).unwrap();
+    assert_eq!(ca.crl_status().unwrap().number, 6);
+    assert_eq!(ca.ledger().unwrap().crl_number, 6);
+}
+
+#[test]
+fn the_crl_is_valid_from_a_little_before_now() {
+    let dir = crate::test_dir();
+    let ca = new_ca(dir.path());
+    let der = der(&crl(&ca));
+    let (_, parsed) = x509_parser::parse_x509_crl(&der).unwrap();
+    assert_eq!(parsed.last_update().to_datetime(), NOW - BACKDATE);
+    assert_eq!(
+        parsed.next_update().unwrap().to_datetime(),
+        NOW + CRL_VALIDITY
+    );
+}
+
+/// Should the CA's certificate ever land among a system's trusted authorities, it vouches for
+/// no server.
+#[test]
+fn the_ca_vouches_for_clients_only() {
+    let now = OffsetDateTime::now_utc();
+    let dir = crate::test_dir();
+    let ca = Ca::create(
+        &Store::new(dir.path()),
+        "Test family",
+        now,
+        DEFAULT_CA_VALIDITY,
+    )
+    .unwrap();
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).unwrap();
+    let mut params = CertificateParams::new(vec!["bank.example".to_owned()]).unwrap();
+    params.not_before = now - BACKDATE;
+    params.not_after = now + Duration::days(30);
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let server = params.signed_by(&key, &ca.issuer().unwrap()).unwrap();
+    let client = ca
+        .issue(
+            device("Anna", "phone"),
+            Key::Generate,
+            now,
+            DEFAULT_CLIENT_VALIDITY,
+        )
+        .unwrap();
+    let openssl_verify = |certificate: &str, purpose: &str| {
+        let path = dir.path().join("leaf.crt");
+        std::fs::write(&path, certificate).unwrap();
+        let output = Command::new("openssl")
+            .arg("verify")
+            .arg("-CAfile")
+            .arg(ca.store().path(CERTIFICATE_FILE))
+            .args(["-purpose", purpose])
+            .arg(&path)
+            .output()
+            .expect("these tests need the `openssl` command");
+        (
+            output.status.success(),
+            String::from_utf8_lossy(&output.stdout).into_owned()
+                + &String::from_utf8_lossy(&output.stderr),
+        )
+    };
+    let (ok, output) = openssl_verify(&server.pem(), "sslserver");
+    // Depth 1 is the CA: its own purpose is what refuses the server.
+    assert!(
+        !ok && output.contains("at 1 depth lookup: unsuitable certificate purpose"),
+        "{output}"
+    );
+    let (ok, output) = openssl_verify(&client.certificate_pem, "sslclient");
+    assert!(ok, "{output}");
+}
+
+/// A request made by `openssl req` with `newkey` and signed with `digest`, if any.
+fn openssl_request(dir: &Path, newkey: &[&str], digest: Option<&str>) -> String {
+    let key = dir.join("agent.key");
+    let request = dir.join("agent.csr");
+    let output = Command::new("openssl")
+        .args(["req", "-new", "-nodes", "-subj", "/CN=backup", "-newkey"])
+        .args(newkey)
+        .args(digest)
+        .arg("-keyout")
+        .arg(&key)
+        .arg("-out")
+        .arg(&request)
+        .output()
+        .expect("these tests need the `openssl` command");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    std::fs::read_to_string(&request).unwrap()
+}
+
+/// A request given as text, or made by `openssl req` with `newkey` and signed with `digest`.
+enum Request {
+    /// RSA keys take long to generate, so these are made once and kept with the tests.
+    Kept(&'static str),
+    Made(&'static [&'static str], Option<&'static str>),
+}
+
+#[test]
+fn a_signing_request_must_carry_a_strong_key_nginx_takes() {
+    let dir = crate::test_dir();
+    let ca = new_ca(dir.path());
+    let request = |request: &Request| match request {
+        Request::Kept(text) => (*text).to_owned(),
+        Request::Made(newkey, digest) => openssl_request(dir.path(), newkey, *digest),
+    };
+    let accepted = [
+        (
+            "P-256",
+            Request::Made(&["ec", "-pkeyopt", "ec_paramgen_curve:P-256"], None),
+        ),
+        (
+            "P-384",
+            Request::Made(
+                &["ec", "-pkeyopt", "ec_paramgen_curve:P-384"],
+                Some("-sha384"),
+            ),
+        ),
+        ("RSA-2048", Request::Kept(requests::RSA_2048)),
+        ("Ed25519", Request::Made(&["ed25519"], None)),
+    ];
+    for (i, (kind, made)) in accepted.iter().enumerate() {
+        let name = format!("agent{i}");
+        let issued = ca
+            .issue(
+                Holder::Agent(&name),
+                Key::Request(&request(made)),
+                NOW,
+                DEFAULT_CLIENT_VALIDITY,
+            )
+            .unwrap_or_else(|e| panic!("{kind}: {e:#}"));
+        let der = der(&issued.certificate_pem);
+        let (_, certificate) = x509_parser::parse_x509_certificate(&der).unwrap();
+        assert!(certificate.public_key().parsed().is_ok(), "{kind}");
+    }
+    let refused = [
+        ("RSA-1024", Request::Kept(requests::RSA_1024)),
+        (
+            "P-521",
+            Request::Made(&["ec", "-pkeyopt", "ec_paramgen_curve:P-521"], None),
+        ),
+        (
+            "secp256k1",
+            Request::Made(&["ec", "-pkeyopt", "ec_paramgen_curve:secp256k1"], None),
+        ),
+    ];
+    for (kind, made) in &refused {
+        let error = ca
+            .issue(
+                Holder::Agent("refused"),
+                Key::Request(&request(made)),
+                NOW,
+                DEFAULT_CLIENT_VALIDITY,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{kind} was signed"));
+        assert!(
+            format!("{error:#}").contains("key is not one the CA signs"),
+            "{kind}: {error:#}"
+        );
+    }
+    assert_eq!(ca.ledger().unwrap().certificates().count(), 4);
+}
+
+/// rcgen takes a request's key algorithm from its signature: a P-256 key signed with SHA-384
+/// would come out as a certificate with a key nobody can read.
+#[test]
+fn a_signing_request_whose_signature_does_not_match_its_key_is_refused() {
+    let dir = crate::test_dir();
+    let ca = new_ca(dir.path());
+    for (newkey, digest) in [
+        (["ec", "-pkeyopt", "ec_paramgen_curve:P-256"], "-sha384"),
+        (["ec", "-pkeyopt", "ec_paramgen_curve:P-384"], "-sha256"),
+    ] {
+        let request = openssl_request(dir.path(), &newkey, Some(digest));
+        let error = ca
+            .issue(
+                Holder::Agent("backup"),
+                Key::Request(&request),
+                NOW,
+                DEFAULT_CLIENT_VALIDITY,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{newkey:?} {digest} was signed"));
+        assert!(
+            format!("{error:#}").contains("does not match its key"),
+            "{error:#}"
+        );
+    }
+    assert_eq!(ca.ledger().unwrap().certificates().count(), 0);
 }

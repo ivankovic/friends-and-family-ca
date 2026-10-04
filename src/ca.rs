@@ -18,14 +18,20 @@
 //! The certificate authority: creating it, issuing client certificates, revoking them, and signing
 //! the certificate revocation list (CRL).
 //!
-//! Everything is ECDSA P-256. Every TLS stack a family's devices run accepts it for client
-//! certificates (Android, iOS, macOS, Windows, the browsers), and its keys and signatures are
-//! small. Ed25519 would be nicer, and is not accepted for client certificates by enough of them.
+//! The CA's key and the keys it generates are ECDSA P-256. Every TLS stack a family's devices run
+//! accepts it for client certificates (Android, iOS, macOS, Windows, the browsers), and its keys
+//! and signatures are small. Ed25519 would be nicer, and is not accepted for client certificates
+//! by enough of them. An agent that sends its own request may use P-256, P-384, RSA of 2048 bits
+//! or more, or Ed25519: whatever runs the agent decides what it can present.
 //!
-//! The CA key is a plain PKCS#8 PEM file, readable by its owner only. A passphrase would add
-//! little: this CA guards one web server, and whoever has root there can switch client
-//! certificates off without the key. It would also stop `crl-refresh` from running unattended.
-//! All files are standard PEM, so `openssl` can carry on if ffca ever cannot.
+//! The CA key is a plain PKCS#8 PEM file, readable by its owner only, because `crl-refresh` signs
+//! with it unattended every hour. That makes every copy of the state folder, backups and
+//! snapshots included, as good as the key: whoever has one can mint certificates the ledger never
+//! saw, which only a new CA stops. All files are standard PEM, so `openssl` can carry on if ffca ever cannot.
+//!
+//! The CA certificate itself is limited to client authentication too (extended key usage
+//! `clientAuth`): should it ever end up among a system's trusted authorities, OpenSSL and the
+//! browsers refuse a server certificate under it.
 //!
 //! A client certificate is for client authentication only (extended key usage `clientAuth`, key
 //! usage `digitalSignature`, `CA:FALSE`), so a leaked one cannot be used to impersonate a server or
@@ -37,11 +43,14 @@
 //! The CA generates the key for a person's device, because the device's own installer takes a
 //! finished key and certificate. An agent can instead send a certificate signing request (CSR):
 //! then its key never leaves the machine it runs on. Only the CSR's public key is used; what it
-//! asks for (names, usages, validity) is ignored, and the CA decides all of it as above.
+//! asks for (names, usages, validity) is ignored, and the CA decides all of it as above. The
+//! certificate is checked to carry exactly the request's key before it is kept.
 //!
 //! The CRL is rebuilt from the ledger on every change and on every refresh. A web server rejects
 //! every client once the CRL is past its `nextUpdate`, so [`CRL_VALIDITY`] is a month and
-//! `crl-refresh` runs daily: a month of missed refreshes before anyone is locked out.
+//! `crl-refresh` runs hourly: a month of missed refreshes before anyone is locked out.
+
+use std::fmt::Write as _;
 
 use anyhow::{Context, Result, bail, ensure};
 use rcgen::{
@@ -144,6 +153,7 @@ impl Ca {
         // Path length 0: this CA signs client certificates directly and never another CA.
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
         params.key_identifier_method = KeyIdMethod::Sha256;
         let certificate = params.self_signed(&key)?;
 
@@ -158,8 +168,9 @@ impl Ca {
             not_after: params.not_after,
         };
         let mut ledger = Ledger::default();
-        ca.write_crl(&mut ledger, now)?;
+        ca.advance_crl_number(&mut ledger)?;
         ledger.save(store)?;
+        ca.write_crl(&ledger, now)?;
         Ok(ca)
     }
 
@@ -289,10 +300,12 @@ impl Ca {
         );
         let request = match key {
             Key::Generate => None,
-            Key::Request(pem) => Some(
-                CertificateSigningRequestParams::from_pem(pem)
-                    .context("the certificate signing request is not usable")?,
-            ),
+            Key::Request(pem) => {
+                let key = request_key(pem)?;
+                let request = CertificateSigningRequestParams::from_pem(pem)
+                    .context("the certificate signing request is not usable")?;
+                Some((request, key))
+            }
         };
 
         let _lock = self.store.lock()?;
@@ -329,10 +342,19 @@ impl Ca {
                     Some(key.serialize_pem()),
                 )
             }
-            Some(request) => (
-                params.signed_by(&request.public_key, &self.issuer()?)?,
-                None,
-            ),
+            Some((request, key)) => {
+                let certificate = params.signed_by(&request.public_key, &self.issuer()?)?;
+                // rcgen names the key's algorithm after the request's signature: a P-256 key
+                // signed with SHA-384 would come out as a P-384 key nobody can read.
+                let (_, parsed) = x509_parser::parse_x509_certificate(certificate.der())
+                    .context("the CA made a certificate it cannot read")?;
+                ensure!(
+                    parsed.public_key().raw == key.as_slice(),
+                    "the certificate signing request's signature does not match its key; sign \
+                     a P-256 key's request with SHA-256 and a P-384 key's with SHA-384"
+                );
+                (certificate, None)
+            }
         };
 
         let record = Certificate {
@@ -366,8 +388,9 @@ impl Ca {
         let _lock = self.store.lock()?;
         let mut ledger = self.ledger()?;
         let revoked = ledger.revoke(target, reason, now)?;
-        self.write_crl(&mut ledger, now)?;
+        self.advance_crl_number(&mut ledger)?;
         ledger.save(&self.store)?;
+        self.write_crl(&ledger, now)?;
         Ok(revoked)
     }
 
@@ -393,18 +416,32 @@ impl Ca {
         let now = whole_seconds(now);
         let _lock = self.store.lock()?;
         let mut ledger = self.ledger()?;
-        self.write_crl(&mut ledger, now)?;
-        ledger.save(&self.store)
+        self.advance_crl_number(&mut ledger)?;
+        ledger.save(&self.store)?;
+        self.write_crl(&ledger, now)
     }
 
-    /// Signs the next CRL and writes it; the caller holds the lock and saves `ledger`, whose CRL
-    /// number this advances. The CRL is written before the ledger is saved: a crash in between
-    /// leaves a number used twice, which a verifier treats as the same CRL, never one skipped
-    /// backwards.
-    fn write_crl(&self, ledger: &mut Ledger, now: OffsetDateTime) -> Result<()> {
-        ledger.crl_number += 1;
+    /// Gives `ledger` the next CRL number: past its own and past the CRL on disk's, so that no
+    /// two different CRLs ever share one. The caller holds the lock, and saves the ledger -
+    /// with whatever it revoked - before [`Ca::write_crl`] signs: a crash in between leaves a
+    /// number unused, which RFC 5280 allows, and the next refresh lists the revocation. The other
+    /// order would let a crash forget a revocation the CRL on disk already listed.
+    fn advance_crl_number(&self, ledger: &mut Ledger) -> Result<()> {
+        let on_disk = self.crl_status().map_or(0, |status| status.number);
+        ledger.crl_number = ledger
+            .crl_number
+            .max(on_disk)
+            .checked_add(1)
+            .context("the CRL number has run out")?;
+        Ok(())
+    }
+
+    /// Signs the CRL `ledger` describes, with its number, and writes it; the caller holds the lock.
+    /// It is valid from a little before `now`, like a certificate, so a web server whose clock is
+    /// a little behind ours does not take it for one from the future and refuse every client.
+    fn write_crl(&self, ledger: &Ledger, now: OffsetDateTime) -> Result<()> {
         let params = CertificateRevocationListParams {
-            this_update: now,
+            this_update: now - BACKDATE,
             next_update: now + CRL_VALIDITY,
             crl_number: SerialNumber::from(ledger.crl_number),
             issuing_distribution_point: None,
@@ -430,12 +467,21 @@ impl Ca {
     }
 }
 
-/// Escapes a value for an RFC 4514 distinguished name: a backslash before each special character,
-/// and before a leading `#` or space or a trailing space.
+/// Escapes a value for an RFC 4514 distinguished name as OpenSSL's RFC 2253 printing does, which
+/// is what nginx's `$ssl_client_s_dn` holds: a backslash before each special character, and
+/// before a leading `#` or space or a trailing space; every byte of a character beyond ASCII as
+/// `\XX` - "Željko" is `\C5\BDeljko`.
 fn rfc4514_escape(value: &str) -> String {
     let last = value.chars().count().saturating_sub(1);
     let mut escaped = String::new();
     for (i, c) in value.chars().enumerate() {
+        if !c.is_ascii() {
+            let mut bytes = [0; 4];
+            for byte in c.encode_utf8(&mut bytes).bytes() {
+                let _ = write!(escaped, "\\{byte:02X}");
+            }
+            continue;
+        }
         let special = matches!(c, ',' | '+' | '"' | '\\' | '<' | '>' | ';')
             || (i == 0 && matches!(c, '#' | ' '))
             || (i == last && c == ' ');
@@ -445,6 +491,43 @@ fn rfc4514_escape(value: &str) -> String {
         escaped.push(c);
     }
     escaped
+}
+
+/// The public key of the certificate signing request `pem`, as the DER of its
+/// SubjectPublicKeyInfo, if it is of a kind the CA signs: P-256, P-384, RSA of 2048 bits or more,
+/// or Ed25519. Anything else is too weak, or something nginx's OpenSSL may not take.
+fn request_key(pem: &str) -> Result<Vec<u8>> {
+    use x509_parser::certification_request::X509CertificationRequest;
+    use x509_parser::prelude::FromDer;
+    use x509_parser::public_key::PublicKey;
+    const EC: &str = "1.2.840.10045.2.1";
+    const P256: &str = "1.2.840.10045.3.1.7";
+    const P384: &str = "1.3.132.0.34";
+    const RSA: &str = "1.2.840.113549.1.1.1";
+    const ED25519: &str = "1.3.101.112";
+    let unusable = "the certificate signing request is not usable";
+    let (_, pem) = x509_parser::pem::parse_x509_pem(pem.as_bytes()).context(unusable)?;
+    let (_, request) = X509CertificationRequest::from_der(&pem.contents).context(unusable)?;
+    let key = &request.certification_request_info.subject_pki;
+    let algorithm = key.algorithm.algorithm.to_id_string();
+    let curve = key
+        .algorithm
+        .parameters
+        .as_ref()
+        .and_then(|p| p.as_oid().ok())
+        .map(|oid| oid.to_id_string());
+    let accepted = match (algorithm.as_str(), curve.as_deref()) {
+        (EC, Some(P256 | P384)) => true,
+        (ED25519, _) => true,
+        (RSA, _) => matches!(key.parsed(), Ok(PublicKey::RSA(rsa)) if rsa.key_size() >= 2048),
+        _ => false,
+    };
+    ensure!(
+        accepted,
+        "the certificate signing request's key is not one the CA signs: use P-256, P-384, \
+         RSA of 2048 bits or more, or Ed25519"
+    );
+    Ok(key.raw.to_vec())
 }
 
 /// Certificates and CRLs carry whole seconds; the ledger records the same instants they do.
