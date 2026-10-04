@@ -368,6 +368,12 @@ const ENROLLMENT_MARK: &str = "# Written by Friends and Family CA: the enrollmen
 /// and `include`s are copied from a site on the same domain - `k.example.org` takes them from
 /// `cloud.example.org` - which also says which certificate covers the name. Returns the file and
 /// its text.
+///
+/// Invite links (`/i/<token>`, `/d/<id>/...`) are not logged: the path is the secret, and a shared
+/// access log is read by more than the administrator (bot detectors, log shippers). The rest of
+/// the site logs as its includes say. Blocks another tool marked in the file it rewrites -
+/// `# BEGIN stop-bots ... # END stop-bots` - are kept, at the top of the `server` block, where
+/// stop-bots puts its own.
 pub fn enrollment_site(
     nginx: &config::Nginx,
     enrollment: &config::Enrollment,
@@ -428,42 +434,83 @@ pub fn enrollment_site(
         .map_or(address, |(h, _)| h)
         .trim_matches(['[', ']']);
     let literal = host_part == "localhost" || host_part.parse::<std::net::IpAddr>().is_ok();
-    let forward = if literal {
-        format!(
-            "        proxy_pass {upstream};
-"
-        )
-    } else {
-        format!(
-            "        # Looked up when a request comes (Docker's DNS), so that nginx starts while the page is down.
-                     resolver 127.0.0.11 valid=30s ipv6=off;
-                     set $ffca_enrollment {upstream};
-                     proxy_pass $ffca_enrollment;
-"
-        )
-    };
     let file = nginx.sites.join(ENROLLMENT_FILE);
-    let site = format!(
-        "{ENROLLMENT_MARK}, where invites are collected.
-         # It never asks for a client certificate: whoever opens an invite has none yet. Its listen,
-         # TLS certificate and includes are copied from {template}.
-         server {{
-         {copied}
-             server_name {host};
-
-             location / {{
-         {forward}                 proxy_set_header Host $host;
-                 proxy_set_header X-Real-IP $remote_addr;
-             }}
-         }}
-",
-        template = template.file_name(),
-        copied = copied.join(
-            "
-"
-        ),
+    // Blocks other tools wrote into the site - stop-bots' bot filter - stay when ffca rewrites it.
+    let kept = match fs::read_to_string(&file) {
+        Ok(existing) if existing.starts_with(ENROLLMENT_MARK) => foreign_blocks(&existing),
+        _ => Vec::new(),
+    };
+    let proxy = |lines: &mut Vec<String>| {
+        lines.push(format!(
+            "        proxy_pass {};",
+            if literal {
+                upstream.as_str()
+            } else {
+                "$ffca_enrollment"
+            }
+        ));
+        lines.push("        proxy_set_header Host $host;".to_owned());
+        lines.push("        proxy_set_header X-Real-IP $remote_addr;".to_owned());
+    };
+    let mut lines = vec![
+        format!("{ENROLLMENT_MARK}, where invites are collected."),
+        "# It never asks for a client certificate: whoever opens an invite has none yet. Its listen,".to_owned(),
+        format!("# TLS certificate and includes are copied from {}.", template.file_name()),
+        "server {".to_owned(),
+    ];
+    for block in &kept {
+        lines.extend(block.iter().cloned());
+        lines.push(String::new());
+    }
+    lines.extend(copied);
+    lines.push(format!("    server_name {host};"));
+    lines.push(String::new());
+    if !literal {
+        lines.push("    # Looked up when a request comes (Docker's DNS), so that nginx starts while the page is down.".to_owned());
+        lines.push("    resolver 127.0.0.11 valid=30s ipv6=off;".to_owned());
+        lines.push(format!("    set $ffca_enrollment {upstream};"));
+        lines.push(String::new());
+    }
+    lines.push("    location / {".to_owned());
+    proxy(&mut lines);
+    lines.push("    }".to_owned());
+    lines.push(String::new());
+    lines.push(
+        "    # An invite's link carries its secret: these requests are not logged.".to_owned(),
     );
+    lines.push("    location ~ ^/(i|d)/ {".to_owned());
+    lines.push("        access_log off;".to_owned());
+    proxy(&mut lines);
+    lines.push("    }".to_owned());
+    lines.push("}".to_owned());
+    let site = lines.join("\n") + "\n";
     Ok((file, site))
+}
+
+/// The blocks of `text` that another tool marked as its own - `# BEGIN <tool> ...` to
+/// `# END <tool>`, stop-bots' among them - with their lines as they are.
+fn foreign_blocks(text: &str) -> Vec<Vec<String>> {
+    let mut blocks = Vec::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some(rest) = line.trim_start().strip_prefix("# BEGIN ") else {
+            continue;
+        };
+        let tool = rest.split_whitespace().next().unwrap_or_default();
+        if tool == "ffca" {
+            continue;
+        }
+        let end = format!("# END {tool}");
+        let mut block = vec![line.to_owned()];
+        for line in lines.by_ref() {
+            block.push(line.to_owned());
+            if line.trim_start().starts_with(&end) {
+                blocks.push(block);
+                break;
+            }
+        }
+    }
+    blocks
 }
 
 /// Writes the enrollment site, tests nginx's configuration and reloads; a refusal leaves the

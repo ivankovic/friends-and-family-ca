@@ -667,10 +667,16 @@ const CLOUD: &str = r#"server {
     server_name books.example.test;
     ssl_certificate /etc/ffca/server.crt;
     ssl_certificate_key /etc/ffca/server.key;
+    include /etc/ffca/sites/logging.inc;
 
     location / { return 200 "$ssl_client_s_dn\n"; }
 }
 "#;
+
+/// The access log the sites include, as a server's shared logging snippet does.
+/// It records which site answered: right after a reload, a worker from before it can still answer
+/// for a site it does not know yet, and logs under another site's settings.
+const LOGGING: &str = "access_log /tmp/access.log with_site;\n";
 
 /// The whole way, as a family member takes it: an invite made, its link opened through nginx
 /// without a certificate, the button pressed, the .p12 downloaded and opened with the password the
@@ -680,8 +686,8 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
     let ffca = Ffca::initialised();
     let nginx = Nginx::start_with(
         &ffca,
-        "    include /etc/ffca/sites/*.conf;",
-        &[("books.conf", CLOUD)],
+        "    log_format with_site '$server_name \"$request\" $status';\n    include /etc/ffca/sites/*.conf;",
+        &[("books.conf", CLOUD), ("logging.inc", LOGGING)],
     );
     let serve = Serve::start(&ffca);
     let store = Store::new(&ffca.state);
@@ -811,6 +817,46 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         invite.collected_by.as_deref(),
         Some("127.0.0.1, an unknown device")
     );
+
+    // The invite's secret is nowhere in nginx's access log; other requests to the site are.
+    let (status, _) = fetch_through(&nginx, "https://k.example.test/", &[]);
+    assert_eq!(status, 200);
+    let token = made.link.rsplit('/').next().unwrap();
+    let log = || {
+        let output = Command::new(&nginx.engine)
+            .args(["exec", &nginx.container, "cat", "/tmp/access.log"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    until(
+        || log().contains("k.example.test \"GET / HTTP"),
+        "the enrollment site's own requests are logged",
+    );
+    let log = log();
+    for line in log.lines().filter(|l| l.starts_with("k.example.test ")) {
+        assert!(
+            !line.contains(token) && !line.contains("/d/"),
+            "an invite's secret in the access log:\n{log}"
+        );
+    }
+
+    // stop-bots' filter, written into the site as stop-bots does, survives ffca rewriting it.
+    let written = std::fs::read_to_string(&file).unwrap();
+    let filter = "    # BEGIN stop-bots (DO NOT EDIT)\n    if ($http_user_agent ~* \"BadBot\") {\n        return 403;\n    }\n    # END stop-bots\n";
+    std::fs::write(
+        &file,
+        written.replacen("server {\n", &format!("server {{\n{filter}\n"), 1),
+    )
+    .unwrap();
+    let (file, text) = nginx::enrollment_site(&settings, &enrollment).unwrap();
+    nginx::write_enrollment_site(&settings, &ca, &file, &text).unwrap();
+    assert!(std::fs::read_to_string(&file).unwrap().contains(filter));
+    until(
+        || fetch(&nginx, "https://k.example.test/", &["-A", "BadBot"]).0 == 403,
+        "the bot filter still turns bots away",
+    );
+    assert_eq!(fetch(&nginx, "https://k.example.test/", &[]).0, 200);
 }
 
 /// `fetch`, asked again while nginx refuses it with 400 itself: after a reload, a worker of the
