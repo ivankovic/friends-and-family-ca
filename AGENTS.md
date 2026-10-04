@@ -6,7 +6,7 @@ that directory.
 
 ## Branches
 
-- Until v0.0.1, commit straight to `main` and push: Marko is the only developer. No branches, no
+- Until v0.1.0, commit straight to `main` and push: Marko is the only developer. No branches, no
 pull requests.
 - Releases are cut from `main`.
 

@@ -421,3 +421,44 @@ fn healthz_says_whether_the_enrollment_page_answers() {
     serve.kill().unwrap();
     serve.wait().unwrap();
 }
+
+/// As a container's first process, the page gets no default handling of SIGTERM; it handles it.
+#[test]
+fn the_enrollment_page_stops_on_sigterm() {
+    let ffca = Ffca::initialised();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let address = format!("127.0.0.1:{port}");
+    let mut serve = ffca
+        .command(&["serve", "--listen", &address])
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    while !ffca
+        .run(&["healthz", "--address", &address])
+        .status
+        .success()
+    {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &serve.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(status) = serve.try_wait().unwrap() {
+            assert!(status.success(), "{status}");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "still running after SIGTERM"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}

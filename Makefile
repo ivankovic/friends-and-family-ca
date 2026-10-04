@@ -18,7 +18,7 @@
 # Product-side targets: build, test, install, third-party notices, the local CI mirror.
 
 .PHONY: test build install install-hooks lint-python ci third-party-notices \
-	check-third-party-notices
+	check-third-party-notices check-versions release-checks release-crates release-tag release
 
 # Where `make install` puts ffca. `sudo ffca` and the refresh timer the CA tab sets up both run
 # the binary there.
@@ -99,3 +99,34 @@ PYTHON_DIRS := scripts
 # `python3 scripts/ci_local.py --list` shows the jobs, `--job <id>` runs one.
 ci:
 	python3 scripts/ci_local.py
+
+# Every file that repeats the version names Cargo.toml's: see scripts/check_version_sync.py. CI runs
+# it; `make release` adds --release, which also wants CHANGELOG.md's dated section for it.
+check-versions:
+	python3 scripts/check_version_sync.py
+
+# What a release needs before anything is published: a clean tree on main, the same commit as
+# GitHub's, the version everywhere with its changelog section, and every test passing.
+VERSION = $(shell grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')
+release-checks:
+	@[ -z "$$(git status --porcelain)" ] || { echo "error: the working tree is not clean" >&2; exit 1; }
+	@[ "$$(git branch --show-current)" = main ] || { echo "error: releases are cut from main" >&2; exit 1; }
+	git fetch origin main
+	@[ "$$(git rev-parse HEAD)" = "$$(git rev-parse origin/main)" ] || { \
+		echo "error: HEAD is not origin/main - push or pull first" >&2; exit 1; }
+	@! git rev-parse -q --verify "refs/tags/v$(VERSION)" >/dev/null || { \
+		echo "error: v$(VERSION) is tagged already" >&2; exit 1; }
+	python3 scripts/check_version_sync.py --release
+	$(MAKE) test
+
+# crates.io first: a publish there can never be undone, only yanked, while a tag can be deleted.
+# Needs `cargo login` (or CARGO_REGISTRY_TOKEN).
+release-crates: release-checks
+	cargo publish --locked
+
+# The tag: release.yml then builds the binaries and the image and publishes the release.
+release-tag: release-checks
+	git tag -a v$(VERSION) -m "Friends and Family CA $(VERSION)"
+	git push origin v$(VERSION)
+
+release: release-crates release-tag

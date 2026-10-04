@@ -133,6 +133,11 @@ impl Page {
 pub fn run(listen: &str, folder: PathBuf) -> Result<()> {
     let server =
         tiny_http::Server::http(listen).map_err(|e| anyhow!("cannot listen on {listen}: {e}"))?;
+    // In a container the page is the first process, which gets no default handling of SIGTERM:
+    // without this, `docker stop` waits and then kills it. Nothing is lost by exiting at once - a
+    // collected invite's files are only ever in memory, for ten minutes.
+    ctrlc::set_handler(|| std::process::exit(0))
+        .map_err(|e| anyhow!("cannot handle SIGTERM: {e}"))?;
     eprintln!(
         "ffca serve: listening on {listen}, invites in {}",
         folder.display()

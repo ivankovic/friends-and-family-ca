@@ -113,6 +113,10 @@ jobs:
       - name: Third-party notices are in sync with Cargo.lock
         run: make check-third-party-notices
 
+      # The Nix recipe and the Compose snippet repeat Cargo.toml's version by hand.
+      - name: Every file names Cargo.toml's version
+        run: make check-versions
+
   # Cargo.toml's `rust-version` is a promise to `cargo install` users on an older toolchain, and
   # only a build on exactly that toolchain keeps it: a dependency bump can raise the real floor
   # without any line of this crate changing. The version appears twice below on purpose - the

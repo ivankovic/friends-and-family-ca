@@ -36,11 +36,18 @@ include = [
     "/src/**/*.rs",
 ]
 
+# `cargo binstall friends-and-family-ca`: the static binaries release.yml attaches to a release.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/ffca-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "ffca"
+
 [dependencies]
 anyhow = "1.0.100"
 base64 = "0.23"
 clap = { version = "4.6.6", features = ["derive", "env"] }
 crossterm = "0.29.0"
+ctrlc = { version = "3", features = ["termination"] }
 getrandom = "0.4"
 qrcode = { version = "0.14", default-features = false }
 ratatui = "0.30.2"

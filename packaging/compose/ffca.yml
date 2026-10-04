@@ -18,6 +18,8 @@
 # The enrollment page, as a service for a docker-compose.yml that already runs nginx. Copy it under
 # `services:` and adjust the three marked lines - see packaging/README.md.
   ffca:
+    # A released image - or, before there is one, the build from a checkout below.
+    #image: ghcr.io/ivankovic/friends-and-family-ca:0.1.0
     build:
       context: /home/marko/src/friends-and-family-ca      # <- your checkout
       dockerfile: packaging/docker/Dockerfile

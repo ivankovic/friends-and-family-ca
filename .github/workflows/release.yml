@@ -1,0 +1,219 @@
+# This file is part of Friends and Family CA.
+#
+# Copyright (C) 2026 Marko Ivankovic
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Affero General Public License as published
+# by the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU Affero General Public License for more details.
+#
+# You should have received a copy of the GNU Affero General Public License
+# along with this program. If not, see <https://www.gnu.org/licenses/>.
+
+# A release, from a `v*` tag: static Linux binaries on a GitHub release whose notes are the
+# version's CHANGELOG.md section, and the enrollment page's image on ghcr.io. `make release` pushes
+# the tag, after publishing the crate to crates.io - see packaging/README.md, "Releasing".
+#
+# To redo a release, re-run this run (`gh run rerun <id>`), or delete the tag and release and push
+# the tag again.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  # The release, as a draft, first: every other job adds to it, and `publish` makes it public once
+  # all of them are done, so nobody sees a release with half its files. A tag that is not
+  # Cargo.toml's version, or whose CHANGELOG section is missing or undated, fails here, before
+  # anything is built.
+  release:
+    name: create draft release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: The tag is Cargo.toml's version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.*)"/\1/')"
+          [ "v$version" = "$TAG" ] || { echo "::error::tag $TAG, Cargo.toml says $version"; exit 1; }
+
+      - name: Extract this version's section from CHANGELOG.md
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - "$TAG" <<'PY'
+          import re
+          import sys
+
+          version = sys.argv[1].removeprefix("v")
+          text = open("CHANGELOG.md", encoding="utf-8").read()
+          match = re.search(
+              rf"^## \[{re.escape(version)}\] - (?P<date>[^\n]*)\n(?P<body>.*?)(?=^## \[|\Z)",
+              text,
+              re.MULTILINE | re.DOTALL,
+          )
+          if match is None:
+              sys.exit(f"CHANGELOG.md has no `## [{version}] - <date>` section for tag {sys.argv[1]}")
+          if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", match["date"].strip()):
+              sys.exit(f"CHANGELOG.md's [{version}] heading says '{match['date']}', not a release date")
+          body = match["body"].strip()
+          if not body:
+              sys.exit(f"CHANGELOG.md's [{version}] section is empty")
+          open("release-notes.md", "w", encoding="utf-8").write(body + "\n")
+          PY
+          cat release-notes.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body_path: release-notes.md
+          draft: true
+
+  # Static binaries: ffca runs beside nginx and systemd, on Linux, and musl makes the binary run on
+  # any distribution, any libc. cargo-zigbuild cross-compiles both, zig being the C compiler for
+  # `ring` as well as the linker.
+  build:
+    name: ${{ matrix.target }}
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            arch: amd64
+            file: x86-64
+          - target: aarch64-unknown-linux-musl
+            arch: arm64
+            file: ARM aarch64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild
+
+      - uses: mlugg/setup-zig@v2
+
+      - run: cargo zigbuild --release --locked --target ${{ matrix.target }} --bin ffca
+
+      - name: Static, and for ${{ matrix.arch }}
+        run: |
+          binary=target/${{ matrix.target }}/release/ffca
+          file "$binary"
+          file "$binary" | grep -q 'static' || { echo "::error::not statically linked"; exit 1; }
+          file "$binary" | grep -q '${{ matrix.file }}' || { echo "::error::not ${{ matrix.arch }}"; exit 1; }
+
+      - name: Package
+        run: |
+          mkdir dist
+          cp target/${{ matrix.target }}/release/ffca LICENSE LICENSE-COMMERCIAL THIRD-PARTY-NOTICES.md README.md dist/
+          cp packaging/README.md dist/DEPLOYING.md
+          cp -r packaging/compose dist/
+          tar czf ffca-${{ matrix.target }}.tar.gz -C dist .
+
+      - uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: ffca-${{ matrix.target }}.tar.gz
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          draft: true
+          files: ffca-${{ matrix.target }}.tar.gz
+
+      # For the image: the same binary, not a second build.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ffca-${{ matrix.arch }}
+          path: target/${{ matrix.target }}/release/ffca
+
+  # The enrollment page's image, for amd64 and arm64, from the binaries above.
+  image:
+    name: image on ghcr.io
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ffca-*
+          path: binaries
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Tags
+        id: tags
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "list=$image:${TAG#v},$image:latest" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: binaries
+          file: packaging/docker/Dockerfile.release
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.list }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.licenses=AGPL-3.0-or-later
+            org.opencontainers.image.description=Friends and Family CA's enrollment page (ffca serve)
+
+  # Checksums of everything attached, then the release made public.
+  publish:
+    name: checksums, publish
+    needs: [build, image]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download the release's files
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets
+
+      - name: SHA256SUMS
+        run: (cd assets && sha256sum -- * > ../SHA256SUMS) && cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: SHA256SUMS
+          draft: false
