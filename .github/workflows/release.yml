@@ -19,8 +19,15 @@
 # version's CHANGELOG.md section, and the enrollment page's image on ghcr.io. `make release` pushes
 # the tag, after publishing the crate to crates.io - see packaging/README.md, "Releasing".
 #
-# To redo a release, re-run this run (`gh run rerun <id>`), or delete the tag and release and push
-# the tag again.
+# The jobs are split by what they may do. `build` runs the code of every dependency (build scripts,
+# proc macros) and so holds nothing but a read-only token: no write access, no OIDC token, no
+# attestations, no cache from other runs. `image` and `publish`, which do hold those, run no code
+# of this crate or its dependencies: they package, attest and publish the files `build` handed on.
+# Every action is pinned by commit (dependabot keeps the pins current), and no checkout leaves its
+# token in .git/config.
+#
+# To redo a release that failed before it was published, re-run this run (`gh run rerun <id>`):
+# `publish` replaces a draft it left behind. A published release is never replaced.
 name: Release
 
 on:
@@ -28,19 +35,28 @@ on:
     tags:
       - "v*"
 
-permissions:
-  contents: write
+permissions: {}
+
+# What the binaries are built with, pinned, so that a release is not built with whatever was newest
+# that day. Bump them by hand; `make release` builds nothing, so CI's build on `stable` is where a
+# newer toolchain is tried first.
+env:
+  RUST_TOOLCHAIN: "1.99.0"
+  ZIG_VERSION: "0.16.0"
+  CARGO_ZIGBUILD_VERSION: "0.23.4"
 
 jobs:
-  # The release, as a draft, first: every other job adds to it, and `publish` makes it public once
-  # all of them are done, so nobody sees a release with half its files. A tag that is not
-  # Cargo.toml's version, or whose CHANGELOG section is missing or undated, fails here, before
-  # anything is built.
-  release:
-    name: create draft release
+  # A tag that is not Cargo.toml's version, or whose CHANGELOG section is missing or undated, fails
+  # here, before anything is built.
+  check:
+    name: tag and changelog
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: The tag is Cargo.toml's version
         env:
@@ -75,24 +91,21 @@ jobs:
           PY
           cat release-notes.md
 
-      - uses: softprops/action-gh-release@v2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          body_path: release-notes.md
-          draft: true
+          name: release-notes
+          path: release-notes.md
 
   # Static binaries: ffca runs beside nginx and systemd, on Linux, and musl makes the binary run on
   # any distribution, any libc. cargo-zigbuild cross-compiles both, zig being the C compiler for
-  # `ring` as well as the linker.
+  # `ring` as well as the linker. No cache: a cache entry written by any other run - CI on main
+  # included - would be trusted as build output.
   build:
     name: ${{ matrix.target }}
-    needs: release
+    needs: check
     runs-on: ubuntu-latest
     permissions:
-      contents: write
-      id-token: write
-      attestations: write
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -104,21 +117,23 @@ jobs:
             arch: arm64
             file: ARM aarch64
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master, 2026-10-01
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: ${{ matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@e407f7bafb71fd004bc5c2da3032e5470cbb6ef0 # v2.87.24
         with:
-          key: release-${{ matrix.target }}
+          tool: cargo-zigbuild@${{ env.CARGO_ZIGBUILD_VERSION }}
 
-      - uses: taiki-e/install-action@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
-          tool: cargo-zigbuild
-
-      - uses: mlugg/setup-zig@v2
+          version: ${{ env.ZIG_VERSION }}
+          use-cache: false
 
       - run: cargo zigbuild --release --locked --target ${{ matrix.target }} --bin ffca
 
@@ -137,23 +152,20 @@ jobs:
           cp -r packaging/compose dist/
           tar czf ffca-${{ matrix.target }}.tar.gz -C dist .
 
-      - uses: actions/attest-build-provenance@v2
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          subject-path: ffca-${{ matrix.target }}.tar.gz
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          draft: true
-          files: ffca-${{ matrix.target }}.tar.gz
+          name: tarball-${{ matrix.target }}
+          path: ffca-${{ matrix.target }}.tar.gz
 
       # For the image: the same binary, not a second build.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ffca-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/ffca
 
-  # The enrollment page's image, for amd64 and arm64, from the binaries above.
+  # The enrollment page's image, for amd64 and arm64, from the binaries above: an empty base and a
+  # COPY, nothing that runs this crate's code. Attested, so that a pull can be checked against this
+  # workflow (`gh attestation verify oci://ghcr.io/... --repo ...`).
   image:
     name: image on ghcr.io
     needs: build
@@ -161,31 +173,37 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: ffca-*
           path: binaries
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
-      - uses: docker/login-action@v3
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Tags
+      - name: Name and tags
         id: tags
         env:
           TAG: ${{ github.ref_name }}
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
           echo "list=$image:${TAG#v},$image:latest" >> "$GITHUB_OUTPUT"
 
-      - uses: docker/build-push-action@v6
+      - id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: binaries
           file: packaging/docker/Dockerfile.release
@@ -197,23 +215,49 @@ jobs:
             org.opencontainers.image.licenses=AGPL-3.0-or-later
             org.opencontainers.image.description=Friends and Family CA's enrollment page (ffca serve)
 
-  # Checksums of everything attached, then the release made public.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  # The release: the tarballs attested, their checksums, and the release created as a draft with
+  # its files, then made public, so nobody sees a release with half its files.
   publish:
-    name: checksums, publish
-    needs: [build, image]
+    name: attest, checksums, publish
+    needs: [check, build, image]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
     steps:
-      - name: Download the release's files
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: tarball-*
+          path: assets
+          merge-multiple: true
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-notes
+
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: assets/ffca-*.tar.gz
+
+      - name: SHA256SUMS
+        run: (cd assets && sha256sum -- * > SHA256SUMS) && cat assets/SHA256SUMS
+
+      - name: Publish the release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets
-
-      - name: SHA256SUMS
-        run: (cd assets && sha256sum -- * > ../SHA256SUMS) && cat SHA256SUMS
-
-      - uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          files: SHA256SUMS
-          draft: false
+        run: |
+          # A draft left by an earlier attempt of this run; a published release makes `create` fail.
+          if [ "$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null)" = true ]; then
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" --yes
+          fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --draft \
+            --title "$TAG" --notes-file release-notes.md assets/*
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest

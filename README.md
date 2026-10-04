@@ -70,11 +70,13 @@ It runs on Linux, beside nginx, and needs the `openssl` command, which makes the
 * **A release's binary** - static, for x86_64 and aarch64 - from the
   [releases page](https://github.com/ivankovic/friends-and-family-ca/releases), or
   `cargo binstall friends-and-family-ca`.
-* **From crates.io:** `cargo install friends-and-family-ca`.
+* **From crates.io:** `cargo install --locked friends-and-family-ca`.
 * **From a checkout:** `make install` runs the tests, builds the release and installs it as
   `/usr/local/bin/ffca`.
 
-The enrollment page's image is `ghcr.io/ivankovic/friends-and-family-ca`.
+The enrollment page's image is `ghcr.io/ivankovic/friends-and-family-ca`. The release's files and
+the image are attested by the workflow that built them: `gh attestation verify <file> --repo
+ivankovic/friends-and-family-ca` checks one.
 
 Then follow **[the deployment guide](packaging/README.md)**: create the CA, tell it where nginx is,
 start the enrollment page, invite your own devices, and turn sites on one at a time.

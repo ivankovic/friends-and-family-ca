@@ -183,6 +183,12 @@ Every push and pull request runs (see `.github/workflows/ci.yml`):
 
 `.github/workflows/nix.yml` builds the Nix recipe when one of its inputs changes, and weekly.
 
+Every action is pinned by commit, with its version in a comment beside it, and dependabot moves
+the pins; `dtolnay/rust-toolchain` has no releases, so its pin moves by hand. In
+`.github/workflows/release.yml`, the job that compiles - and so runs every dependency's build
+scripts - has a read-only token and no cache; only the jobs that run none of that code may write.
+Keep it that way when adding a step.
+
 All of these checks must pass before a PR is done. Two things run them locally, before GitHub
 does - see "Makefile targets" above:
 
