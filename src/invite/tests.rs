@@ -591,10 +591,12 @@ fn handing_the_folder_over_never_follows_a_link() {
     let dir = crate::test_dir();
     let folder = dir.path().join("invites");
     fs::create_dir(&folder).unwrap();
-    // Owned by root: following the link and changing it would fail, and did.
+    // Someone else's file (root's, or nobody's in a build sandbox): following the link and
+    // changing it would fail, and did.
     std::os::unix::fs::symlink("/etc/passwd", folder.join("x")).unwrap();
     fs::write(folder.join("an.invite"), "{}").unwrap();
+    let owner = fs::metadata("/etc/passwd").unwrap().uid();
     let me = fs::metadata(&folder).unwrap();
     hand_over_folder(&folder, me.uid(), me.gid()).unwrap();
-    assert_eq!(fs::metadata("/etc/passwd").unwrap().uid(), 0);
+    assert_eq!(fs::metadata("/etc/passwd").unwrap().uid(), owner);
 }
