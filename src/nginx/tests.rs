@@ -90,6 +90,8 @@ fn folder(files: &[(&str, &str)]) -> (tempfile::TempDir, config::Nginx) {
     let dir = crate::test_dir();
     let nginx = settings(dir.path());
     fs::create_dir(&nginx.sites).unwrap();
+    // ffca writes only into a folder nobody else can change, whatever the umask made it.
+    fs::set_permissions(&nginx.sites, fs::Permissions::from_mode(0o755)).unwrap();
     for (name, text) in files {
         fs::write(nginx.sites.join(name), text).unwrap();
     }
@@ -329,7 +331,7 @@ fn the_parser_reads_what_nginx_reads() {
         args,
         [
             vec!["$x".to_owned(), "a { b ; c".into()],
-            vec!["${y}z".into(), "q\\'s".into()]
+            vec!["${y}z".into(), "q's".into()]
         ]
     );
 }
@@ -522,7 +524,7 @@ fn enrollment(upstream: &str) -> config::Enrollment {
 }
 
 /// The whole file, so that its shape cannot drift unseen: what is copied, what is forwarded, and
-/// the invite paths left out of the access log.
+/// the access log turned off for the whole site.
 #[test]
 fn the_enrollment_site_is_written_out_in_full() {
     let (_dir, nginx) = folder(&[("cloud.conf", CLOUD)]);
@@ -540,6 +542,11 @@ server {
     ssl_certificate_key /etc/le/example/privkey.pem;
     include /etc/nginx/snippets/logging.conf;
     server_name k.example.org;
+    ssl_verify_client off;
+
+    # An invite's link carries its secret, and a request turned away before it reaches a
+    # location - by a bot filter, say - is logged here: nothing on this site is.
+    access_log off;
 
     # Looked up when a request comes (Docker's DNS), so that nginx starts while the page is down.
     resolver 127.0.0.11 valid=30s ipv6=off;
@@ -551,9 +558,8 @@ server {
         proxy_set_header X-Real-IP $remote_addr;
     }
 
-    # An invite's link carries its secret: these requests are not logged.
+    # nginx names the request in an error too - the page being down, say.
     location ~ ^/(i|d)/ {
-        access_log off;
         error_log /dev/null crit;
         proxy_pass $ffca_enrollment;
         proxy_set_header Host $host;
@@ -630,6 +636,7 @@ fn a_linked_site_is_changed_where_the_link_points() {
     let (dir, nginx) = folder(&[]);
     let available = dir.path().join("available");
     fs::create_dir(&available).unwrap();
+    fs::set_permissions(&available, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(available.join("books.conf"), BOOKS).unwrap();
     fs::set_permissions(
         available.join("books.conf"),
@@ -660,4 +667,454 @@ fn optional_no_ca_is_marked_for_what_it_lets_in() {
     let text = "server {\n    listen 443 ssl;\n    server_name a.example.org;\n    ssl_verify_client optional_no_ca;\n}\n";
     let site = &sites_in(Path::new("a.conf"), text, &nginx).unwrap()[0];
     assert_eq!((site.mode, site.any_issuer), (Mode::Optional, true));
+}
+
+/// The site the read-back checks below change, between two others it must not touch.
+fn requiring(text: &str, index: usize) -> Result<String> {
+    let (_dir, nginx) = folder(&[]);
+    plan(text, index, Mode::Required, &nginx)
+}
+
+/// A server written on one line has nowhere inside it for ffca's lines to go: after its
+/// `server_name`, they would land after its `}`, at the level of every site.
+#[test]
+fn a_server_on_one_line_is_left_to_a_person() {
+    let one_line = "server { listen 443 ssl; server_name a.example.test; ssl_certificate a.crt; }
+server {
+    listen 443 ssl;
+    server_name b.example.test;
+}
+";
+    let error = requiring(one_line, 0).unwrap_err();
+    assert!(
+        error.to_string().contains("written on one line"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn a_server_name_sharing_its_line_with_the_close_is_not_an_anchor() {
+    let (_dir, nginx) = folder(&[]);
+    let text = "server {
+    listen 443 ssl;
+    server_name a.example.test; }
+server {
+    listen 443 ssl;
+    server_name b.example.test;
+}
+";
+    let planned = plan(text, 0, Mode::Required, &nginx).unwrap();
+    assert!(
+        planned.starts_with("server {\n\n    # BEGIN ffca"),
+        "after the server's own {{:\n{planned}"
+    );
+    let sites = sites_in(Path::new("x.conf"), &planned, &nginx).unwrap();
+    assert_eq!(
+        sites.iter().map(|s| s.mode).collect::<Vec<_>>(),
+        [Mode::Required, Mode::Off]
+    );
+    assert_eq!(plan(&planned, 0, Mode::Off, &nginx).unwrap(), text);
+}
+
+#[test]
+fn a_server_whose_brace_is_on_the_next_line_gets_the_block_inside() {
+    let (_dir, nginx) = folder(&[]);
+    let text = "server\n{\n    listen 443 ssl;\n}\n";
+    let planned = plan(text, 0, Mode::Required, &nginx).unwrap();
+    assert!(
+        planned.starts_with("server\n{\n\n    # BEGIN ffca"),
+        "{planned}"
+    );
+    assert_eq!(plan(&planned, 0, Mode::Off, &nginx).unwrap(), text);
+}
+
+#[test]
+fn a_server_open_and_named_on_one_line_gets_the_block_before_its_close() {
+    let (_dir, nginx) = folder(&[]);
+    let text = "server { listen 443 ssl; server_name a.example.test; ssl_certificate a.crt;\n}\n";
+    let planned = plan(text, 0, Mode::Required, &nginx).unwrap();
+    assert!(planned.ends_with("    # END ffca\n}\n"), "{planned}");
+    assert_eq!(
+        sites_in(Path::new("x.conf"), &planned, &nginx).unwrap()[0].mode,
+        Mode::Required
+    );
+    assert_eq!(plan(&planned, 0, Mode::Off, &nginx).unwrap(), text);
+}
+
+/// An apostrophe inside a word is part of the word, as nginx reads it: the quoted string after
+/// it holds text that only looks like directives.
+#[test]
+fn quotes_inside_a_word_are_letters() {
+    let (_dir, nginx) = folder(&[]);
+    let text = "server {
+    listen 443 ssl;
+    server_name a.example.test;
+    add_header X-A don't;
+    add_header X-B 'x; ssl_verify_client on; add_header X-C y';
+    add_header X-D it's;
+    default_type a}b;
+}
+";
+    let site = &sites_in(Path::new("x.conf"), text, &nginx).unwrap()[0];
+    assert_eq!(site.mode, Mode::Off, "nginx does not ask here");
+    let parsed = Parsed::new(text).unwrap();
+    let args: Vec<Vec<String>> = parsed.servers()[0]
+        .block
+        .as_ref()
+        .unwrap()
+        .iter()
+        .map(|s| s.args.clone())
+        .collect();
+    assert_eq!(args[2], ["X-A", "don't"]);
+    assert_eq!(
+        args[3],
+        ["X-B", "x; ssl_verify_client on; add_header X-C y"]
+    );
+    assert_eq!(args[5], ["a}b"]);
+    let planned = plan(text, 0, Mode::Required, &nginx).unwrap();
+    assert!(
+        planned.contains("    add_header X-B 'x; ssl_verify_client on; add_header X-C y';\n"),
+        "{planned}"
+    );
+}
+
+/// `${` keeps the `{` in its word, and the word ends where nginx ends it: lines after it are
+/// counted right, and the line ffca comments out is the one that asks.
+#[test]
+fn a_dollar_brace_does_not_swallow_lines() {
+    let (_dir, nginx) = folder(&[]);
+    let text = "server {
+    listen 443 ssl;
+    ssl_client_certificate /etc/nginx/certs/ffca-ca.crt;
+    default_type ${x;
+    if ($host) {}
+    charset utf-8;
+    server_name a.example.test;
+    ssl_verify_client optional;
+    add_header X-Keep keep;
+}
+";
+    let off = plan(text, 0, Mode::Off, &nginx).unwrap();
+    assert!(
+        off.contains("    # ffca: ssl_verify_client optional;\n"),
+        "{off}"
+    );
+    assert!(off.contains("\n    server_name a.example.test;\n"), "{off}");
+}
+
+#[test]
+fn the_parser_undoes_escapes_as_nginx_does() {
+    let parsed = Parsed::new(
+        "set $a \"x\\\"y\\\\z\\q\";\nset $b a\\;b;\nset $c 'tab\\there';\nreturn 200 \"ok\")\n;\n",
+    )
+    .unwrap();
+    let args: Vec<_> = parsed.statements.iter().map(|s| s.args.clone()).collect();
+    assert_eq!(
+        args,
+        [
+            vec!["$a".to_owned(), "x\"y\\z\\q".into()],
+            // `\;` is not an escape: the `\` stays, and the `;` is in the word.
+            vec!["$b".into(), "a\\;b".into()],
+            vec!["$c".into(), "tab\there".into()],
+            vec!["200".into(), "ok".into(), ")".into()],
+        ]
+    );
+    for (text, problem) in [
+        ("set $a \"x\"y;\n", "after a quoted string"),
+        ("set $a \"x\"#c\n;\n", "after a quoted string"),
+        ("; listen 80;\n", "unexpected `;`"),
+    ] {
+        let error = Parsed::new(text).err().unwrap();
+        assert!(
+            format!("{error:#}").contains(problem),
+            "{text:?}: {error:#}"
+        );
+    }
+    // Only space, tab and line ends separate words.
+    let parsed = Parsed::new("server_name a.example.test\u{a0}b.example.test;\n").unwrap();
+    assert_eq!(
+        parsed.statements[0].args,
+        ["a.example.test\u{a0}b.example.test"]
+    );
+}
+
+/// Another tool's block whose name starts with ffca's is not ffca's: turning the site off
+/// leaves it, and a lone `# END ffca` is refused rather than taken as the end of something.
+#[test]
+fn only_ffcas_exact_markers_mark_its_block() {
+    let (_dir, nginx) = folder(&[]);
+    let theirs = "server {
+    listen 443 ssl;
+    server_name a.example.test;
+    # BEGIN ffca-admin-acl (mine)
+    location /admin { deny all; }
+    # END ffca-admin-acl
+}
+";
+    assert_eq!(plan(theirs, 0, Mode::Off, &nginx).unwrap(), theirs);
+    let on = plan(theirs, 0, Mode::Required, &nginx).unwrap();
+    assert_eq!(plan(&on, 0, Mode::Off, &nginx).unwrap(), theirs);
+
+    let stray = theirs.replace("# END ffca-admin-acl", "# END ffca");
+    let error = plan(&stray, 0, Mode::Off, &nginx).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("# END ffca without its # BEGIN ffca"),
+        "{error:#}"
+    );
+}
+
+/// Markers inside a quoted string are text, not comments.
+#[test]
+fn markers_inside_strings_are_not_markers() {
+    let (_dir, nginx) = folder(&[]);
+    let text = "server {
+    listen 443 ssl;
+    server_name a.example.test;
+    add_header X-Note \"
+    # BEGIN ffca
+    \";
+    ssl_verify_client off;
+    add_header X-E \"
+    # END ffca
+\";
+}
+";
+    let planned = plan(text, 0, Mode::Required, &nginx).unwrap();
+    assert!(
+        planned.contains("    # ffca: ssl_verify_client off;\n"),
+        "{planned}"
+    );
+    assert!(planned.contains("add_header X-Note \"\n    # BEGIN ffca\n    \";\n"));
+    assert_eq!(
+        sites_in(Path::new("x.conf"), &planned, &nginx).unwrap()[0].mode,
+        Mode::Required
+    );
+}
+
+#[test]
+fn an_ffca_block_holding_more_than_its_lines_is_left_to_a_person() {
+    let (_dir, nginx) = folder(&[]);
+    let text = "server {
+    listen 443 ssl;
+    server_name a.example.test;
+
+    # BEGIN ffca - client certificates, managed by Friends and Family CA
+    ssl_verify_client on;
+    location /x { return 403; }
+    # END ffca
+}
+";
+    let error = plan(text, 0, Mode::Off, &nginx).unwrap_err();
+    assert!(
+        error.to_string().contains("holds more than its own lines"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn every_ffca_block_goes_when_the_site_is_turned_off() {
+    let (_dir, nginx) = folder(&[]);
+    let text = "server {
+    listen 443 ssl;
+    server_name a.example.test;
+
+    # BEGIN ffca - x
+    ssl_verify_client optional;
+    # END ffca
+
+    # BEGIN ffca - y
+    ssl_client_certificate /etc/nginx/certs/ffca-ca.crt;
+    ssl_crl /etc/nginx/certs/ffca.crl;
+    ssl_verify_client off;
+    # END ffca
+}
+";
+    let off = plan(text, 0, Mode::Off, &nginx).unwrap();
+    assert_eq!(
+        off,
+        "server {\n    listen 443 ssl;\n    server_name a.example.test;\n}\n"
+    );
+    let on = plan(text, 0, Mode::Required, &nginx).unwrap();
+    assert_eq!(on.matches("# BEGIN ffca").count(), 1, "{on}");
+}
+
+#[test]
+fn the_folder_in_nginx_is_checked_where_it_is_written() {
+    let (_dir, mut nginx) = folder(&[]);
+    nginx.ca_files_in_nginx = "/etc/x;#".into();
+    assert!(plan(BOOKS, 0, Mode::Required, &nginx).is_err());
+}
+
+#[test]
+fn listen_addresses_are_grouped_as_nginx_groups_them() {
+    assert_eq!(listen_address("443"), "*:443");
+    assert_eq!(listen_address("*:443"), "*:443");
+    assert_eq!(listen_address("0.0.0.0:443"), "*:443");
+    assert_eq!(listen_address("[::]:443"), "[::]:443");
+    assert_eq!(listen_address("127.0.0.1"), "127.0.0.1:80");
+    assert_eq!(listen_address("[::1]"), "[::1]:80");
+}
+
+const SECOND_BOOKS: &str = "server {
+    listen *:443 ssl;
+    server_name Books.example.org;
+}
+";
+
+/// nginx serves the first of two blocks with a name on an address and ignores the other, so
+/// whatever the other says about certificates does not count.
+#[test]
+fn a_name_two_blocks_claim_is_marked_and_not_set() {
+    let (dir, mut nginx) = folder(&[("books.conf", BOOKS), ("books-old.conf", SECOND_BOOKS)]);
+    let sites = survey(&nginx).unwrap().sites;
+    assert!(sites.iter().all(|s| s.duplicate), "{sites:?}");
+    let (_dir2, alone) = folder(&[("books.conf", BOOKS), ("photos.conf", PHOTOS)]);
+    assert!(survey(&alone).unwrap().sites.iter().all(|s| !s.duplicate));
+
+    nginx.test =
+        "echo nginx: [warn] conflicting server name \"books.example.org\" on 0.0.0.0:443, ignored"
+            .into();
+    let ca = ca(dir.path());
+    let site = sites
+        .iter()
+        .find(|s| s.file_name() == "books.conf")
+        .unwrap();
+    let error = set_mode(&nginx, &ca, site, Mode::Required).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("two server blocks for books.example.org"),
+        "{error:#}"
+    );
+    assert_eq!(
+        fs::read_to_string(nginx.sites.join("books.conf")).unwrap(),
+        BOOKS
+    );
+    assert!(
+        set_mode(&nginx, &ca, site, Mode::Off).is_ok(),
+        "turning it off is never what lets anyone in"
+    );
+}
+
+/// What another tool writes into the file while nginx tests ffca's change is not overwritten by
+/// putting the file back.
+#[test]
+fn a_file_changed_during_the_test_is_left_as_it_is() {
+    let (dir, mut nginx) = folder(&[("books.conf", BOOKS)]);
+    let file = nginx.sites.join("books.conf");
+    let script = dir.path().join("test.sh");
+    fs::write(
+        &script,
+        format!("#!/bin/sh\necho '# theirs' >> {}\nexit 1\n", file.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    nginx.test = script.display().to_string();
+    let ca = ca(dir.path());
+    let error = set_mode(&nginx, &ca, &only_site(&nginx), Mode::Required).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("changed while ffca was changing it"),
+        "{error:#}"
+    );
+    assert!(fs::read_to_string(&file).unwrap().ends_with("# theirs\n"));
+}
+
+/// A folder someone else could write is one where they could swap a site for a link, or put
+/// their own CA where nginx reads this one's: ffca writes into neither.
+#[test]
+fn folders_others_could_change_are_refused() {
+    let (dir, nginx) = folder(&[("books.conf", BOOKS)]);
+    let ca = ca(dir.path());
+    let site = only_site(&nginx);
+    fs::set_permissions(&nginx.sites, fs::Permissions::from_mode(0o775)).unwrap();
+    let error = set_mode(&nginx, &ca, &site, Mode::Required).unwrap_err();
+    assert!(error.to_string().contains("chmod go-w"), "{error:#}");
+    assert_eq!(fs::read_to_string(&site.file).unwrap(), BOOKS);
+    fs::set_permissions(&nginx.sites, fs::Permissions::from_mode(0o755)).unwrap();
+
+    fs::set_permissions(&nginx.ca_files, fs::Permissions::from_mode(0o777)).unwrap();
+    let error = publish(&nginx, &ca).unwrap_err();
+    assert!(error.to_string().contains("chmod go-w"), "{error:#}");
+}
+
+#[test]
+fn the_ca_files_folder_is_made_readable_and_writable_by_its_owner_only() {
+    let dir = crate::test_dir();
+    let nginx = settings(dir.path());
+    publish(&nginx, &ca(dir.path())).unwrap();
+    assert_eq!(
+        fs::metadata(&nginx.ca_files).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
+}
+
+#[test]
+fn an_enrollment_file_ffca_cannot_read_is_not_written_over() {
+    let (dir, nginx) = folder(&[("cloud.conf", CLOUD)]);
+    let (file, text) = enrollment_site(&nginx, &enrollment("http://ffca:8080")).unwrap();
+    fs::write(&file, b"\xff\xfe not text").unwrap();
+    let error = write_enrollment_site(&nginx, &ca(dir.path()), &file, &text).unwrap_err();
+    assert!(
+        error.to_string().contains("move it away first"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"\xff\xfe not text");
+}
+
+/// A template's file name goes into a comment: nothing in it can start a line of its own.
+#[test]
+fn the_template_file_name_cannot_add_lines() {
+    let (_dir, nginx) = folder(&[("a\nserver { return 302 http:evil; }\n#.conf", CLOUD)]);
+    let (_, text) = enrollment_site(&nginx, &enrollment("http://ffca:8080")).unwrap();
+    assert!(
+        text.contains("# TLS certificate and includes are copied from a?server { return 302"),
+        "{text}"
+    );
+    assert_eq!(Parsed::new(&text).unwrap().servers().len(), 1);
+}
+
+/// Copied arguments are written back so that nginx reads what it read in the template.
+#[test]
+fn copied_arguments_read_back_as_they_were() {
+    let template = CLOUD.replace(
+        "include /etc/nginx/snippets/logging.conf;",
+        "include \"/etc/a\\\"b c.conf\" /etc/x\\ty.conf;",
+    );
+    let (_dir, nginx) = folder(&[("cloud.conf", &template)]);
+    let (_, text) = enrollment_site(&nginx, &enrollment("http://ffca:8080")).unwrap();
+    let original = Parsed::new(&template).unwrap();
+    let copied = Parsed::new(&text).unwrap();
+    let include = |p: &Parsed| {
+        directives(p.servers()[0].block.as_deref().unwrap(), "include")
+            .next()
+            .unwrap()
+            .args
+            .clone()
+    };
+    assert_eq!(include(&copied), include(&original));
+    assert_eq!(include(&original), ["/etc/a\"b c.conf", "/etc/x\ty.conf"]);
+}
+
+#[test]
+fn the_enrollment_host_is_checked_where_it_is_written() {
+    let (_dir, nginx) = folder(&[("cloud.conf", CLOUD)]);
+    let mut bad = enrollment("http://ffca:8080");
+    bad.host = "k.example.org; return 302 x".into();
+    assert!(enrollment_site(&nginx, &bad).is_err());
+}
+
+/// A block another tool left without its end is not kept, and does not hide the blocks after it.
+#[test]
+fn a_block_without_its_end_does_not_swallow_the_rest() {
+    let text = "# BEGIN broken\nx\n# BEGIN stop-bots (DO NOT EDIT)\nif ($a) { return 444; }\n# END stop-bots\n";
+    assert_eq!(
+        foreign_blocks(text),
+        [vec![
+            "# BEGIN stop-bots (DO NOT EDIT)".to_owned(),
+            "if ($a) { return 444; }".into(),
+            "# END stop-bots".into(),
+        ]]
+    );
 }

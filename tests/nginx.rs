@@ -105,6 +105,12 @@ impl Nginx {
         )
         .unwrap();
         std::fs::create_dir(config.path().join("sites")).unwrap();
+        // ffca writes only into a folder nobody else can change, whatever the umask made it.
+        std::fs::set_permissions(
+            config.path().join("sites"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
         for (name, text) in sites {
             std::fs::write(
                 config.path().join("sites").join(name),
@@ -818,29 +824,6 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         Some("127.0.0.1, an unknown device")
     );
 
-    // The invite's secret is nowhere in nginx's access log; other requests to the site are.
-    let (status, _) = fetch_through(&nginx, "https://k.example.test/", &[]);
-    assert_eq!(status, 200);
-    let token = made.link.rsplit('/').next().unwrap();
-    let log = || {
-        let output = Command::new(&nginx.engine)
-            .args(["exec", &nginx.container, "cat", "/tmp/access.log"])
-            .output()
-            .unwrap();
-        String::from_utf8_lossy(&output.stdout).into_owned()
-    };
-    until(
-        || log().contains("k.example.test \"GET / HTTP"),
-        "the enrollment site's own requests are logged",
-    );
-    let log = log();
-    for line in log.lines().filter(|l| l.starts_with("k.example.test ")) {
-        assert!(
-            !line.contains(token) && !line.contains("/d/"),
-            "an invite's secret in the access log:\n{log}"
-        );
-    }
-
     // stop-bots' filter, written into the site as stop-bots does, survives ffca rewriting it.
     let written = std::fs::read_to_string(&file).unwrap();
     let filter = "    # BEGIN stop-bots (DO NOT EDIT)\n    if ($http_user_agent ~* \"BadBot\") {\n        return 403;\n    }\n    # END stop-bots\n";
@@ -857,6 +840,43 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         "the bot filter still turns bots away",
     );
     assert_eq!(fetch(&nginx, "https://k.example.test/", &[]).0, 200);
+
+    // The invite's secret is nowhere in nginx's access log: not from the requests the page
+    // answered, nor from those the bot filter turned away before nginx chose a location - as it
+    // turns away chat apps fetching a link to preview it.
+    let download = format!("https://k.example.test{p12_path}");
+    assert_eq!(fetch(&nginx, &made.link, &["-A", "BadBot"]).0, 403);
+    assert_eq!(fetch(&nginx, &download, &["-A", "BadBot"]).0, 403);
+    let log = || {
+        let output = Command::new(&nginx.engine)
+            .args(["exec", &nginx.container, "cat", "/tmp/access.log"])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    until(
+        || log().contains("books.example.test \"GET / HTTP"),
+        "the protected site's requests are logged",
+    );
+    // Lines are by the site that answered: a worker from before the enrollment site existed
+    // answers for the protected one, and that is the test's doing, not the site's.
+    let log = log();
+    let token = made.link.rsplit('/').next().unwrap();
+    let id = p12_path.split('/').nth(2).unwrap();
+    assert!(
+        !log.lines()
+            .filter(|l| l.contains(" 403"))
+            .any(|l| l.contains(token) || l.contains(id)),
+        "an invite's secret in the access log:\n{log}"
+    );
+    let enrollment_lines: Vec<&str> = log
+        .lines()
+        .filter(|l| l.starts_with("k.example.test "))
+        .collect();
+    assert!(
+        enrollment_lines.is_empty(),
+        "the enrollment site in the access log:\n{log}"
+    );
 }
 
 /// `fetch`, asked again while nginx refuses it with 400 itself: after a reload, a worker of the

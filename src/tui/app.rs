@@ -497,7 +497,7 @@ impl App {
             let settings = config::Nginx {
                 sites: sites.into(),
                 ca_files: ca_files.into(),
-                ca_files_in_nginx: in_nginx.into(),
+                ca_files_in_nginx: config::checked_folder_in_nginx(std::path::Path::new(in_nginx))?,
                 test: test.clone(),
                 reload: reload.clone(),
             };
