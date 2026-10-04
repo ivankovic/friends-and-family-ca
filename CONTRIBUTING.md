@@ -147,10 +147,13 @@ of the repository; `AGENT_LOG.md` at the root is git-ignored for that. `REVIEW.m
 
 ## Makefile targets
 
-* `test` - `cargo nextest run`: the unit tests and the end-to-end tests in `tests/` (see "End-to-end
-  tests" for what those need). Requires `cargo-nextest` (`cargo install cargo-nextest`, one-time).
-* `build` - `cargo build --release`. It does not run the tests.
-* `install` - `cargo install --path . --force`, so `ffca` on `PATH` matches this checkout.
+* `test` - `cargo nextest run --locked`: the unit tests and the end-to-end tests in `tests/` (see
+  "End-to-end tests" for what those need). Requires `cargo-nextest` (`cargo install cargo-nextest
+  --locked`, one-time).
+* `build` - `cargo build --release --locked`. It does not run the tests.
+* `install` - `test`, then `build`, then the binary installed as `/usr/local/bin/ffca` (`PREFIX`
+  changes `/usr/local`), with `sudo` if that folder is not writable. A failing test installs
+  nothing. This is how a server gets `ffca`: see `packaging/README.md`.
 * `install-hooks` - one-time setup that points git at `.githooks/`. `pre-commit` formats the Rust
   and Python a commit stages (`cargo fmt`, `ruff format`). `pre-push` runs the fast subset of what
   CI checks (`cargo fmt --check`, `cargo clippy`, `ruff`) before a `git push` leaves your machine -

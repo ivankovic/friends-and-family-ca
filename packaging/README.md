@@ -18,11 +18,15 @@ The steps below use a Docker Compose setup with nginx in a container, on a serve
 
 ```sh
 cd friends-and-family-ca
-cargo build --release
-sudo install -m 0755 target/release/ffca /usr/local/bin/ffca
+git pull
+make install
 ```
 
-The host needs the `openssl` command, which makes the `.p12` files. Most distributions have it.
+`make install` runs the whole test suite, builds the release, and installs it as
+`/usr/local/bin/ffca`, asking for `sudo` for that last step. Nothing is installed if a test fails.
+The tests need `cargo-nextest` (`cargo install cargo-nextest --locked`), and the end-to-end ones
+`openssl`, `curl`, `script` and podman or docker; the host needs the `openssl` command anyway, to
+make the `.p12` files.
 
 ## 2. Create the CA
 
@@ -129,8 +133,7 @@ list reaches nginx at once.
 ## Updating
 
 ```sh
-cd friends-and-family-ca && git pull
-cargo build --release && sudo install -m 0755 target/release/ffca /usr/local/bin/ffca
+cd friends-and-family-ca && git pull && make install
 sudo docker compose up -d --build ffca
 ```
 
