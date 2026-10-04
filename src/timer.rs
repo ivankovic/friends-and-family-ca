@@ -81,7 +81,9 @@ pub fn units(binary: &Path, state: &Path) -> [(&'static str, String); 2] {
 /// spaces, so that tests can stand in for it).
 pub fn install(unit_dir: &Path, systemctl: &str, binary: &Path, state: &Path) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
-    check_binary(binary, std::fs::metadata(unit_dir)?.uid())?;
+    let owner = std::fs::metadata(unit_dir)?.uid();
+    check_binary(binary, owner)?;
+    Store::new(state).check_owner(owner, &[crate::config::FILE])?;
     let store = Store::new(unit_dir);
     for (name, text) in units(binary, state) {
         store.write(name, text.as_bytes(), PUBLIC)?;
@@ -206,7 +208,7 @@ mod tests {
             dir.path(),
             script.to_str().unwrap(),
             &binary,
-            Path::new("/var/lib/ffca"),
+            &dir.path().join("state"),
         )
         .unwrap();
         assert!(dir.path().join(SERVICE).exists() && dir.path().join(TIMER).exists());
@@ -214,6 +216,24 @@ mod tests {
             std::fs::read_to_string(log).unwrap(),
             format!("daemon-reload\nenable --now {TIMER}\n")
         );
+    }
+
+    #[test]
+    fn a_state_folder_others_could_change_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = crate::test_dir();
+        let binary = fake_binary(dir.path());
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let units = dir.path().join("units");
+        std::fs::create_dir(&units).unwrap();
+        let error = install(&units, "true", &binary, &state).unwrap_err();
+        assert!(
+            error.to_string().contains("can be changed by others"),
+            "{error}"
+        );
+        assert!(!units.join(SERVICE).exists(), "nothing is installed");
     }
 
     #[test]

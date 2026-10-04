@@ -394,13 +394,62 @@ impl Ca {
         Ok(revoked)
     }
 
-    /// Changes the ledger under the lock, signing no CRL: for records that revoke nothing.
+    /// Changes the ledger under the lock, signing no CRL: for records that revoke nothing. The
+    /// ledger is written only if `f` changed it.
     pub fn change<T>(&self, f: impl FnOnce(&mut Ledger) -> Result<T>) -> Result<T> {
+        self.change_then(f, |_| Ok(()))
+    }
+
+    /// As [`Ca::change`], then runs `then` while the lock is still held: for a file that the
+    /// ledger must record before it exists, and that no other process may find missing before it
+    /// is written.
+    pub fn change_then<T>(
+        &self,
+        f: impl FnOnce(&mut Ledger) -> Result<T>,
+        then: impl FnOnce(&T) -> Result<()>,
+    ) -> Result<T> {
         let _lock = self.store.lock()?;
         let mut ledger = self.ledger()?;
+        let before = ledger.clone();
         let result = f(&mut ledger)?;
-        ledger.save(&self.store)?;
+        if ledger != before {
+            ledger.save(&self.store)?;
+        }
+        then(&result)?;
         Ok(result)
+    }
+
+    /// Changes the ledger under the lock and, if `f` revoked anything, signs a new CRL: the
+    /// revocation is saved in the same write as the rest of the change, so the two never come
+    /// apart. Says whether it signed. The ledger is written only if `f` changed it.
+    pub fn change_and_sign<T>(
+        &self,
+        now: OffsetDateTime,
+        f: impl FnOnce(&mut Ledger) -> Result<T>,
+    ) -> Result<(T, bool)> {
+        let now = whole_seconds(now);
+        let _lock = self.store.lock()?;
+        let mut ledger = self.ledger()?;
+        let before = ledger.clone();
+        let result = f(&mut ledger)?;
+        if ledger == before {
+            return Ok((result, false));
+        }
+        let revoked = |ledger: &Ledger| {
+            ledger
+                .certificates()
+                .filter(|(_, certificate)| certificate.revoked.is_some())
+                .count()
+        };
+        let sign = revoked(&ledger) != revoked(&before);
+        if sign {
+            self.advance_crl_number(&mut ledger)?;
+        }
+        ledger.save(&self.store)?;
+        if sign {
+            self.write_crl(&ledger, now)?;
+        }
+        Ok((result, sign))
     }
 
     /// Renames a person, a device or an agent (see [`Ledger::rename`]).
@@ -531,7 +580,7 @@ fn request_key(pem: &str) -> Result<Vec<u8>> {
 }
 
 /// Certificates and CRLs carry whole seconds; the ledger records the same instants they do.
-fn whole_seconds(time: OffsetDateTime) -> OffsetDateTime {
+pub(crate) fn whole_seconds(time: OffsetDateTime) -> OffsetDateTime {
     time.replace_nanosecond(0)
         .expect("zero is a valid nanosecond")
 }

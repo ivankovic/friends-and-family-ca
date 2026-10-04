@@ -67,6 +67,14 @@ pub fn issue_to_files(
             file.write_all(key_pem.as_bytes())
                 .with_context(|| format!("cannot write {}", paths[1].display()))?;
         }
+        // On the disk before the command says so: the ledger already holds the certificate.
+        for (file, path) in files.iter().zip(&paths) {
+            file.sync_all()
+                .with_context(|| format!("cannot write {}", path.display()))?;
+        }
+        File::open(out)
+            .and_then(|folder| folder.sync_all())
+            .with_context(|| format!("cannot write {}", out.display()))?;
         Ok(issued)
     })();
     match written {

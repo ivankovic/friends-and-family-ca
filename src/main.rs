@@ -169,6 +169,12 @@ fn main() -> Result<()> {
     let command = args.command.unwrap_or(Command::Tui {
         out: PathBuf::from("."),
     });
+    // As root, ffca runs the commands the state folder's config.toml names; the enrollment page
+    // runs as nobody, and reads only its invites.
+    let as_root = unsafe { libc::geteuid() } == 0;
+    if as_root && !matches!(command, Command::Serve { .. } | Command::Healthz { .. }) {
+        store.check_owner(0, &[friends_and_family_ca::config::FILE])?;
+    }
     match command {
         Command::Tui { out } => friends_and_family_ca::tui::run(store, out)?,
         Command::Healthz { address } => {

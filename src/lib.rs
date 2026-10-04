@@ -36,13 +36,17 @@ pub mod tui;
 
 /// A temporary folder for a test, in memory where the system has `/dev/shm`. [`store::Store`]
 /// syncs every write to disk, which on a busy disk makes a test that issues a few certificates
-/// take a second; on tmpfs a sync costs nothing.
+/// take a second; on tmpfs a sync costs nothing. It is its owner's alone, as the folder the CA
+/// lives in must be, whatever the umask.
 #[cfg(test)]
 pub(crate) fn test_dir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
     let shm = std::path::Path::new("/dev/shm");
+    let mut builder = tempfile::Builder::new();
+    builder.permissions(std::fs::Permissions::from_mode(0o700));
     if shm.is_dir() {
-        tempfile::tempdir_in(shm).unwrap()
+        builder.tempdir_in(shm).unwrap()
     } else {
-        tempfile::tempdir().unwrap()
+        builder.tempdir().unwrap()
     }
 }
