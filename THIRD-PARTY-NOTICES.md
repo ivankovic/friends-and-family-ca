@@ -10,7 +10,7 @@ later (see LICENSE), or under a commercial license (see LICENSE-COMMERCIAL).
 
 ## Overview
 
-- Apache License 2.0: 121 crates
+- Apache License 2.0: 118 crates
 - MIT License: 33 crates
 - ISC License: 17 crates
 - Unicode License v3: 1 crate
@@ -3111,7 +3111,6 @@ Used by:
 - either 1.18.0 (https://github.com/rayon-rs/either)
 - equivalent 1.0.2 (https://github.com/indexmap-rs/equivalent)
 - errno 0.3.14 (https://github.com/lambda-fairy/rust-errno)
-- fastrand 2.5.0 (https://github.com/smol-rs/fastrand)
 - hashbrown 0.16.1 (https://github.com/rust-lang/hashbrown)
 - hashbrown 0.17.1 (https://github.com/rust-lang/hashbrown)
 - heck 0.5.0 (https://github.com/withoutboats/heck)
@@ -3124,7 +3123,6 @@ Used by:
 - num-integer 0.1.47 (https://github.com/rust-num/num-integer)
 - num-traits 0.2.19 (https://github.com/rust-num/num-traits)
 - oid-registry 0.8.1 (https://github.com/rusticata/oid-registry.git)
-- once_cell 1.21.4 (https://github.com/matklad/once_cell)
 - parking_lot 0.12.5 (https://github.com/Amanieu/parking_lot)
 - parking_lot_core 0.9.12 (https://github.com/Amanieu/parking_lot)
 - ring 0.17.14 (https://github.com/briansmith/ring)
@@ -3135,7 +3133,6 @@ Used by:
 - signal-hook-registry 1.4.8 (https://github.com/vorner/signal-hook)
 - signal-hook 0.3.18 (https://github.com/vorner/signal-hook)
 - smallvec 1.16.2 (https://github.com/servo/rust-smallvec)
-- tempfile 3.27.0 (https://github.com/Stebalien/tempfile)
 - unicode-segmentation 1.13.3 (https://github.com/unicode-rs/unicode-segmentation)
 - unicode-truncate 2.0.1 (https://github.com/Aetf/unicode-truncate)
 - unicode-width 0.2.2 (https://github.com/unicode-rs/unicode-width)
