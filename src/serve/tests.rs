@@ -228,6 +228,134 @@ fn no_way_of_writing_a_path_puts_a_secret_in_the_log() {
     );
 }
 
+/// Paths the page does not answer by - a dot segment, an escaped slash, a token spelled twice
+/// over - are not shown whole, however much of a token they carry.
+#[test]
+fn a_path_the_page_does_not_answer_is_not_shown_whole() {
+    let token = "lKrtAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAANdr8";
+    let id = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    for path in [
+        format!("/i/./{token}"),
+        format!("/x/../i/{token}"),
+        format!("/i%2F{token}"),
+        format!("/i/{token}/more"),
+        format!("/{token}"),
+        format!("/d/./{id}/anna-phone.p12"),
+        format!("/{id}"),
+        format!("/i/%25{}", token.replace('A', "%41")),
+    ] {
+        let shown = redact(&path);
+        assert!(
+            !shown.contains("AAAAAAAA") && !shown.contains("%41%41"),
+            "{path} -> {shown}"
+        );
+    }
+    assert_eq!(redact("/robots.txt"), "/robots.txt");
+    assert_eq!(
+        redact("/.well-known/security.txt"),
+        "/.well-known/security.txt"
+    );
+}
+
+fn request(headers: &[(&str, &str)]) -> http::Request {
+    http::Request {
+        method: "GET".to_owned(),
+        target: "/".to_owned(),
+        headers: headers
+            .iter()
+            .map(|(n, v)| (n.to_string(), v.to_string()))
+            .collect(),
+        peer: "172.18.0.5:41000".parse().unwrap(),
+    }
+}
+
+/// The address an invite is collected from is nginx's word for it, or the connection's: never
+/// text a client made up.
+#[test]
+fn the_client_address_is_an_address() {
+    assert_eq!(
+        client_address(&request(&[("x-real-ip", "203.0.113.7")])).to_string(),
+        "203.0.113.7"
+    );
+    assert_eq!(
+        client_address(&request(&[("X-Real-IP", "2001:db8::1")])).to_string(),
+        "2001:db8::1"
+    );
+    for forged in ["9.9.9.9\nPOST /i/x 200 (", "evil", ""] {
+        assert_eq!(
+            client_address(&request(&[("X-Real-IP", forged)])).to_string(),
+            "172.18.0.5",
+            "{forged:?}"
+        );
+    }
+    assert_eq!(client_address(&request(&[])).to_string(), "172.18.0.5");
+}
+
+#[test]
+fn a_log_line_is_one_line() {
+    let line = log_line(
+        "GET",
+        "/x\n%0A\u{1b}[2K",
+        404,
+        "203.0.113.7".parse().unwrap(),
+        "iPhone",
+    );
+    assert_eq!(line, "GET /x[2K 404 (203.0.113.7, iPhone)");
+}
+
+/// The whole page, through its HTTP server: the security headers on every answer, and a download
+/// named for the person.
+#[test]
+fn every_answer_forbids_caching_and_scripts() {
+    let dir = crate::test_dir();
+    let (_ca, page, token) = page_with_invite(dir.path());
+    let page = Mutex::new(page);
+    let mut post = request(&[("X-Real-IP", "203.0.113.7"), ("User-Agent", "iPhone")]);
+    post.method = "POST".to_owned();
+    post.target = format!("/i/{token}");
+    let answer = handle(&post, &page, NOW);
+    assert_eq!(answer.status, 200);
+    let body = String::from_utf8(answer.body.clone()).unwrap();
+    let mut get = request(&[]);
+    get.target = link(&body, "p12");
+    let file = handle(&get, &page, NOW);
+    for response in [&answer, &file] {
+        let header = |name: &str| {
+            response
+                .headers
+                .iter()
+                .find(|(n, _)| *n == name)
+                .map(|(_, v)| v.as_str())
+        };
+        assert_eq!(header("Cache-Control"), Some("no-store"));
+        assert_eq!(header("Referrer-Policy"), Some("no-referrer"));
+        assert!(
+            header("Content-Security-Policy")
+                .unwrap()
+                .starts_with("default-src 'none'")
+        );
+    }
+    assert_eq!(file.status, 200);
+    assert!(
+        file.headers
+            .iter()
+            .any(|(n, v)| *n == "Content-Disposition" && v.contains("anna-phone.p12"))
+    );
+}
+
+/// The password is on the page once, for both downloads: the profile no longer carries it.
+#[test]
+fn the_password_is_shown_for_both_downloads() {
+    let dir = crate::test_dir();
+    let (_ca, mut page, token) = page_with_invite(dir.path());
+    let body = text(&page.answer("POST", &format!("/i/{token}"), "x", NOW));
+    assert_eq!(body.matches("<code>").count(), 1, "{body}");
+    let password = body.find("<code>").unwrap();
+    assert!(password < body.find(".mobileconfig").unwrap());
+    assert!(password < body.find(".p12").unwrap());
+    assert!(body.contains("type the password when it asks"), "{body}");
+}
+
 /// Browsers percent-encode what is not ASCII: a Croatian name's files still download.
 #[test]
 fn a_name_that_is_not_ascii_still_downloads() {

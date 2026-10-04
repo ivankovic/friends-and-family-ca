@@ -28,6 +28,7 @@
     init: true                                             # stops at once when told to: the
                                                            # page is the container's first process
     mem_limit: 128m
+    pids_limit: 64                                         # its threads: a fixed few
     read_only: true
     security_opt:
       - no-new-privileges:true

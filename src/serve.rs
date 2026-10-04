@@ -23,27 +23,30 @@
 //! * `GET /i/<token>` shows whose certificate it is and a button. Opening the link does not use
 //!   it up: chat apps fetch links to preview them, and that must not spend an invite.
 //! * `POST /i/<token>` - the button - collects the invite (`crate::invite::collect`) and shows how
-//!   to install it: a profile for iPhone and iPad, a `.p12` and its password for everything else.
+//!   to install it: a profile for iPhone and iPad, a `.p12` for everything else, and the password
+//!   both ask for while installing.
 //!   The two files are kept in memory for [`DOWNLOAD_WINDOW`], under a random address of their
 //!   own, so that the person can try both, or again, without a second invite.
 //! * `GET /d/<id>/<file>` serves them.
 //!
 //! Every answer forbids caching and referrers - the token is in the address - and the page has no
 //! scripts. Requests are logged without their tokens.
+//!
+//! The HTTP underneath is [`http`]'s, made for nginx in front and wary of whoever is not.
+
+pub mod http;
 
 use std::collections::HashMap;
-use std::io::Read;
+use std::net::{IpAddr, TcpListener};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context, Result, anyhow};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use time::{Duration, OffsetDateTime};
 
 use crate::invite::{self, Payload, Unavailable};
-
-/// Requests answered at once; beyond, the page says it is busy.
-const MAX_IN_FLIGHT: usize = 32;
 
 /// How long the files of a collected invite can be downloaded.
 pub const DOWNLOAD_WINDOW: Duration = Duration::minutes(10);
@@ -93,16 +96,26 @@ impl Page {
                 Ok(payload) => html(200, &payload.holder, &invitation(token, &payload)),
                 Err(unavailable) => unavailable_page(unavailable),
             },
-            ("POST", ["i", token]) => match invite::collect(&self.folder, token, now, client) {
-                Ok(payload) => {
-                    let id = random_id();
-                    let body = installation(&id, &payload);
-                    let title = payload.holder.clone();
-                    self.downloads.insert(id, (payload, now + DOWNLOAD_WINDOW));
-                    html(200, &title, &body)
+            ("POST", ["i", token]) => {
+                // Made before the invite is collected: without it, the files could not be offered.
+                let Some(id) = random_id() else {
+                    return html(
+                        503,
+                        "Try again",
+                        "<h1>Something went wrong</h1><p>The invite is still unused. Try again in a minute.</p>",
+                    );
+                };
+                match invite::collect(&self.folder, token, now, client) {
+                    Ok(payload) => {
+                        let body = installation(&id, &payload);
+                        let title = payload.holder.clone();
+                        let until = now.checked_add(DOWNLOAD_WINDOW).unwrap_or(now);
+                        self.downloads.insert(id, (payload, until));
+                        html(200, &title, &body)
+                    }
+                    Err(unavailable) => unavailable_page(unavailable),
                 }
-                Err(unavailable) => unavailable_page(unavailable),
-            },
+            }
             ("GET", ["d", id, file]) => match self.downloads.get(*id) {
                 Some((payload, _)) if *file == format!("{}.mobileconfig", payload.stem) => Reply {
                     status: 200,
@@ -129,8 +142,8 @@ impl Page {
 
 /// Serves the page on `listen` until the process ends.
 pub fn run(listen: &str, folder: PathBuf) -> Result<()> {
-    let server =
-        tiny_http::Server::http(listen).map_err(|e| anyhow!("cannot listen on {listen}: {e}"))?;
+    let listener =
+        TcpListener::bind(listen).with_context(|| format!("cannot listen on {listen}"))?;
     // In a container the page is the first process, which gets no default handling of SIGTERM:
     // without this, `docker stop` waits and then kills it. Nothing is lost by exiting at once - a
     // collected invite's files are only ever in memory, for ten minutes.
@@ -140,58 +153,34 @@ pub fn run(listen: &str, folder: PathBuf) -> Result<()> {
         "ffca serve: listening on {listen}, invites in {}",
         folder.display()
     );
-    // A thread per request: one that is slow to send its body holds up only itself. Bounded, so
-    // that a flood of them cannot exhaust the container.
-    let page = std::sync::Arc::new(std::sync::Mutex::new(Page::new(folder)));
-    let in_flight = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    for request in server.incoming_requests() {
-        use std::sync::atomic::Ordering;
-        if in_flight.fetch_add(1, Ordering::SeqCst) >= MAX_IN_FLIGHT {
-            in_flight.fetch_sub(1, Ordering::SeqCst);
-            let _ = request.respond(tiny_http::Response::empty(503));
-            continue;
-        }
-        let (page, in_flight) = (page.clone(), in_flight.clone());
-        std::thread::spawn(move || {
-            handle(request, &page);
-            in_flight.fetch_sub(1, Ordering::SeqCst);
-        });
-    }
-    Ok(())
+    let page = Mutex::new(Page::new(folder));
+    http::serve(
+        listener,
+        http::Limits::default(),
+        Arc::new(move |request: &http::Request| handle(request, &page, OffsetDateTime::now_utc())),
+    )
 }
 
-/// Answers one request.
-fn handle(mut request: tiny_http::Request, page: &std::sync::Mutex<Page>) {
-    let method = request.method().as_str().to_owned();
-    let path = request.url().to_owned();
-    let header = |name: &str| {
-        request
-            .headers()
-            .iter()
-            .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
-            .map(|h| h.value.as_str().to_owned())
-    };
-    let address = header("X-Real-IP")
-        .or_else(|| request.remote_addr().map(|a| a.ip().to_string()))
-        .unwrap_or_default();
-    let device = device(&header("User-Agent").unwrap_or_default());
-    // The button's form has no fields; whatever came is read and dropped.
-    let _ = std::io::copy(
-        &mut request.as_reader().take(64 * 1024),
-        &mut std::io::sink(),
-    );
+/// Answers one request, made at `now`, and logs it.
+fn handle(request: &http::Request, page: &Mutex<Page>, now: OffsetDateTime) -> http::Response {
+    let address = client_address(request);
+    let device = device(request.header("User-Agent").unwrap_or_default());
     let reply = page.lock().unwrap_or_else(|p| p.into_inner()).answer(
-        &method,
-        &path,
+        &request.method,
+        &request.target,
         &format!("{address}, {device}"),
-        OffsetDateTime::now_utc(),
+        now,
     );
     eprintln!(
-        "{method} {} {} ({address}, {device})",
-        redact(&path),
-        reply.status
+        "{}",
+        log_line(
+            &request.method,
+            &request.target,
+            reply.status,
+            address,
+            device
+        )
     );
-    let mut response = tiny_http::Response::from_data(reply.body).with_status_code(reply.status);
     let mut headers = vec![
             ("Content-Type", reply.content_type.to_owned()),
             ("Cache-Control", "no-store".to_owned()),
@@ -205,14 +194,28 @@ fn handle(mut request: tiny_http::Request, page: &std::sync::Mutex<Page>) {
     if let Some(name) = reply.attachment {
         headers.push(("Content-Disposition", disposition(&name)));
     }
-    for (name, value) in headers {
-        if let Ok(header) = tiny_http::Header::from_bytes(name.as_bytes(), value.as_bytes()) {
-            response = response.with_header(header);
-        }
+    http::Response {
+        status: reply.status,
+        headers,
+        body: reply.body,
     }
-    if let Err(error) = request.respond(response) {
-        eprintln!("ffca serve: cannot answer: {error}");
-    }
+}
+
+/// Where a request comes from: the address nginx gives in `X-Real-IP`, or, without one that is an
+/// address, the connection's own.
+fn client_address(request: &http::Request) -> IpAddr {
+    request
+        .header("X-Real-IP")
+        .and_then(|a| a.parse().ok())
+        .unwrap_or(request.peer.ip())
+}
+
+/// The log's line for a request: its path without secrets, and nothing that could forge a line.
+fn log_line(method: &str, path: &str, status: u16, address: IpAddr, device: &str) -> String {
+    format!("{method} {} {status} ({address}, {device})", redact(path))
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect()
 }
 
 /// A path as the page reads it: without its query, in segments, each percent-decoded - a browser
@@ -253,12 +256,23 @@ fn percent_decode(segment: &str) -> String {
 
 /// A path as the log shows it: from the same segments the page answers by, with tokens and
 /// download addresses left out, and nothing that could forge a log line.
+///
+/// A path that is not the page's own is shown only if it is too short to hold a secret: a token
+/// is 43 characters and a download address 32, however a client spells the rest of the path.
 fn redact(path: &str) -> String {
+    const LONGEST_SHOWN: usize = 31;
     let parts = route(path);
     let shown = match parts.as_slice() {
         [i, _] if i == "i" => "/i/…".to_owned(),
         [d, _, file] if d == "d" => format!("/d/…/{file}"),
-        _ => format!("/{}", parts.join("/")),
+        _ => {
+            let whole = format!("/{}", parts.join("/"));
+            if whole.chars().count() <= LONGEST_SHOWN {
+                whole
+            } else {
+                format!("/… ({} characters)", whole.chars().count())
+            }
+        }
     };
     shown
         .chars()
@@ -308,10 +322,11 @@ fn device(user_agent: &str) -> &'static str {
     "an unknown device"
 }
 
-fn random_id() -> String {
+/// A download's address, or `None` if the system has no randomness to give.
+fn random_id() -> Option<String> {
     let mut bytes = [0u8; 24];
-    getrandom::fill(&mut bytes).expect("randomness");
-    URL_SAFE_NO_PAD.encode(bytes)
+    getrandom::fill(&mut bytes).ok()?;
+    Some(URL_SAFE_NO_PAD.encode(bytes))
 }
 
 fn unavailable_page(unavailable: Unavailable) -> Reply {
@@ -343,15 +358,16 @@ fn invitation(token: &str, payload: &Payload) -> String {
 fn installation(id: &str, payload: &Payload) -> String {
     format!(
         r#"<h1>{holder}</h1>
+<p>The certificate's password: <code>{password}</code></p>
+<p class="small">Installing it asks for this password.</p>
 <h2>iPhone or iPad</h2>
 <p><a class="button" href="/d/{id}/{stem}.mobileconfig">Download the profile</a></p>
 <ol>
 <li>Allow the download.</li>
-<li>Open <b>Settings</b>, tap <b>Profile Downloaded</b> near the top, then <b>Install</b>.</li>
+<li>Open <b>Settings</b>, tap <b>Profile Downloaded</b> near the top, then <b>Install</b>, and type the password when it asks.</li>
 </ol>
 <h2>Android, Boox, a computer</h2>
 <p><a class="button" href="/d/{id}/{stem}.p12">Download the certificate</a></p>
-<p>Its password: <code>{password}</code></p>
 <ol>
 <li>Android: open the file, or go to <b>Settings › Security › Encryption &amp; credentials › Install a certificate › VPN &amp; app user certificate</b>, and type the password.</li>
 <li>Firefox: <b>Settings › Privacy &amp; Security › View Certificates › Your Certificates › Import</b>.</li>
