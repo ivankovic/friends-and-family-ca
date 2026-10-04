@@ -19,7 +19,7 @@
 //! and the site the enrollment page will live on. Written by the terminal UI, readable and
 //! editable by hand.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::{Deserialize, Serialize};
@@ -101,6 +101,28 @@ pub fn checked_upstream(upstream: &str) -> Result<String> {
         "{upstream} is not an address such as http://ffca:8080"
     );
     Ok(upstream.to_owned())
+}
+
+/// The CA files' folder as nginx sees it: a full path that ffca can write into nginx's
+/// configuration as it is, unquoted - nothing in it that nginx would read as the end of a word, a
+/// comment, a quote, an escape or a variable.
+pub fn checked_folder_in_nginx(folder: &Path) -> Result<PathBuf> {
+    let text = folder
+        .to_str()
+        .with_context(|| format!("{} is not UTF-8", folder.display()))?
+        .trim();
+    ensure!(
+        text.starts_with('/'),
+        "{text} is not a full path, such as /etc/nginx/certs"
+    );
+    ensure!(
+        !text
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || ";{}#\"'\\$".contains(c)),
+        "{text} holds a character nginx would read as more than a letter: no spaces, ; {{ }} # \
+         quotes, \\ or $"
+    );
+    Ok(PathBuf::from(text))
 }
 
 impl Default for Nginx {
@@ -233,6 +255,31 @@ mod tests {
             "http://ffca;rm",
         ] {
             assert!(checked_upstream(bad).is_err(), "{bad:?} passed");
+        }
+    }
+
+    #[test]
+    fn the_folder_in_nginx_is_a_plain_full_path() {
+        assert_eq!(
+            checked_folder_in_nginx(Path::new(" /etc/nginx/certs ")).unwrap(),
+            PathBuf::from("/etc/nginx/certs")
+        );
+        for bad in [
+            "etc/nginx/certs",
+            "",
+            "/etc/my certs",
+            "/etc/x;#",
+            "/etc/x}",
+            "/etc/$x",
+            "/etc/\\x",
+            "/etc/'x'",
+            "/etc/\"x",
+            "/etc/x\ny",
+        ] {
+            assert!(
+                checked_folder_in_nginx(Path::new(bad)).is_err(),
+                "{bad:?} passed"
+            );
         }
     }
 

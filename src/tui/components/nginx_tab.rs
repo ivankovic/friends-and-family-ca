@@ -166,6 +166,9 @@ impl NginxTab {
         if site.any_issuer {
             note.push_str("  optional_no_ca: any issuer gets in");
         }
+        if site.duplicate {
+            note.push_str("  another block has this name: nginx ignores one");
+        }
         ListItem::new(Line::from(vec![
             format!(" {:<34}", site.name()).into(),
             format!("{:<22}", site.file_name()).dim(),

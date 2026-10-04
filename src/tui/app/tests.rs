@@ -502,6 +502,14 @@ fn n_is_offered_only_where_there_is_a_person_to_add_to() {
     assert!(screen.contains("p new person"), "{screen}");
 }
 
+/// A folder for sites, which ffca writes into only while nobody else can change it, whatever the
+/// umask would have made it.
+fn sites_folder(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
 /// A site folder with one HTTPS site, and settings that reach it with `test` and `reload`.
 fn with_nginx(
     fixture: &Fixture,
@@ -510,7 +518,7 @@ fn with_nginx(
     enrollment: Option<&str>,
 ) -> config::Nginx {
     let root = fixture.out.parent().unwrap().join("nginx");
-    std::fs::create_dir_all(root.join("conf.d")).unwrap();
+    sites_folder(&root.join("conf.d"));
     for (file, name) in [
         ("books.conf", "books.example.org"),
         ("enroll.conf", "k.example.invalid"),
@@ -579,7 +587,7 @@ fn the_nginx_tab_says_what_is_missing_until_it_is_set_up() {
 fn the_settings_form_saves_publishes_and_lists_the_sites() {
     let fixture = Fixture::new();
     let root = fixture.out.parent().unwrap().join("nginx");
-    std::fs::create_dir_all(root.join("conf.d")).unwrap();
+    sites_folder(&root.join("conf.d"));
     std::fs::write(
         root.join("conf.d/books.conf"),
         "server {\n    listen 443 ssl;\n    server_name books.example.org;\n}\n",
@@ -924,7 +932,7 @@ fn an_agent_still_gets_files() {
 fn w_writes_the_enrollment_site_after_showing_it() {
     let fixture = Fixture::new();
     let root = fixture.out.parent().unwrap().join("nginx");
-    std::fs::create_dir_all(root.join("conf.d")).unwrap();
+    sites_folder(&root.join("conf.d"));
     std::fs::write(
         root.join("conf.d/cloud.conf"),
         "server {\n    listen 443 ssl default_server;\n    http2 on;\n    server_name cloud.example.org;\n    ssl_certificate /etc/le/example/fullchain.pem;\n    ssl_certificate_key /etc/le/example/privkey.pem;\n    include /etc/nginx/ssl-params.inc;\n    location / { return 200; }\n}\n",
@@ -974,7 +982,10 @@ fn w_writes_the_enrollment_site_after_showing_it() {
         written.contains("include /etc/nginx/ssl-params.inc;"),
         "{written}"
     );
-    assert!(!written.contains("ssl_verify_client"), "{written}");
+    assert!(
+        written.contains("ssl_verify_client off;") && !written.contains("ssl_verify_client on"),
+        "{written}"
+    );
 }
 
 #[test]
