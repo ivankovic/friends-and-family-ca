@@ -674,7 +674,9 @@ const CLOUD: &str = r#"server {
 "#;
 
 /// The access log the sites include, as a server's shared logging snippet does.
-const LOGGING: &str = "access_log /tmp/access.log;\n";
+/// It records which site answered: right after a reload, a worker from before it can still answer
+/// for a site it does not know yet, and logs under another site's settings.
+const LOGGING: &str = "access_log /tmp/access.log with_site;\n";
 
 /// The whole way, as a family member takes it: an invite made, its link opened through nginx
 /// without a certificate, the button pressed, the .p12 downloaded and opened with the password the
@@ -684,7 +686,7 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
     let ffca = Ffca::initialised();
     let nginx = Nginx::start_with(
         &ffca,
-        "    include /etc/ffca/sites/*.conf;",
+        "    log_format with_site '$server_name \"$request\" $status';\n    include /etc/ffca/sites/*.conf;",
         &[("books.conf", CLOUD), ("logging.inc", LOGGING)],
     );
     let serve = Serve::start(&ffca);
@@ -828,15 +830,16 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         String::from_utf8_lossy(&output.stdout).into_owned()
     };
     until(
-        || log().contains("\"GET / HTTP"),
+        || log().contains("k.example.test \"GET / HTTP"),
         "the enrollment site's own requests are logged",
     );
     let log = log();
-    assert!(!log.contains(token), "a token in the access log:\n{log}");
-    assert!(
-        !log.contains("/d/"),
-        "a download address in the access log:\n{log}"
-    );
+    for line in log.lines().filter(|l| l.starts_with("k.example.test ")) {
+        assert!(
+            !line.contains(token) && !line.contains("/d/"),
+            "an invite's secret in the access log:\n{log}"
+        );
+    }
 
     // stop-bots' filter, written into the site as stop-bots does, survives ffca rewriting it.
     let written = std::fs::read_to_string(&file).unwrap();
