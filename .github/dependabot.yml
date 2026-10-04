@@ -24,13 +24,21 @@ updates:
     schedule:
       interval: "weekly"
 
-  # The actions used by .github/workflows/ci.yml (actions/checkout, dtolnay/rust-toolchain,
-  # Swatinem/rust-cache, ...).
+  # The actions the workflows use, pinned by commit with the version in a comment beside it:
+  # dependabot moves both.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
     ignore:
-      # Its refs name Rust toolchains, not releases of the action: `@1.90` is Cargo.toml's
-      # rust-version, which CI's MSRV job checks on purpose, and `@stable` needs no update.
+      # It has no releases: its branches name Rust toolchains, and the workflows pin a commit of
+      # master and pass the toolchain as an input. Dependabot would offer those branches as
+      # versions. Move its pin by hand.
       - dependency-name: "dtolnay/rust-toolchain"
+
+  # The base of the image packaging/docker/Dockerfile builds in, pinned by digest.
+  # Dockerfile.release starts from scratch and has nothing to update.
+  - package-ecosystem: "docker"
+    directory: "/packaging/docker"
+    schedule:
+      interval: "weekly"
