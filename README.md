@@ -7,30 +7,77 @@ A small certificate authority for mutual-TLS client certificates, for a home ser
 who use it.
 
 You self-host Nextcloud, Immich or Jellyfin, and you want only your own family's devices to reach
-them: a client certificate on each device, checked by the web server before anything else runs.
-The tools that issue those certificates are made for companies, and they expect every person to
-run commands on their own device. Friends and Family CA is made for one administrator and a
-handful of people who should never need to.
+them: a client certificate on each device, checked by nginx before anything else runs. The tools
+that issue those certificates are made for companies, and they expect every person to run
+commands on their own device. Friends and Family CA is made for one administrator and a handful of
+people who should never need to: you run a terminal UI over SSH, and they scan a QR code.
 
-> **Status: early development.** Nothing below works yet. The `ffca` binary has its commands, and
-> each one says it is not implemented.
+```
+ Friends and Family CA · Domaci                                       CRL valid until 2 Nov 2026
+ People & agents │ Invites │ Nginx │ CA
+╭──────────────────────────────────╮╭──────────────────────────────────────────────────────────╮
+│▾ Anna                            ││ Anna · phone                                             │
+│  ● phone          until 2028     ││                                                          │
+│  ● laptop         until 2028     ││ Current   439ce6f2   issued 3 Oct 2026, valid until 2028 │
+│▾ Ben                             ││           CN=Anna (phone),OU=people                      │
+│  ✕ tablet         retired        ││ Earlier   0330b08b   revoked 3 Oct 2026 · replaced       │
+│▾ Agents                          ││                                                          │
+│  ● backup         until 2028     ││                                                          │
+│  ◐ monitoring     expires in 12 d││                                                          │
+╰──────────────────────────────────╯╰──────────────────────────────────────────────────────────╯
+ p new person  n new device  a new agent  u renew  r revoke  R rename  Tab switch  ? help  q quit
+```
 
 # What it does
 
-* **A terminal UI for the administrator** (`ffca tui`), run over SSH. Every action is one key,
-  with the keys always on screen, so there is nothing to remember between the few times a year
-  you need it:
-  * create the CA
-  * issue a certificate for a person and a device, and revoke it when the phone is lost
-  * choose, per site, whether the web server demands a certificate, accepts one, or ignores it
-* **A web page for everyone else** (`ffca serve`). The administrator creates an invite in the
-  terminal UI, and it shows a link and a QR code that work once and expire. The person opens it
-  on their phone and installs the certificate: as a configuration profile on an iPhone or iPad,
-  as a `.p12` file on Android.
-* **A revocation list that never expires** (`ffca crl-refresh`), run from a timer. A web server
-  that checks a revocation list refuses every client once the list is out of date.
+* **A terminal UI** (`sudo ffca`) for everything an administrator does: create the CA; add people,
+  their devices, and agents - programs that sign in as themselves, such as a backup job; renew,
+  revoke and rename; see every certificate each has held.
+* **Invites.** A new device gets a link, shown as a QR code, that works once for a day. It opens
+  the enrollment page, which hands the device its certificate - a profile for iPhone and iPad, a
+  `.p12` and its password for Android, Windows, macOS and the browsers - with how to install it.
+* **nginx.** The Nginx tab lists your HTTPS sites and sets each to ask for no certificate, accept
+  one, or require one. Every change is shown first, tested with `nginx -t`, and put back if nginx
+  refuses it. It also writes the enrollment site.
+* **Revocation that takes effect.** A revoked device is refused as soon as you press Enter: the
+  new revocation list is copied where nginx reads it and nginx reloads. An hourly timer re-signs
+  the list long before it expires, so nobody is locked out by a stale one, and tidies up invites.
 
-The first web server it supports is nginx.
+Revoke a person, one of their devices, or a single certificate; agents may send their own
+certificate signing request, so their key never leaves their machine.
+
+# How it is built
+
+* **The CA's key stays on the host**, readable by root only, with the ledger of every certificate
+  issued. All files are standard PEM and TOML: `openssl` can take over, and a person can read them.
+* **The enrollment page** (`ffca serve`), the only part that faces the internet, runs in a
+  container next to nginx, as nobody, with the invites folder and nothing else. It cannot issue
+  anything: it hands over an invite the administrator made, once.
+* **An invite's link carries a 256-bit secret.** The invite is sealed with a key derived from it,
+  and its file is named after the secret's hash, so the folder alone reveals nothing. Opening the
+  link does not use it up - chat apps fetch links to preview them - only pressing the button does.
+* **Certificates are ECDSA P-256**, for client authentication only, with subjects nginx can log and
+  match: `CN=Anna (phone),OU=people`, `CN=backup,OU=agents`.
+
+It is tested against what it drives: certificates checked by `rustls-webpki` and `openssl verify`,
+a real nginx in a container asked by `curl` - an invite all the way to a site that requires a
+certificate - and the terminal UI on a pseudo-terminal.
+
+# Installing
+
+It runs on Linux, beside nginx, and needs the `openssl` command, which makes the `.p12` files.
+
+* **A release's binary** - static, for x86_64 and aarch64 - from the
+  [releases page](https://github.com/ivankovic/friends-and-family-ca/releases), or
+  `cargo binstall friends-and-family-ca`.
+* **From crates.io:** `cargo install friends-and-family-ca`.
+* **From a checkout:** `make install` runs the tests, builds the release and installs it as
+  `/usr/local/bin/ffca`.
+
+The enrollment page's image is `ghcr.io/ivankovic/friends-and-family-ca`.
+
+Then follow **[the deployment guide](packaging/README.md)**: create the CA, tell it where nginx is,
+start the enrollment page, invite your own devices, and turn sites on one at a time.
 
 # License
 

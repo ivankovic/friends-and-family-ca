@@ -152,3 +152,23 @@ sudo docker compose up -d --build ffca
    `/etc/systemd/system`.
 
 `/var/lib/ffca` keeps the CA, should you want it back.
+
+## Releasing
+
+For the maintainer. A release is cut from `main` by `make release`, and GitHub does the rest.
+
+1. Deploy it on a real server and install certificates on real devices first: iPhone or iPad,
+   Android, a desktop browser. The tests cannot say whether a device accepts what it is given.
+2. In `CHANGELOG.md`, turn `## [Unreleased]` into `## [<version>] - <today>`, and make sure
+   `Cargo.toml`, `packaging/nix/package.nix` and `packaging/compose/ffca.yml` name that version
+   (`make check-versions`). Commit and push.
+3. `cargo login` once, if this machine has not published to crates.io before.
+4. `make release`. It refuses unless the tree is clean, on `main` and at `origin/main`, the version
+   is untagged and named everywhere with its changelog section, and every test passes. Then it
+   publishes the crate to crates.io - which cannot be undone, only yanked - and pushes the tag.
+5. The tag starts `.github/workflows/release.yml`: static binaries for x86_64 and aarch64, the
+   enrollment page's image on ghcr.io for amd64 and arm64, checksums, and the release, published
+   with the changelog section as its notes. Watch it with `gh run watch`.
+6. The first time only: the image's package on ghcr.io is private when it is created. Make it
+   public in the package's settings on GitHub.
+7. Add `## [Unreleased]` back to the top of `CHANGELOG.md`.
