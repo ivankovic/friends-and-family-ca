@@ -122,6 +122,7 @@ Follow Rust's standard project structure.
         |- bundle.rs    <- What a device installs: a .p12 (via openssl), an Apple profile
         |- invite.rs    <- Invites: sealed one-time bundles, collecting, tending, cancelling
         |- serve.rs     <- `ffca serve`, the enrollment page
+        |- serve/http.rs <- The small HTTP/1 server it runs on: one request per connection, bounded
         |- timer.rs     <- The hourly systemd timer for `ffca crl-refresh`
         |- nginx.rs     <- nginx's sites: a parser of its syntax, the client-certificate editor,
         |- nginx/          test-then-reload with rollback, and the CA's files where nginx reads them
