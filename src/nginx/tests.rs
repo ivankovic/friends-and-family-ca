@@ -500,3 +500,125 @@ fn every_publish_is_a_new_file_for_nginx_to_notice() {
         first
     );
 }
+
+/// A site on the same domain as the enrollment site, for it to copy from.
+const CLOUD: &str = "server {
+    listen 443 ssl default_server;
+    http2 on;
+    server_name cloud.example.org;
+    ssl_certificate /etc/le/example/fullchain.pem;
+    ssl_certificate_key /etc/le/example/privkey.pem;
+    include /etc/nginx/snippets/logging.conf;
+    location / { return 200; }
+}
+";
+
+fn enrollment(upstream: &str) -> config::Enrollment {
+    config::Enrollment {
+        host: "k.example.org".into(),
+        upstream: upstream.into(),
+        user: config::default_page_user(),
+    }
+}
+
+/// The whole file, so that its shape cannot drift unseen: what is copied, what is forwarded, and
+/// the invite paths left out of the access log.
+#[test]
+fn the_enrollment_site_is_written_out_in_full() {
+    let (_dir, nginx) = folder(&[("cloud.conf", CLOUD)]);
+    let (file, text) = enrollment_site(&nginx, &enrollment("http://ffca:8080")).unwrap();
+    assert_eq!(file, nginx.sites.join(ENROLLMENT_FILE));
+    assert_eq!(
+        text,
+        "# Written by Friends and Family CA: the enrollment page, where invites are collected.
+# It never asks for a client certificate: whoever opens an invite has none yet. Its listen,
+# TLS certificate and includes are copied from cloud.conf.
+server {
+    listen 443 ssl;
+    http2 on;
+    ssl_certificate /etc/le/example/fullchain.pem;
+    ssl_certificate_key /etc/le/example/privkey.pem;
+    include /etc/nginx/snippets/logging.conf;
+    server_name k.example.org;
+
+    # Looked up when a request comes (Docker's DNS), so that nginx starts while the page is down.
+    resolver 127.0.0.11 valid=30s ipv6=off;
+    set $ffca_enrollment http://ffca:8080;
+
+    location / {
+        proxy_pass $ffca_enrollment;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    # An invite's link carries its secret: these requests are not logged.
+    location ~ ^/(i|d)/ {
+        access_log off;
+        proxy_pass $ffca_enrollment;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+"
+    );
+    Parsed::new(&text).unwrap();
+}
+
+#[test]
+fn an_address_needs_no_resolver() {
+    let (_dir, nginx) = folder(&[("cloud.conf", CLOUD)]);
+    let (_, text) = enrollment_site(&nginx, &enrollment("http://127.0.0.1:8080")).unwrap();
+    assert!(
+        !text.contains("resolver") && !text.contains("$ffca_enrollment"),
+        "{text}"
+    );
+    assert_eq!(
+        text.matches("        proxy_pass http://127.0.0.1:8080;\n")
+            .count(),
+        2,
+        "{text}"
+    );
+}
+
+/// stop-bots writes its bot filter into every site it finds, ffca's included; rewriting the site
+/// keeps it, as stop-bots left it.
+#[test]
+fn another_tools_block_survives_a_rewrite() {
+    let (_dir, nginx) = folder(&[("cloud.conf", CLOUD)]);
+    let (file, text) = enrollment_site(&nginx, &enrollment("http://ffca:8080")).unwrap();
+    let filter = "    # BEGIN stop-bots (DO NOT EDIT)
+    if ($http_user_agent ~* \"BadBot\") {
+        return 444;
+    }
+    # END stop-bots
+";
+    let filtered = text.replacen("server {\n", &format!("server {{\n{filter}\n"), 1);
+    fs::write(&file, &filtered).unwrap();
+    let (_, rewritten) = enrollment_site(&nginx, &enrollment("http://ffca:9090")).unwrap();
+    assert!(
+        rewritten.contains(&format!("server {{\n{filter}\n    listen 443 ssl;")),
+        "{rewritten}"
+    );
+    assert!(
+        rewritten.contains("set $ffca_enrollment http://ffca:9090;"),
+        "{rewritten}"
+    );
+    assert_eq!(
+        rewritten.matches("# BEGIN").count(),
+        1,
+        "nothing doubled:\n{rewritten}"
+    );
+    Parsed::new(&rewritten).unwrap();
+}
+
+#[test]
+fn a_file_that_is_not_ffcas_is_neither_read_for_blocks_nor_written() {
+    let (dir, nginx) = folder(&[("cloud.conf", CLOUD)]);
+    let theirs = "# BEGIN stop-bots (DO NOT EDIT)\n# END stop-bots\nserver { listen 443 ssl; server_name k.example.org; }\n";
+    fs::write(nginx.sites.join(ENROLLMENT_FILE), theirs).unwrap();
+    let (file, text) = enrollment_site(&nginx, &enrollment("http://ffca:8080")).unwrap();
+    assert!(!text.contains("stop-bots"), "{text}");
+    let error = write_enrollment_site(&nginx, &ca(dir.path()), &file, &text).unwrap_err();
+    assert!(error.to_string().contains("is not ffca's"), "{error}");
+    assert_eq!(fs::read_to_string(&file).unwrap(), theirs);
+}

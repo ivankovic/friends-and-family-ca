@@ -78,8 +78,13 @@ site on the same domain - then writes it, tests nginx's configuration and reload
 refuses it, nothing is written.
 
 The site forwards to the page by name through Docker's DNS, looked up when a request comes, so
-nginx starts even while the page is down. Check it in a browser: `https://<enrollment site>/`
-says "Friends and Family CA".
+nginx starts even while the page is down. It copies the other site's `include`s - a shared
+logging snippet, say - but leaves invite links (`/i/…`, `/d/…`) out of the access log: their
+path is the invite's secret. Check it in a browser: `https://<enrollment site>/` says "Friends
+and Family CA".
+
+A bot filter such as stop-bots finds the new site like any other: re-scan and apply it there.
+Pressing `w` again later keeps whatever block another tool wrote into the file.
 
 ## 6. Set up the refresh timer
 

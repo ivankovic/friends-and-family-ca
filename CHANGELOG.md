@@ -59,3 +59,8 @@ the on-disk CA layout or the command line, a patch bump does not.
   site on the same domain - tests it and reloads nginx.
 - On the CA tab, `T` sets up an hourly systemd timer running `ffca crl-refresh`, which now also
   records collected invites and revokes the certificates of invites that expired uncollected.
+- The enrollment site leaves invite links out of nginx's access log: their path carries the
+  invite's secret, and an access log is read by more than the CA's administrator. Other requests
+  to the site are logged as before, so bot detectors still see them.
+- Rewriting the enrollment site (`w`) keeps blocks other tools wrote into it, such as stop-bots'
+  bot filter, as they were.
