@@ -38,6 +38,11 @@ With no CA yet, it asks for a name - the one devices show among their installed 
 and how many years the CA is valid. The CA lives in `/var/lib/ffca`. **Put that folder in your
 backups**: without the key, every certificate has to be issued again.
 
+**Guard those backups like the key itself, because they hold it.** Whoever has a copy can make
+certificates for any name - `CN=Anna (phone),OU=people` - that are in no ledger, so revoking by
+serial cannot reach them, and the only cure is a new CA and every device enrolled again. Keep the
+backups encrypted, and snapshots of the folder as private as the folder.
+
 ## 3. Tell it where nginx is
 
 On the **Nginx** tab, press `e`:
@@ -73,7 +78,8 @@ sudo docker compose ps ffca        # healthy, after a few seconds
 ```
 
 The image is a static binary on an empty base, run as nobody, read-only, with every capability
-dropped. Its only volume is the invites folder.
+dropped and a cap on its processes and memory (`pids_limit`, `mem_limit`). Its only volume is the
+invites folder.
 
 ## 5. Write the enrollment site
 
@@ -89,7 +95,17 @@ path is the invite's secret. Check it in a browser: `https://<enrollment site>/`
 and Family CA".
 
 A bot filter such as stop-bots finds the new site like any other: re-scan and apply it there.
-Pressing `w` again later keeps whatever block another tool wrote into the file.
+Pressing `w` again later keeps whatever block another tool wrote into the file. Exempt the invite
+paths, `/i/` and `/d/`, on the enrollment site from the filter, as you would `/.well-known/`: chat
+apps fetch a link to preview it, and Android's download manager fetches the `.p12` without the
+headers a browser sends, and a filter turns both away. A preview does not use the invite up - only
+pressing the button does.
+
+If no site on the enrollment site's `listen` address is marked `default_server`, nginx takes the
+first one it reads as the default, and `ffca-enrollment.conf` sorts early: requests for an unknown
+name, or for the bare IP address, then reach the enrollment page. That gives nothing away - the
+page hands out nothing without an invite's secret - but mark another site `default_server` if you
+would rather they went there.
 
 ## 6. Set up the refresh timer
 
@@ -133,6 +149,15 @@ Every change shows its lines first, is tested with `nginx -t`, and is put back i
 it. Apps that cannot present a certificate (a TV's media player, some mobile apps) need their site
 left off, or optional.
 
+To see which certificate came in, log it: `$ssl_client_s_dn` names the person and device, and
+`$ssl_client_serial` the certificate - `ffca list` shows its first characters, and `ffca revoke
+--serial` takes it as nginx writes it. A serial that is in no ledger means someone has the CA's
+key.
+
+```nginx
+log_format clients '$remote_addr [$time_local] "$request" $status "$ssl_client_s_dn" $ssl_client_serial';
+```
+
 ## Revoking
 
 On **People & agents**, select a device, an agent or a person and press `r`. The new revocation
@@ -171,7 +196,11 @@ For the maintainer. A release is cut from `main` by `make release`, and GitHub d
    publishes the crate to crates.io - which cannot be undone, only yanked - and pushes the tag.
 5. The tag starts `.github/workflows/release.yml`: static binaries for x86_64 and aarch64, the
    enrollment page's image on ghcr.io for amd64 and arm64, checksums, and the release, published
-   with the changelog section as its notes. Watch it with `gh run watch`.
+   with the changelog section as its notes. The tarballs and the image are attested. Watch it with
+   `gh run watch`.
+
+   The binaries are built with the Rust toolchain, zig and cargo-zigbuild that `release.yml`'s
+   `env` names. Move them there, by hand, when a newer one is wanted.
 6. The first time only: the image's package on ghcr.io is private when it is created. Make it
    public in the package's settings on GitHub.
 7. Add `## [Unreleased]` back to the top of `CHANGELOG.md`.
