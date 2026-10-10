@@ -90,7 +90,7 @@ jobs:
           PY
           cat release-notes.md
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-notes
           path: release-notes.md
@@ -151,13 +151,13 @@ jobs:
           cp -r packaging/compose dist/
           tar czf ffca-${{ matrix.target }}.tar.gz -C dist .
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: tarball-${{ matrix.target }}
           path: ffca-${{ matrix.target }}.tar.gz
 
       # For the image: the same binary, not a second build.
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ffca-${{ matrix.arch }}
           path: target/${{ matrix.target }}/release/ffca
