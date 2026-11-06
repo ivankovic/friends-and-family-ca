@@ -32,6 +32,7 @@ pub mod serve;
 pub mod store;
 pub mod timer;
 pub mod tui;
+pub mod users;
 
 /// A temporary folder for a test, in memory where the system has `/dev/shm`. [`store::Store`]
 /// syncs every write to disk, which on a busy disk makes a test that issues a few certificates
