@@ -1036,3 +1036,187 @@ fn t_sets_up_the_refresh_timer_after_showing_its_units() {
         "{calls}"
     );
 }
+
+/// The password a dialog shows once, on the line that starts with the user's name.
+fn password_on_screen(screen: &str, name: &str) -> String {
+    screen
+        .lines()
+        .find_map(|line| {
+            let mut words = line.split_whitespace().skip_while(|w| *w != name);
+            words.next()?;
+            words
+                .next()
+                .filter(|w| w.len() == crate::users::GENERATED_LENGTH)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| panic!("no password for {name} on\n{screen}"))
+}
+
+fn users(fixture: &Fixture) -> Users {
+    Users::load(&fixture.store).unwrap()
+}
+
+/// Adds a user from the Users tab with a made-up password, which it returns.
+fn add_user(app: &mut App, name: &str) -> String {
+    go_to(app, Tab::Users);
+    key(app, KeyCode::Char('n'));
+    type_text(app, name);
+    key(app, KeyCode::Enter);
+    key(app, KeyCode::Enter);
+    let password = password_on_screen(&screen(app), name);
+    key(app, KeyCode::Esc);
+    password
+}
+
+#[test]
+fn a_new_user_gets_a_password_shown_once_then_a_new_one_then_is_deleted() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Users);
+    assert_shows(&mut app, "No users yet");
+    let first = add_user(&mut app, "boox");
+    assert!(crate::users::verify(
+        &first,
+        &users(&fixture).get("boox").unwrap().hash
+    ));
+    assert_shows(&mut app, "no site lets them in");
+    assert!(!screen(&mut app).contains(&first));
+
+    key(&mut app, KeyCode::Char('p'));
+    key(&mut app, KeyCode::Enter);
+    let second = password_on_screen(&screen(&mut app), "boox");
+    key(&mut app, KeyCode::Esc);
+    let hash = users(&fixture).get("boox").unwrap().hash.clone();
+    assert!(crate::users::verify(&second, &hash));
+    assert!(!crate::users::verify(&first, &hash));
+
+    key(&mut app, KeyCode::Char('d'));
+    assert_shows(&mut app, "boox can no longer log in anywhere.");
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "Deleted boox.");
+    assert!(users(&fixture).get("boox").is_none());
+}
+
+#[test]
+fn a_typed_password_too_short_keeps_the_form_open() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Users);
+    key(&mut app, KeyCode::Char('n'));
+    type_text(&mut app, "anna");
+    key(&mut app, KeyCode::Enter);
+    type_text(&mut app, "short");
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "12");
+    assert_shows(&mut app, "•••••");
+    assert!(users(&fixture).get("anna").is_none());
+}
+
+#[test]
+fn a_site_s_login_is_turned_on_for_its_users_and_follows_their_passwords() {
+    let fixture = Fixture::new();
+    let settings = with_nginx(&fixture, "true", "true", None);
+    let mut app = fixture.app(NOW);
+    add_user(&mut app, "anna");
+    go_to(&mut app, Tab::Nginx);
+    assert_shows(&mut app, "login off");
+    key(&mut app, KeyCode::Char('l'));
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    assert_shows(&mut app, "Name at least one user");
+    type_text(&mut app, "ben");
+    assert_shows(&mut app, "There is no user ben");
+    (0..3).for_each(|_| key(&mut app, KeyCode::Backspace));
+    type_text(&mut app, "anna");
+    let screen = screen(&mut app);
+    assert!(
+        screen.contains("+ auth_basic books.example.org;"),
+        "{screen}"
+    );
+    key(&mut app, KeyCode::Enter);
+    assert_shows(
+        &mut app,
+        "books.example.org's login is now on (anna); nginx reloaded.",
+    );
+    assert_shows(&mut app, "login on (anna)");
+    let site = std::fs::read_to_string(settings.sites.join("books.conf")).unwrap();
+    assert!(
+        site.contains("auth_basic_user_file /etc/nginx/certs/ffca-users-books.example.org;"),
+        "{site}"
+    );
+    let file = settings.ca_files.join("ffca-users-books.example.org");
+    let hash = users(&fixture).get("anna").unwrap().hash.clone();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("anna:{hash}\n")
+    );
+
+    // A new password reaches the site's file at once.
+    go_to(&mut app, Tab::Users);
+    assert_shows(&mut app, "books.example.org");
+    key(&mut app, KeyCode::Char('p'));
+    key(&mut app, KeyCode::Enter);
+    assert_shows(
+        &mut app,
+        "books.example.org: its password file is rewritten",
+    );
+    key(&mut app, KeyCode::Esc);
+    let hash = users(&fixture).get("anna").unwrap().hash.clone();
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        format!("anna:{hash}\n")
+    );
+
+    // Deleting the only user leaves a site nobody gets into, and says so.
+    key(&mut app, KeyCode::Char('d'));
+    assert_shows(&mut app, "Sites that let them in now: books.example.org.");
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "books.example.org: nobody can log in now");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "");
+
+    // Off takes the login and its file away.
+    key(&mut app, KeyCode::Esc);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('l'));
+    key(&mut app, KeyCode::Up);
+    key(&mut app, KeyCode::Up);
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "login off");
+    assert!(!file.exists());
+    let site = std::fs::read_to_string(settings.sites.join("books.conf")).unwrap();
+    assert!(!site.contains("auth_basic"), "{site}");
+}
+
+#[test]
+fn passthrough_asks_for_a_login_and_names_who_may_pass() {
+    let fixture = Fixture::new();
+    let settings = with_nginx(&fixture, "true", "true", None);
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('l'));
+    key(&mut app, KeyCode::Down);
+    assert_shows(&mut app, "+ if ($remote_user = \"\") {");
+    type_text(&mut app, "boox");
+    assert_shows(&mut app, "+ if ($remote_user !~ \"^(?:boox)$\") {");
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "login passthrough (boox)");
+    let site = std::fs::read_to_string(settings.sites.join("books.conf")).unwrap();
+    assert!(site.contains("location @ffca_login {"), "{site}");
+    assert!(!site.contains("auth_basic"), "{site}");
+}
+
+#[test]
+fn the_enrollment_site_never_asks_for_a_login() {
+    let fixture = Fixture::new();
+    let settings = with_nginx(&fixture, "true", "true", Some("k.example.invalid"));
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Char('l'));
+    key(&mut app, KeyCode::Down);
+    assert_shows(&mut app, "This is the enrollment site");
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "This is the enrollment site");
+    let file = std::fs::read_to_string(settings.sites.join("enroll.conf")).unwrap();
+    assert!(!file.contains("remote_user"), "{file}");
+}

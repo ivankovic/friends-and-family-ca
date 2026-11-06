@@ -160,8 +160,10 @@ impl fmt::Display for Auth {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(Auth::KINDS[self.kind()])?;
         match self {
-            Auth::Off => Ok(()),
             Auth::Passthrough(names) if names.is_empty() => f.write_str(" (any user)"),
+            // On with no names: a password file ffca did not write.
+            Auth::Off => Ok(()),
+            Auth::On(names) if names.is_empty() => Ok(()),
             Auth::Passthrough(names) | Auth::On(names) => write!(f, " ({})", names.join(", ")),
         }
     }

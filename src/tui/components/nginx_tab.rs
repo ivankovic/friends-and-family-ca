@@ -14,8 +14,8 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-//! The Nginx tab: how ffca reaches nginx, the enrollment site, and every site's client-certificate
-//! mode.
+//! The Nginx tab: how ffca reaches nginx, the enrollment site, and every site's two gates: its
+//! client-certificate mode and its HTTP login.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -27,7 +27,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 
 use super::{Component, Hint, step};
 use crate::config;
-use crate::nginx::{Mode, Site, Survey};
+use crate::nginx::{Auth, Mode, Site, Survey};
 use crate::tui::action::Action;
 
 /// What the tab shows: the settings, what DNS says about the enrollment site, and the sites.
@@ -72,6 +72,7 @@ impl NginxTab {
         if self.settings.is_some() {
             if !self.sites().is_empty() {
                 hints.push(("s", "client certificate"));
+                hints.push(("l", "login"));
             }
             hints.push(("t", "test"));
             let written = self.sites().iter().any(|s| self.is_enrollment(s));
@@ -165,6 +166,9 @@ impl NginxTab {
         if site.any_issuer {
             note.push_str("  optional_no_ca: any issuer gets in");
         }
+        if site.foreign_auth {
+            note.push_str("  a login ffca did not write");
+        }
         if site.duplicate {
             note.push_str("  another block has this name: nginx ignores one");
         }
@@ -172,7 +176,11 @@ impl NginxTab {
             format!(" {:<34}", site.name()).into(),
             format!("{:<22}", site.file_name()).dim(),
             Span::styled(symbol, Style::new().fg(color)),
-            format!(" {}", site.mode).into(),
+            format!(" {:<10}", site.mode.to_string()).into(),
+            match site.auth {
+                Auth::Off => "login off".dim(),
+                _ => format!("login {}", site.auth).into(),
+            },
             note.dim(),
         ]))
     }
@@ -187,6 +195,7 @@ impl Component for NginxTab {
                 return Some(Action::AskEnrollmentSite);
             }
             KeyCode::Char('s') => return self.selected_site().cloned().map(Action::AskSiteMode),
+            KeyCode::Char('l') => return self.selected_site().cloned().map(Action::AskSiteAuth),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = step(self.selected, false, self.sites().len())
             }

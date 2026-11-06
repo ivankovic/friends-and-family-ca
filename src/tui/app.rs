@@ -28,15 +28,17 @@ use ratatui::widgets::{Paragraph, Tabs};
 use time::{Duration, OffsetDateTime};
 
 use super::action::{Action, Selection};
+use super::components::auth_dialog::AuthDialog;
 use super::components::ca_info::CaInfo;
 use super::components::form::Form;
 use super::components::invite_dialog::InviteDialog;
 use super::components::invites_tab::InvitesTab;
 use super::components::message::Message;
-use super::components::mode_dialog::{Change, ModeDialog};
+use super::components::mode_dialog::{ModeDialog, diff};
 use super::components::nginx_tab::NginxTab;
 use super::components::people::People;
 use super::components::revoke_dialog::RevokeDialog;
+use super::components::users_tab::{self, UsersTab};
 use super::components::{Component, Hint, hint_line};
 use super::date;
 use crate::ca::{self, Ca, CrlStatus, Key};
@@ -44,9 +46,10 @@ use crate::config::{self, Config};
 use crate::files::issue_to_files;
 use crate::invite;
 use crate::ledger::{Invite, Ledger, Place, Status, Target};
-use crate::nginx::{self, Mode, Site};
+use crate::nginx::{self, Auth, Mode, Site};
 use crate::store::PRIVATE;
 use crate::timer;
+use crate::users::Users;
 
 /// A CRL this close to expiring means the refresh timer is not running: say so on every screen.
 const CRL_WARNING: Duration = Duration::days(7);
@@ -56,13 +59,15 @@ enum Tab {
     People,
     Invites,
     Nginx,
+    Users,
     Ca,
 }
 
-const TABS: [(Tab, &str); 4] = [
+const TABS: [(Tab, &str); 5] = [
     (Tab::People, "People & agents"),
     (Tab::Invites, "Invites"),
     (Tab::Nginx, "Nginx"),
+    (Tab::Users, "Users"),
     (Tab::Ca, "CA"),
 ];
 
@@ -70,6 +75,7 @@ enum Dialog {
     Form(Form),
     Revoke(RevokeDialog),
     Mode(ModeDialog),
+    Auth(AuthDialog),
     Invite(InviteDialog),
     Message(Message),
 }
@@ -102,6 +108,9 @@ pub struct App {
     people: People,
     invites: InvitesTab,
     nginx: NginxTab,
+    users_tab: UsersTab,
+    /// The HTTP logins nginx checks itself, as `users.toml` holds them.
+    users: Users,
     ca_info: CaInfo,
     dialog: Option<Dialog>,
     notice: Option<Notice>,
@@ -126,6 +135,8 @@ impl App {
             people: People::default(),
             invites: InvitesTab::default(),
             nginx: NginxTab::default(),
+            users_tab: UsersTab::default(),
+            users: Users::default(),
             ca_info: CaInfo::default(),
             dialog: None,
             notice: None,
@@ -182,6 +193,7 @@ impl App {
             self.ledger = self.ca.ledger()?;
             self.crl = Some(self.ca.crl_status()?);
             self.config = Config::load(self.ca.store())?;
+            self.users = Users::load(self.ca.store())?;
             if self.tend_invites() {
                 self.ledger = self.ca.ledger()?;
                 self.crl = Some(self.ca.crl_status()?);
@@ -209,6 +221,27 @@ impl App {
         let enrollment = self.config.enrollment.as_ref().map(|e| e.host.clone());
         self.invites
             .update(&self.ledger.invites, enrollment.is_some(), now);
+        let rows = self
+            .users
+            .users
+            .iter()
+            .map(|user| users_tab::Row {
+                name: user.name.clone(),
+                changed: date(user.changed),
+                sites: match &survey {
+                    Some(Ok(survey)) => survey
+                        .sites
+                        .iter()
+                        .filter(
+                            |s| matches!(&s.auth, Auth::On(names) if names.contains(&user.name)),
+                        )
+                        .map(|s| s.name().to_owned())
+                        .collect(),
+                    _ => Vec::new(),
+                },
+            })
+            .collect();
+        self.users_tab.update(rows);
         self.nginx.update(
             self.config.nginx.clone(),
             enrollment,
@@ -228,6 +261,7 @@ impl App {
             Some(Dialog::Form(form)) => form.handle_key_event(key),
             Some(Dialog::Revoke(dialog)) => dialog.handle_key_event(key),
             Some(Dialog::Mode(dialog)) => dialog.handle_key_event(key),
+            Some(Dialog::Auth(dialog)) => dialog.handle_key_event(key),
             Some(Dialog::Invite(dialog)) => dialog.handle_key_event(key),
             Some(Dialog::Message(message)) => message.handle_key_event(key),
             None => match key.code {
@@ -239,6 +273,7 @@ impl App {
                     Tab::People => self.people.handle_key_event(key),
                     Tab::Invites => self.invites.handle_key_event(key),
                     Tab::Nginx => self.nginx.handle_key_event(key),
+                    Tab::Users => self.users_tab.handle_key_event(key),
                     Tab::Ca => self.ca_info.handle_key_event(key),
                 },
             },
@@ -425,6 +460,16 @@ impl App {
             }
             Action::AskSiteMode(site) => self.ask_site_mode(site),
             Action::SetSiteMode(site, mode) => self.set_site_mode(&site, mode),
+            Action::AskSiteAuth(site) => self.ask_site_auth(site),
+            Action::SetSiteAuth(site, auth) => self.set_site_auth(&site, &auth),
+            Action::AskNewUser => self.dialog = Some(Dialog::Form(Form::new_user())),
+            Action::AddUser { name, password } => self.add_user(&name, &password),
+            Action::AskNewPassword(name) => {
+                self.dialog = Some(Dialog::Form(Form::new_password(&name)));
+            }
+            Action::SetPassword { name, password } => self.set_password(&name, &password),
+            Action::AskDeleteUser(name) => self.ask_delete_user(&name),
+            Action::DeleteUser(name) => self.delete_user(&name),
             Action::TestNginx => {
                 let Some(settings) = &self.config.nginx else {
                     return;
@@ -603,6 +648,199 @@ impl App {
                     lines,
                 )));
             }
+        }
+        self.reload(self.now);
+    }
+
+    fn ask_site_auth(&mut self, site: Site) {
+        let Some(settings) = &self.config.nginx else {
+            return;
+        };
+        let original = std::fs::read_to_string(&site.file)
+            .map_err(|e| format!("cannot read {}: {e}", site.file.display()));
+        let refused = self.is_enrollment(&site).then(|| {
+            "This is the enrollment site: whoever opens an invite has no login yet.".to_owned()
+        });
+        let users = self.users.names().map(str::to_owned).collect();
+        self.dialog = Some(Dialog::Auth(AuthDialog::new(
+            site,
+            original,
+            settings.clone(),
+            users,
+            refused,
+        )));
+    }
+
+    fn set_site_auth(&mut self, site: &Site, auth: &Auth) {
+        self.dialog = None;
+        let Some(settings) = self.config.nginx.clone() else {
+            return;
+        };
+        if self.is_enrollment(site) && *auth != Auth::Off {
+            return self.fail(format!(
+                "{} is the enrollment site: it never asks for a login.",
+                site.name()
+            ));
+        }
+        match nginx::set_auth(&settings, &self.ca, &self.users, site, auth) {
+            Ok(true) => self.tell(format!(
+                "{}'s login is now {auth}; nginx reloaded.",
+                site.name()
+            )),
+            Ok(false) => self.tell(format!("{}'s login was already {auth}.", site.name())),
+            Err(error) => {
+                let lines = format!("{error:#}")
+                    .lines()
+                    .map(|l| Line::from(l.to_owned()))
+                    .collect();
+                self.dialog = Some(Dialog::Message(Message::new(
+                    format!("{} is unchanged", site.name()),
+                    lines,
+                )));
+            }
+        }
+        self.reload(self.now);
+    }
+
+    /// Saves the users and rewrites the password files of the sites that use them; the lines that
+    /// say what changed there.
+    fn save_users(&mut self, users: &Users) -> anyhow::Result<Vec<Line<'static>>> {
+        users.save(self.ca.store())?;
+        self.users = users.clone();
+        let Some(settings) = &self.config.nginx else {
+            return Ok(Vec::new());
+        };
+        let mut lines = Vec::new();
+        for (site, left) in nginx::publish_users(settings, &self.ca, users)? {
+            lines.push(if left == 0 {
+                format!("{site}: nobody can log in now; name a user with l on the Nginx tab.")
+                    .fg(Color::Yellow)
+                    .into()
+            } else {
+                format!("{site}: its password file is rewritten; nginx reloaded.").into()
+            });
+        }
+        Ok(lines)
+    }
+
+    /// Shows a password once, with what else changed.
+    fn show_password(
+        &mut self,
+        title: String,
+        name: &str,
+        password: &str,
+        mut more: Vec<Line<'static>>,
+    ) {
+        let mut lines: Vec<Line> = vec![
+            Line::default(),
+            vec![
+                "  ".into(),
+                name.to_owned().bold(),
+                "  ".into(),
+                password.to_owned().bold(),
+            ]
+            .into(),
+            Line::default(),
+            "It is not shown again: ffca keeps only its hash."
+                .dim()
+                .into(),
+        ];
+        if !more.is_empty() {
+            lines.push(Line::default());
+            lines.append(&mut more);
+        }
+        self.dialog = Some(Dialog::Message(Message::new(title, lines)));
+    }
+
+    /// Adds a user; with no password typed, ffca makes one up and shows it once.
+    fn add_user(&mut self, name: &str, password: &str) {
+        let mut users = self.users.clone();
+        let made_up = password.is_empty();
+        let added = users
+            .add(name, (!made_up).then_some(password))
+            .and_then(|password| self.save_users(&users).map(|more| (password, more)));
+        match added {
+            Ok((password, more)) => {
+                let name = crate::users::checked_name(name).unwrap_or_default();
+                self.reload(self.now);
+                self.users_tab.select(&name);
+                self.tell(format!("Added {name}."));
+                if made_up {
+                    self.show_password(format!("{name}'s password"), &name, &password, more);
+                } else {
+                    self.dialog = None;
+                }
+            }
+            Err(error) => self.refuse(format!("{error:#}")),
+        }
+    }
+
+    /// A new password, typed or made up; the sites that let the user in get it at once.
+    fn set_password(&mut self, name: &str, password: &str) {
+        let mut users = self.users.clone();
+        let made_up = password.is_empty();
+        let changed = users
+            .set_password(name, (!made_up).then_some(password))
+            .and_then(|password| self.save_users(&users).map(|more| (password, more)));
+        match changed {
+            Ok((password, more)) => {
+                self.tell(format!("{name} has a new password."));
+                if made_up {
+                    self.show_password(format!("{name}'s new password"), name, &password, more);
+                } else if more.is_empty() {
+                    self.dialog = None;
+                } else {
+                    self.dialog = Some(Dialog::Message(Message::new(
+                        format!("{name}'s new password"),
+                        more,
+                    )));
+                }
+                self.reload(self.now);
+            }
+            Err(error) => self.refuse(format!("{error:#}")),
+        }
+    }
+
+    fn ask_delete_user(&mut self, name: &str) {
+        let sites: Vec<String> = match self.config.nginx.as_ref().map(nginx::survey) {
+            Some(Ok(survey)) => survey
+                .sites
+                .iter()
+                .filter(|s| matches!(&s.auth, Auth::On(names) if names.iter().any(|n| n == name)))
+                .map(|s| s.name().to_owned())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let mut lines: Vec<Line> = vec![format!("{name} can no longer log in anywhere.").into()];
+        if !sites.is_empty() {
+            lines.push(
+                format!("Sites that let them in now: {}.", sites.join(", "))
+                    .dim()
+                    .into(),
+            );
+        }
+        self.dialog = Some(Dialog::Message(Message::confirm(
+            format!("Delete {name}"),
+            lines,
+            Action::DeleteUser(name.to_owned()),
+            "delete",
+        )));
+    }
+
+    fn delete_user(&mut self, name: &str) {
+        self.dialog = None;
+        let mut users = self.users.clone();
+        match users.remove(name).and_then(|()| self.save_users(&users)) {
+            Ok(more) => {
+                self.tell(format!("Deleted {name}."));
+                if !more.is_empty() {
+                    self.dialog = Some(Dialog::Message(Message::new(
+                        format!("{name} is deleted"),
+                        more,
+                    )));
+                }
+            }
+            Err(error) => self.fail(format!("{error:#}")),
         }
         self.reload(self.now);
     }
@@ -922,6 +1160,7 @@ impl App {
             Tab::People => self.people.draw(frame, body),
             Tab::Invites => self.invites.draw(frame, body),
             Tab::Nginx => self.nginx.draw(frame, body),
+            Tab::Users => self.users_tab.draw(frame, body),
             Tab::Ca => self.ca_info.draw(frame, body),
         }
         if let Some(n) = &self.notice {
@@ -933,6 +1172,7 @@ impl App {
             Tab::People => self.people.hints(),
             Tab::Invites => self.invites.hints(),
             Tab::Nginx => self.nginx.hints(),
+            Tab::Users => self.users_tab.hints(),
             Tab::Ca => self.ca_info.hints(),
         };
         keys.extend([("Tab", "switch"), ("?", "help"), ("q", "quit")]);
@@ -946,6 +1186,7 @@ impl App {
             Some(Dialog::Form(form)) => form.draw(frame, body),
             Some(Dialog::Revoke(dialog)) => dialog.draw(frame, body),
             Some(Dialog::Mode(dialog)) => dialog.draw(frame, body),
+            Some(Dialog::Auth(dialog)) => dialog.draw(frame, body),
             Some(Dialog::Invite(dialog)) => dialog.draw(frame, body),
             Some(Dialog::Message(message)) => message.draw(frame, body),
             None => {}
@@ -1000,22 +1241,6 @@ fn selection_of(ledger: &Ledger, holder: &str) -> Option<Selection> {
 
 /// The lines `planned` drops from `original`, and the lines it adds, in order: setting a mode only
 /// adds, removes and comments out whole lines.
-fn diff(original: &str, planned: &str) -> Change {
-    let before: Vec<&str> = original.lines().collect();
-    let after: Vec<&str> = planned.lines().collect();
-    let removed = before
-        .iter()
-        .filter(|l| !after.contains(l))
-        .map(|l| l.trim().to_owned())
-        .collect();
-    let added = after
-        .iter()
-        .filter(|l| !before.contains(l))
-        .map(|l| l.trim().to_owned())
-        .collect();
-    Change { removed, added }
-}
-
 /// The time of day, in UTC: "14:02 UTC".
 fn clock(time: OffsetDateTime) -> String {
     format!("{:02}:{:02} UTC", time.hour(), time.minute())
@@ -1033,7 +1258,7 @@ fn help() -> Message {
         "Keys",
         vec![
             key("↑ ↓  j k", "move"),
-            key("Tab", "switch between People & agents, Invites, Nginx and CA"),
+            key("Tab", "switch between People & agents, Invites, Nginx, Users and CA"),
             key("p", "add a person, with a certificate for their first device"),
             key("n", "add a device to the selected person"),
             key("a", "issue a certificate to a new agent"),
@@ -1048,6 +1273,8 @@ fn help() -> Message {
             key("R", "rename the selected person, device or agent"),
             key("e", "on the Nginx tab: where nginx is, and the enrollment site"),
             key("s", "on the Nginx tab: a site's client certificate: off, optional, required"),
+            key("l", "on the Nginx tab: a site's HTTP login: off, passthrough, on, and who"),
+            key("n  p  d", "on the Users tab: a new user, a new password, delete"),
             key("t", "on the Nginx tab: test nginx's configuration"),
             key("w", "on the Nginx tab: write the enrollment site"),
             key("Enter  x", "on the Invites tab: show an invite's QR code again, cancel it"),

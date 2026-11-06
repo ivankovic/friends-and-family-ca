@@ -98,6 +98,21 @@ pub enum Action {
     SaveNginxSettings(Vec<String>),
     AskSiteMode(crate::nginx::Site),
     SetSiteMode(crate::nginx::Site, crate::nginx::Mode),
+    AskSiteAuth(crate::nginx::Site),
+    SetSiteAuth(crate::nginx::Site, crate::nginx::Auth),
+    AskNewUser,
+    /// A new HTTP login; no password means one made up.
+    AddUser {
+        name: String,
+        password: String,
+    },
+    AskNewPassword(String),
+    SetPassword {
+        name: String,
+        password: String,
+    },
+    AskDeleteUser(String),
+    DeleteUser(String),
     TestNginx,
     /// Show the enrollment site's configuration, to write it.
     AskEnrollmentSite,

@@ -16,6 +16,7 @@
  */
 //! The UI's components, and what they share.
 
+pub mod auth_dialog;
 pub mod ca_info;
 pub mod form;
 pub mod invite_dialog;
@@ -25,6 +26,7 @@ pub mod mode_dialog;
 pub mod nginx_tab;
 pub mod people;
 pub mod revoke_dialog;
+pub mod users_tab;
 
 use crossterm::event::KeyEvent;
 use ratatui::Frame;

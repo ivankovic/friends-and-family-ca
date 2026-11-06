@@ -35,9 +35,14 @@ pub enum Purpose {
     NewDevice,
     NewAgent,
     Rename(Selection),
+    NewUser,
+    /// A new password for this user.
+    NewPassword(String),
 }
 
 /// How a device's certificate reaches it.
+const PASSWORD_NOTE: &str = "Leave the password empty to have one made up: 24 letters and digits, shown once. One typed here is at least 12 characters, and should be used nowhere else: nginx's password files are readable on this machine.";
+
 const DELIVERY: &str = "With an enrollment site (on the Nginx tab), the device gets an invite to scan; without one, the certificate and its key are written to files.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +51,8 @@ struct Field {
     value: String,
     /// In characters, not bytes: names are not ASCII.
     cursor: usize,
+    /// A password: shown as dots, and taken as typed, spaces and all.
+    secret: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +137,29 @@ impl Form {
         form
     }
 
+    /// A new HTTP login: its name, and a password or none to have one made up.
+    pub fn new_user() -> Form {
+        let mut form = Form::new(
+            "New user".into(),
+            Purpose::NewUser,
+            &[("Name", ""), ("Password", "")],
+        );
+        form.fields[1].secret = true;
+        form.note = Some(PASSWORD_NOTE.into());
+        form
+    }
+
+    pub fn new_password(name: &str) -> Form {
+        let mut form = Form::new(
+            format!("New password for {name}"),
+            Purpose::NewPassword(name.to_owned()),
+            &[("Password", "")],
+        );
+        form.fields[0].secret = true;
+        form.note = Some(PASSWORD_NOTE.into());
+        form
+    }
+
     fn new(title: String, purpose: Purpose, fields: &[(&'static str, &str)]) -> Form {
         Form {
             title,
@@ -140,6 +170,7 @@ impl Form {
                     label,
                     value: (*value).to_owned(),
                     cursor: value.chars().count(),
+                    secret: false,
                 })
                 .collect(),
             focus: 0,
@@ -177,6 +208,14 @@ impl Form {
             }),
             Purpose::NewAgent => Action::Issue(Selection::Agent(value(0))),
             Purpose::Rename(selection) => Action::Rename(selection.clone(), value(0)),
+            Purpose::NewUser => Action::AddUser {
+                name: value(0),
+                password: self.fields[1].value.clone(),
+            },
+            Purpose::NewPassword(name) => Action::SetPassword {
+                name: name.clone(),
+                password: self.fields[0].value.clone(),
+            },
         }
     }
 
@@ -263,7 +302,12 @@ impl Component for Form {
             } else {
                 label.dim()
             };
-            lines.push(vec![label, field.value.clone().into()].into());
+            let shown = if field.secret {
+                "•".repeat(field.value.chars().count())
+            } else {
+                field.value.clone()
+            };
+            lines.push(vec![label, shown.into()].into());
             lines.push(Line::default());
         }
         match (&self.error, &self.note) {

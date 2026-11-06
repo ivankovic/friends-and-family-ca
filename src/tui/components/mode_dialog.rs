@@ -40,6 +40,23 @@ pub struct Change {
     pub added: Vec<String>,
 }
 
+/// The lines `planned` has that `original` does not, and the other way round.
+pub fn diff(original: &str, planned: &str) -> Change {
+    let before: Vec<&str> = original.lines().collect();
+    let after: Vec<&str> = planned.lines().collect();
+    let removed = before
+        .iter()
+        .filter(|l| !after.contains(l))
+        .map(|l| l.trim().to_owned())
+        .collect();
+    let added = after
+        .iter()
+        .filter(|l| !before.contains(l))
+        .map(|l| l.trim().to_owned())
+        .collect();
+    Change { removed, added }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModeDialog {
     site: Site,
