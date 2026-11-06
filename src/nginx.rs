@@ -61,7 +61,9 @@
 //! With HTTP auth on, the last six lines are `auth_basic "<site>";` and
 //! `auth_basic_user_file <folder>/ffca-users-<site>;`. The `if` runs before nginx picks a
 //! location, so no location escapes it; `auth_basic` is inherited by every location that does not
-//! say `auth_basic off` itself, which is the site's to decide.
+//! say `auth_basic off` itself, which is the site's to decide. nginx checks `auth_basic` after a
+//! location's `return`, so a location that only returns - a redirect, a fixed answer - is answered
+//! without a login; one that serves files or passes the request on is not.
 //!
 //! Any other `ssl_client_certificate`, `ssl_crl` or `ssl_verify_client`, or `auth_basic` or
 //! `auth_basic_user_file`, directly in that block would clash with ffca's, so ffca comments it
