@@ -14,35 +14,65 @@
  *  You should have received a copy of the GNU Affero General Public License
  *  along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
-//! nginx: which sites ask for a client certificate, and changing that safely.
+//! nginx: which sites ask for a client certificate and for an HTTP login, and changing that safely.
 //!
 //! A site is a `server` block that listens with `ssl`, in a `*.conf` file of the folder the
-//! settings name. Its mode is its `ssl_verify_client`: `on` is required; `optional` lets a visitor
-//! without a certificate in but still refuses a bad one - revoked, expired, another CA's - so a
-//! lost phone stays out even there. ffca never writes `optional_no_ca`, which also lets in a
+//! settings name. It has two settings, each a gate of its own: a request gets in when it passes
+//! both.
+//!
+//! Its client-certificate mode is its `ssl_verify_client`: `on` is required; `optional` lets a
+//! visitor without a certificate in but still refuses a bad one - revoked, expired, another CA's -
+//! so a lost phone stays out even there. ffca never writes `optional_no_ca`, which also lets in a
 //! certificate from any issuer; a site written that way by hand reads as optional, and is marked.
 //! So is a site whose name another block on the same address also claims: nginx serves one of the
 //! two and ignores the other, whatever either says.
 //!
-//! ffca writes its three lines in a block of its own, inside the `server` block, after its
-//! `server_name`:
+//! Its HTTP auth is one of:
+//!
+//! * off: nginx asks for no login;
+//! * passthrough: nginx asks for a login and leaves the password to the site behind it - a WebDAV
+//!   server, Nextcloud - which keeps its own users. nginx only sees that a login was sent, and,
+//!   when the site names users, that it is one of them: a request without one is answered `401`
+//!   with a `WWW-Authenticate` challenge, so that a client that waits to be asked sends it. The
+//!   name is what the client says it is; the site's password check is what makes it true.
+//! * on: nginx checks the login itself, against ffca's users (see [`crate::users`]) that the site
+//!   names, in a password file ffca writes next to the CA's certificate: for a site with no
+//!   logins of its own, a page or a folder of files.
+//!
+//! ffca writes its lines in a block of its own, inside the `server` block, after its
+//! `server_name`; a site that requires a certificate and passes logins through reads:
 //!
 //! ```nginx
 //!     # BEGIN ffca - client certificates, managed by Friends and Family CA
 //!     ssl_client_certificate /etc/nginx/certs/ffca-ca.crt;
 //!     ssl_crl /etc/nginx/certs/ffca.crl;
 //!     ssl_verify_client on;
+//!     if ($remote_user !~ "^(?:boox)$") {
+//!         return 401;
+//!     }
+//!     error_page 401 @ffca_login;
+//!     location @ffca_login {
+//!         add_header WWW-Authenticate "Basic realm=\"b.example.org\"" always;
+//!         return 401;
+//!     }
 //!     # END ffca
 //! ```
 //!
-//! Any other `ssl_client_certificate`, `ssl_crl` or `ssl_verify_client` directly in that block
-//! would clash with these, so ffca comments it out, marked `# ffca: `; turning a site off comments
-//! out only a `ssl_verify_client` of its own, the line that makes nginx ask. It changes nothing
-//! else, and it refuses - rather than guesses - when a line it would comment out holds another
-//! directive too, when its block holds anything but its own lines, or when the `server` block is
-//! written on one line. Before anything is written, the changed file is read back and compared
-//! with the original: every statement but ffca's three must be as it was, and the site must ask
-//! as it was told to.
+//! With HTTP auth on, the last six lines are `auth_basic "<site>";` and
+//! `auth_basic_user_file <folder>/ffca-users-<site>;`. The `if` runs before nginx picks a
+//! location, so no location escapes it; `auth_basic` is inherited by every location that does not
+//! say `auth_basic off` itself, which is the site's to decide.
+//!
+//! Any other `ssl_client_certificate`, `ssl_crl` or `ssl_verify_client`, or `auth_basic` or
+//! `auth_basic_user_file`, directly in that block would clash with ffca's, so ffca comments it
+//! out, marked `# ffca: `; turning a setting off comments out only the line that makes nginx ask:
+//! `ssl_verify_client`, `auth_basic`. Changing one setting leaves the other as it is, in ffca's
+//! block or outside it. ffca changes nothing else, and it refuses - rather than guesses - when a
+//! line it would comment out holds another directive too, when its block holds anything but its
+//! own lines, or when the `server` block is written on one line. Before anything is written, the
+//! changed file is read back and compared with the original: every statement but the client
+//! certificate and HTTP auth ones must be as it was, and those must be exactly what the change
+//! asks for.
 //!
 //! The configuration is read with a parser that follows nginx's own rules for words, quoted
 //! strings, escapes, comments and `${variable}`, not with patterns over lines: the stop-bots
@@ -53,7 +83,8 @@
 //! Every change is checked with the settings' test command (`nginx -t`) before nginx reloads; if
 //! the test fails, the file is put back as it was and nothing reloads. nginx reads the CA's
 //! certificate and CRL from copies ffca keeps in a folder nginx can see, refreshed before every
-//! test and reload: the state folder holds the CA's key and stays its owner's only.
+//! test and reload: the state folder holds the CA's key and stays its owner's only. The password
+//! files are in that folder too, written before the test and put back with the site.
 //!
 //! ffca runs as root, so it writes only into folders that nobody but root (or the CA's owner, where
 //! that is not root) can change: a folder another user could write is one where they could swap a
@@ -78,10 +109,68 @@ use crate::store::{PUBLIC, Store};
 pub const CA_FILE: &str = "ffca-ca.crt";
 /// The CA's revocation list, as nginx reads it.
 pub const CRL_FILE: &str = "ffca.crl";
+/// A site's password file, in the CA's files folder: this, then the site's name.
+pub const USERS_FILE_PREFIX: &str = "ffca-users-";
 const BEGIN: &str = "# BEGIN ffca";
 const END: &str = "# END ffca";
 const DISABLED: &str = "# ffca: ";
 const MANAGED: [&str; 3] = ["ssl_client_certificate", "ssl_crl", "ssl_verify_client"];
+const AUTH_MANAGED: [&str; 2] = ["auth_basic", "auth_basic_user_file"];
+/// The named location that answers a missing login with a challenge, under passthrough.
+const LOGIN: &str = "@ffca_login";
+/// The first word of the `if` that passthrough writes.
+const REMOTE_USER: &str = "($remote_user";
+
+/// A site's HTTP auth. The names are users: ffca's own under `On`; the site's, under `Passthrough`,
+/// where none means any.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Auth {
+    /// No login asked for.
+    #[default]
+    Off,
+    /// A login is asked for and passed on; the site checks the password.
+    Passthrough(Vec<String>),
+    /// nginx checks the login itself, against these of ffca's users.
+    On(Vec<String>),
+}
+
+impl Auth {
+    /// The three kinds, with no names, for a dialog to choose from.
+    pub const KINDS: [&'static str; 3] = ["off", "passthrough", "on"];
+
+    pub fn kind(&self) -> usize {
+        match self {
+            Auth::Off => 0,
+            Auth::Passthrough(_) => 1,
+            Auth::On(_) => 2,
+        }
+    }
+
+    pub fn names(&self) -> &[String] {
+        match self {
+            Auth::Off => &[],
+            Auth::Passthrough(names) | Auth::On(names) => names,
+        }
+    }
+}
+
+impl fmt::Display for Auth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(Auth::KINDS[self.kind()])?;
+        match self {
+            Auth::Off => Ok(()),
+            Auth::Passthrough(names) if names.is_empty() => f.write_str(" (any user)"),
+            Auth::Passthrough(names) | Auth::On(names) => write!(f, " ({})", names.join(", ")),
+        }
+    }
+}
+
+/// One change to a site: one of its two settings, the other left as it is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    Certificate(Mode),
+    Auth(Auth),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
@@ -132,6 +221,11 @@ pub struct Site {
     /// Whether another site in the folder has one of its names on one of its addresses. nginx
     /// serves the one it reads first and ignores the other, so what the other says does not count.
     pub duplicate: bool,
+    /// Its HTTP auth. Under `On`, the names are those in ffca's password file; a site that checks
+    /// logins against a file of its own reads as on with no names, and `foreign_auth` set.
+    pub auth: Auth,
+    /// Whether its HTTP auth is written by hand, not by ffca: `auth_basic` with another file.
+    pub foreign_auth: bool,
 }
 
 impl Site {
@@ -230,6 +324,26 @@ fn sites_in(file: &Path, text: &str, nginx: &config::Nginx) -> Result<Vec<Site>>
             Some(value) if value.starts_with("optional") => Mode::Optional,
             _ => Mode::Off,
         };
+        let asks = directive("auth_basic")
+            .last()
+            .is_some_and(|d| d.args.first().is_some_and(|a| a != "off"));
+        let passthrough = children
+            .iter()
+            .find(|c| is_passthrough(c))
+            .map(passthrough_names);
+        let (auth, foreign_auth) = match passthrough {
+            Some(names) => (Auth::Passthrough(names), false),
+            None if asks => {
+                let file = directive("auth_basic_user_file")
+                    .last()
+                    .and_then(|d| d.args.first());
+                match file.and_then(|f| users_file_on_disk(f, nginx)) {
+                    Some(path) => (Auth::On(names_in_users_file(&path)), false),
+                    None => (Auth::On(Vec::new()), true),
+                }
+            }
+            None => (Auth::Off, false),
+        };
         sites.push(Site {
             file: file.to_owned(),
             index,
@@ -248,9 +362,81 @@ fn sites_in(file: &Path, text: &str, nginx: &config::Nginx) -> Result<Vec<Site>>
                 .map(|a| listen_address(a))
                 .collect(),
             duplicate: false,
+            auth,
+            foreign_auth,
         });
     }
     Ok(sites)
+}
+
+/// Whether `statement` is one of the HTTP-auth statements ffca writes or clears: `auth_basic`,
+/// `auth_basic_user_file`, and passthrough's `if`, `error_page` and named location.
+fn is_auth_statement(statement: &Statement) -> bool {
+    match &statement.block {
+        None => {
+            AUTH_MANAGED.contains(&statement.name.as_str())
+                || (statement.name == "error_page"
+                    && statement.args.last().is_some_and(|a| a == LOGIN))
+        }
+        Some(_) => {
+            is_passthrough(statement) || (statement.name == "location" && statement.args == [LOGIN])
+        }
+    }
+}
+
+fn is_passthrough(statement: &Statement) -> bool {
+    statement.block.is_some()
+        && statement.name == "if"
+        && statement.args.first().is_some_and(|a| a == REMOTE_USER)
+}
+
+/// The names passthrough's `if` lets through: none for `= ""` (any name), else those in its
+/// `^(?:a|b)$`.
+fn passthrough_names(statement: &Statement) -> Vec<String> {
+    statement
+        .args
+        .get(2)
+        .and_then(|pattern| pattern.strip_prefix("^(?:"))
+        .and_then(|rest| rest.strip_suffix(")$"))
+        .map(|names| names.split('|').map(|n| n.replace("\\.", ".")).collect())
+        .unwrap_or_default()
+}
+
+/// The name of a site's password file: [`USERS_FILE_PREFIX`] and the site's name, made safe for a
+/// file name.
+pub fn users_file_name(site: &str) -> String {
+    let name: String = site
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{USERS_FILE_PREFIX}{name}")
+}
+
+/// Where an `auth_basic_user_file` that is one of ffca's lives on this machine: a file named
+/// [`USERS_FILE_PREFIX`]... directly in the CA's files folder as nginx sees it. Any other file is
+/// the site's own.
+fn users_file_on_disk(in_nginx: &str, nginx: &config::Nginx) -> Option<PathBuf> {
+    let path = Path::new(in_nginx);
+    let name = path.file_name()?.to_str()?;
+    (path.parent()? == nginx.ca_files_in_nginx && name.starts_with(USERS_FILE_PREFIX))
+        .then(|| nginx.ca_files.join(name))
+}
+
+/// The user names in a password file, in its order; none if it cannot be read.
+fn names_in_users_file(path: &Path) -> Vec<String> {
+    fs::read_to_string(path)
+        .map(|text| {
+            text.lines()
+                .filter_map(|l| l.split_once(':').map(|(name, _)| name.to_owned()))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// A `listen` address as nginx groups servers by it: `443`, `*:443` and `0.0.0.0:443` are one.
@@ -267,8 +453,24 @@ fn listen_address(address: &str) -> String {
     format!("{}:{port}", host.to_ascii_lowercase())
 }
 
-/// `text` with site `index` set to `mode`: see the module documentation for what changes.
+/// `text` with site `index` set to client-certificate `mode`: see the module documentation for
+/// what changes.
 pub fn plan(text: &str, index: usize, mode: Mode, nginx: &config::Nginx) -> Result<String> {
+    plan_change(text, index, &Change::Certificate(mode), nginx)
+}
+
+/// `text` with site `index` set to HTTP auth `auth`.
+pub fn plan_auth(text: &str, index: usize, auth: &Auth, nginx: &config::Nginx) -> Result<String> {
+    plan_change(text, index, &Change::Auth(auth.clone()), nginx)
+}
+
+/// `text` with one of site `index`'s settings changed, the other as ffca's block has it.
+pub fn plan_change(
+    text: &str,
+    index: usize,
+    change: &Change,
+    nginx: &config::Nginx,
+) -> Result<String> {
     let parsed = Parsed::new(text)?;
     let servers = parsed.servers();
     let server = *servers
@@ -279,11 +481,54 @@ pub fn plan(text: &str, index: usize, mode: Mode, nginx: &config::Nginx) -> Resu
     let in_region = |line: usize| regions.iter().any(|r| r.contains(&line));
 
     let children = server.block.as_deref().unwrap_or_default();
-    // Asking for a certificate, ffca's lines would clash with any others; turning it off, only a
-    // `ssl_verify_client` still asks, and the rest can stay as they are.
-    let clashing: &[&str] = match mode {
-        Mode::Off => &["ssl_verify_client"],
-        Mode::Optional | Mode::Required => &MANAGED,
+    // What ffca's block says now, of the setting that does not change.
+    let ours: Vec<&Statement> = children
+        .iter()
+        .filter(|c| in_region(c.first_line))
+        .collect();
+    let mode = match change {
+        Change::Certificate(mode) => *mode,
+        Change::Auth(_) => ours
+            .iter()
+            .filter(|c| c.block.is_none() && c.name == "ssl_verify_client")
+            .find_map(|c| match c.args.first().map(String::as_str) {
+                Some("on") => Some(Mode::Required),
+                Some("optional") => Some(Mode::Optional),
+                _ => None,
+            })
+            .unwrap_or(Mode::Off),
+    };
+    let auth = match change {
+        Change::Auth(auth) => auth.clone(),
+        Change::Certificate(_) => {
+            if let Some(statement) = ours.iter().find(|c| is_passthrough(c)) {
+                Auth::Passthrough(passthrough_names(statement))
+            } else if ours
+                .iter()
+                .any(|c| c.block.is_none() && c.name == "auth_basic")
+            {
+                // The names are in the password file, which this change leaves as it is.
+                Auth::On(Vec::new())
+            } else {
+                Auth::Off
+            }
+        }
+    };
+    if let Change::Auth(Auth::Passthrough(names) | Auth::On(names)) = change {
+        for name in names {
+            ensure!(
+                crate::users::checked_name(name)? == *name,
+                "{name:?} is not a user name"
+            );
+        }
+    }
+    // Asking for a certificate or a login, ffca's lines would clash with any others of that kind;
+    // turning it off, only the line that still asks. The other setting's lines are left alone.
+    let clashing: &[&str] = match change {
+        Change::Certificate(Mode::Off) => &["ssl_verify_client"],
+        Change::Certificate(_) => &MANAGED,
+        Change::Auth(Auth::Off) => &["auth_basic"],
+        Change::Auth(_) => &AUTH_MANAGED,
     };
     let mut disable = Vec::new();
     for child in children {
@@ -332,34 +577,31 @@ pub fn plan(text: &str, index: usize, mode: Mode, nginx: &config::Nginx) -> Resu
             server.first_line + 1
         ),
     };
-    let wanted: Vec<(String, Vec<String>)> = match mode.value() {
-        None => Vec::new(),
-        Some(value) => {
-            let folder = config::checked_folder_in_nginx(&nginx.ca_files_in_nginx)?;
-            vec![
-                (
-                    "ssl_client_certificate".to_owned(),
-                    vec![folder.join(CA_FILE).display().to_string()],
-                ),
-                (
-                    "ssl_crl".to_owned(),
-                    vec![folder.join(CRL_FILE).display().to_string()],
-                ),
-                ("ssl_verify_client".to_owned(), vec![value.to_owned()]),
-            ]
-        }
-    };
+    let site = children
+        .iter()
+        .filter(|c| c.block.is_none() && c.name == "server_name")
+        .find_map(|c| c.args.first())
+        .map_or("_", String::as_str);
+    let wanted = block_statements(mode, &auth, site, nginx)?;
     let mut block = Vec::new();
     if !wanted.is_empty() {
         block.push("\n".to_owned());
         block.push(format!(
             "{indent}{BEGIN} - client certificates, managed by Friends and Family CA\n"
         ));
-        for (name, args) in &wanted {
-            block.push(format!("{indent}{name} {};\n", args.join(" ")));
+        for node in &wanted {
+            render(node, &indent, &mut block);
         }
         block.push(format!("{indent}{END}\n"));
     }
+    // After the change, the client-certificate and HTTP-auth statements of the server are those
+    // outside ffca's block that stay as they are, and the block's.
+    let mut expected: Vec<Node> = children
+        .iter()
+        .filter(|c| is_managed(c) && !in_region(c.first_line) && !disable.contains(&c.first_line))
+        .map(node)
+        .collect();
+    expected.extend(wanted.iter().cloned());
 
     let mut out = String::with_capacity(text.len() + 300);
     for (i, line) in lines.iter().enumerate() {
@@ -384,7 +626,7 @@ pub fn plan(text: &str, index: usize, mode: Mode, nginx: &config::Nginx) -> Resu
         }
         block.iter().for_each(|l| out.push_str(l));
     }
-    check_plan(&parsed, &out, index, &wanted).with_context(|| {
+    check_plan(&parsed, &out, index, change, &expected, !wanted.is_empty()).with_context(|| {
         format!(
             "ffca's change to the server block on line {} would not do only what it should; \
              change it by hand",
@@ -394,14 +636,146 @@ pub fn plan(text: &str, index: usize, mode: Mode, nginx: &config::Nginx) -> Resu
     Ok(out)
 }
 
+/// What ffca's block holds for `mode` and `auth`, on the site named `site`.
+fn block_statements(
+    mode: Mode,
+    auth: &Auth,
+    site: &str,
+    nginx: &config::Nginx,
+) -> Result<Vec<Node>> {
+    let leaf = |name: &str, args: Vec<String>| Node {
+        name: name.to_owned(),
+        args,
+        block: None,
+    };
+    let mut nodes = Vec::new();
+    let folder = || config::checked_folder_in_nginx(&nginx.ca_files_in_nginx);
+    if let Some(value) = mode.value() {
+        let folder = folder()?;
+        nodes.push(leaf(
+            "ssl_client_certificate",
+            vec![folder.join(CA_FILE).display().to_string()],
+        ));
+        nodes.push(leaf(
+            "ssl_crl",
+            vec![folder.join(CRL_FILE).display().to_string()],
+        ));
+        nodes.push(leaf("ssl_verify_client", vec![value.to_owned()]));
+    }
+    match auth {
+        Auth::Off => {}
+        Auth::On(_) => {
+            let file = folder()?.join(users_file_name(site));
+            nodes.push(leaf("auth_basic", vec![site.to_owned()]));
+            nodes.push(leaf(
+                "auth_basic_user_file",
+                vec![file.display().to_string()],
+            ));
+        }
+        Auth::Passthrough(names) => {
+            let condition = if names.is_empty() {
+                vec![
+                    REMOTE_USER.to_owned(),
+                    "=".to_owned(),
+                    String::new(),
+                    ")".to_owned(),
+                ]
+            } else {
+                let names: Vec<String> = names.iter().map(|n| n.replace('.', "\\.")).collect();
+                vec![
+                    REMOTE_USER.to_owned(),
+                    "!~".to_owned(),
+                    format!("^(?:{})$", names.join("|")),
+                    ")".to_owned(),
+                ]
+            };
+            nodes.push(Node {
+                name: "if".to_owned(),
+                args: condition,
+                block: Some(vec![leaf("return", vec!["401".to_owned()])]),
+            });
+            nodes.push(leaf("error_page", vec!["401".to_owned(), LOGIN.to_owned()]));
+            nodes.push(Node {
+                name: "location".to_owned(),
+                args: vec![LOGIN.to_owned()],
+                block: Some(vec![
+                    leaf(
+                        "add_header",
+                        vec![
+                            "WWW-Authenticate".to_owned(),
+                            format!("Basic realm=\"{site}\""),
+                            "always".to_owned(),
+                        ],
+                    ),
+                    leaf("return", vec!["401".to_owned()]),
+                ]),
+            });
+        }
+    }
+    Ok(nodes)
+}
+
+/// `node` as lines of configuration, at `indent`, into `out`.
+fn render(node: &Node, indent: &str, out: &mut Vec<String>) {
+    // The `if` condition's parentheses are written as nginx's own examples write them: `($x`
+    // and `)` touch their neighbours.
+    // The value it compares with is always quoted: unquoted, nginx would read the `)` after a
+    // pattern as part of it.
+    let words: Vec<String> = if node.name == "if" {
+        let mut args: Vec<String> = node
+            .args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| if i == 2 { quote_always(a) } else { quote(a) })
+            .collect();
+        let close = args.pop().unwrap_or_default();
+        if let Some(last) = args.last_mut() {
+            last.push_str(&close);
+        }
+        args
+    } else {
+        node.args.iter().map(|a| quote(a)).collect()
+    };
+    match &node.block {
+        None => out.push(format!("{indent}{} {};\n", node.name, words.join(" "))),
+        Some(children) => {
+            out.push(format!("{indent}{} {} {{\n", node.name, words.join(" ")));
+            for child in children {
+                render(child, &format!("{indent}    "), out);
+            }
+            out.push(format!("{indent}}}\n"));
+        }
+    }
+}
+
+/// Whether `statement`, directly in a server block, is a client-certificate or HTTP-auth one.
+fn is_managed(statement: &Statement) -> bool {
+    (statement.block.is_none() && MANAGED.contains(&statement.name.as_str()))
+        || is_auth_statement(statement)
+}
+
+/// `statement` as a [`Node`].
+fn node(statement: &Statement) -> Node {
+    Node {
+        name: statement.name.clone(),
+        args: statement.args.clone(),
+        block: statement
+            .block
+            .as_ref()
+            .map(|children| children.iter().map(node).collect()),
+    }
+}
+
 /// Reads `out` back and compares it with `before`: every statement but the target server's own
-/// `ssl_client_certificate`, `ssl_crl` and `ssl_verify_client` is as it was, and those are
-/// exactly `wanted` - or, turning it off, no `ssl_verify_client` and nothing that was not there.
+/// client-certificate and HTTP-auth ones is as it was, and those are exactly `expected`; the
+/// setting `change` turned off no longer asks; and ffca has one block, if `block`, else none.
 fn check_plan(
     before: &Parsed,
     out: &str,
     index: usize,
-    wanted: &[(String, Vec<String>)],
+    change: &Change,
+    expected: &[Node],
+    block: bool,
 ) -> Result<()> {
     let after = Parsed::new(out).context("it would not read as nginx configuration")?;
     let (mut managed_before, mut managed_after) = (Vec::new(), Vec::new());
@@ -409,27 +783,32 @@ fn check_plan(
     let shape_after = shape(&after.statements, index, &mut 0, &mut managed_after);
     ensure!(
         shape_before == shape_after,
-        "it would change more than the client-certificate lines"
+        "it would change more than the client-certificate and HTTP-auth lines"
     );
-    if wanted.is_empty() {
-        ensure!(
+    let sorted = |nodes: &[Node]| {
+        let mut keys: Vec<String> = nodes.iter().map(|n| format!("{n:?}")).collect();
+        keys.sort();
+        keys
+    };
+    ensure!(
+        sorted(&managed_after) == sorted(expected),
+        "the server would end up with {managed_after:?}"
+    );
+    match change {
+        Change::Certificate(Mode::Off) => ensure!(
+            managed_after.iter().all(|n| n.name != "ssl_verify_client"),
+            "the server would still ask for a certificate"
+        ),
+        Change::Auth(Auth::Off) => ensure!(
             managed_after
                 .iter()
-                .all(|(name, _)| name != "ssl_verify_client"),
-            "the server would still ask for a certificate"
-        );
-        ensure!(
-            managed_after.iter().all(|m| managed_before.contains(m)),
-            "it would add client-certificate lines"
-        );
-    } else {
-        managed_after.sort();
-        let mut wanted = wanted.to_vec();
-        wanted.sort();
-        ensure!(
-            managed_after == wanted,
-            "the server would end up with {managed_after:?}"
-        );
+                .all(|n| n.name != "auth_basic" || n.args.first().is_some_and(|a| a == "off"))
+                && !managed_after
+                    .iter()
+                    .any(|n| n.name == "if" && n.args.first().is_some_and(|a| a == REMOTE_USER)),
+            "the server would still ask for a login"
+        ),
+        _ => {}
     }
     let lines: Vec<&str> = out.split_inclusive('\n').collect();
     let server = *after
@@ -438,7 +817,7 @@ fn check_plan(
         .context("the server block would be gone")?;
     let regions = after.regions(server, &lines)?;
     ensure!(
-        regions.len() == usize::from(!wanted.is_empty()),
+        regions.len() == usize::from(block),
         "it would leave {} blocks of ffca's",
         regions.len()
     );
@@ -446,39 +825,38 @@ fn check_plan(
 }
 
 /// A statement as nginx acts on it: no lines, no comments.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Node {
     name: String,
     args: Vec<String>,
     block: Option<Vec<Node>>,
 }
 
-/// `statements` as [`Node`]s, with server block `target`'s own client-certificate directives
-/// taken out into `managed`. `seen` counts server blocks, in the order of [`Parsed::servers`].
+/// `statements` as [`Node`]s, with server block `target`'s own client-certificate and HTTP-auth
+/// statements taken out into `managed`. `seen` counts server blocks, in the order of
+/// [`Parsed::servers`].
 fn shape(
     statements: &[Statement],
     target: usize,
     seen: &mut usize,
-    managed: &mut Vec<(String, Vec<String>)>,
+    managed: &mut Vec<Node>,
 ) -> Vec<Node> {
     let mut nodes = Vec::new();
     for statement in statements {
+        let this = (statement.block.is_some() && statement.name == "server").then(|| {
+            *seen += 1;
+            *seen - 1
+        });
         let block = statement.block.as_ref().map(|block| {
-            let this = (statement.name == "server").then(|| {
-                *seen += 1;
-                *seen - 1
-            });
-            let mut children = shape(block, target, seen, managed);
             if this == Some(target) {
-                children.retain(|child| {
-                    let ours = child.block.is_none() && MANAGED.contains(&child.name.as_str());
-                    if ours {
-                        managed.push((child.name.clone(), child.args.clone()));
-                    }
-                    !ours
-                });
+                let (ours, rest): (Vec<&Statement>, Vec<&Statement>) =
+                    block.iter().partition(|child| is_managed(child));
+                managed.extend(ours.into_iter().map(node));
+                let rest: Vec<Statement> = rest.into_iter().cloned().collect();
+                shape(&rest, target, seen, managed)
+            } else {
+                shape(block, target, seen, managed)
             }
-            children
         });
         nodes.push(Node {
             name: statement.name.clone(),
@@ -511,7 +889,88 @@ fn indentation(line: &str) -> &str {
 /// file read, the one written and the one put back are the same, and if anything else changes it
 /// meanwhile, ffca leaves it alone.
 pub fn set_mode(nginx: &config::Nginx, ca: &Ca, site: &Site, mode: Mode) -> Result<bool> {
+    apply(nginx, ca, site, &Change::Certificate(mode), None)
+}
+
+/// Sets `site`'s HTTP auth to `auth`, as [`set_mode`] sets its client-certificate mode. Under
+/// `On`, the site's password file is written from `users` first, and put back with the site if
+/// nginx refuses the change; turning `On` off removes it once nginx has reloaded.
+pub fn set_auth(
+    nginx: &config::Nginx,
+    ca: &Ca,
+    users: &crate::users::Users,
+    site: &Site,
+    auth: &Auth,
+) -> Result<bool> {
+    apply(nginx, ca, site, &Change::Auth(auth.clone()), Some(users))
+}
+
+/// A site's password file, on this machine, what it held before ffca wrote it, and whether ffca
+/// changed it.
+struct UsersFile {
+    store: Store,
+    name: String,
+    before: Option<String>,
+    written: bool,
+}
+
+impl UsersFile {
+    fn put_back(&self) -> Result<()> {
+        match &self.before {
+            Some(text) => self.store.write(&self.name, text.as_bytes(), PUBLIC),
+            None => fs::remove_file(self.store.path(&self.name)).map_err(anyhow::Error::from),
+        }
+    }
+}
+
+fn apply(
+    nginx: &config::Nginx,
+    ca: &Ca,
+    site: &Site,
+    change: &Change,
+    users: Option<&crate::users::Users>,
+) -> Result<bool> {
     publish(nginx, ca)?;
+    let users_file = match change {
+        Change::Auth(Auth::On(names)) => {
+            let users = users.context("no users to write the password file from")?;
+            let text = users.password_file(names)?;
+            let store = Store::new(&nginx.ca_files);
+            let name = users_file_name(site.name());
+            let before = store.exists(&name).then(|| store.read(&name)).transpose()?;
+            let written = before.as_deref() != Some(text.as_str());
+            if written {
+                store.write(&name, text.as_bytes(), PUBLIC)?;
+            }
+            Some(UsersFile {
+                store,
+                name,
+                before,
+                written,
+            })
+        }
+        _ => None,
+    };
+    let result = apply_site(nginx, ca, site, change);
+    // nginx reads the file on every request: once the site is in place, it is in use.
+    if let (Some(file), Err(_)) = (&users_file, &result)
+        && file.written
+    {
+        file.put_back()?;
+    }
+    let changed = result?;
+    let was_ffcas = matches!(site.auth, Auth::On(_)) && !site.foreign_auth;
+    if was_ffcas && matches!(change, Change::Auth(Auth::Off | Auth::Passthrough(_))) {
+        let path = nginx.ca_files.join(users_file_name(site.name()));
+        if path.exists() {
+            fs::remove_file(&path)
+                .with_context(|| format!("nginx reloaded; {} is left over", path.display()))?;
+        }
+    }
+    Ok(changed || users_file.is_some_and(|f| f.written))
+}
+
+fn apply_site(nginx: &config::Nginx, ca: &Ca, site: &Site, change: &Change) -> Result<bool> {
     let real = fs::canonicalize(&site.file)
         .with_context(|| format!("cannot find {}", site.file.display()))?;
     check_folder(real.parent().unwrap_or(Path::new("/")), ca)?;
@@ -523,7 +982,7 @@ pub fn set_mode(nginx: &config::Nginx, ca: &Ca, site: &Site, mode: Mode) -> Resu
         "{} changed since it was read; look again",
         site.file.display()
     );
-    let planned = plan(&original, site.index, mode, nginx)?;
+    let planned = plan_change(&original, site.index, change, nginx)?;
     if planned == original {
         return Ok(false);
     }
@@ -544,9 +1003,11 @@ pub fn set_mode(nginx: &config::Nginx, ca: &Ca, site: &Site, mode: Mode) -> Resu
         Ok(printed) => printed,
         Err(error) => return Err(restore("nginx refused the change", error)),
     };
-    if mode != Mode::Off
-        && let Some(name) = conflicting(&tested, &site.names)
-    {
+    let asks = !matches!(
+        change,
+        Change::Certificate(Mode::Off) | Change::Auth(Auth::Off)
+    );
+    if asks && let Some(name) = conflicting(&tested, &site.names) {
         return Err(restore(
             &format!("nginx has two server blocks for {name} and ignores one of them"),
             anyhow!(
@@ -825,22 +1286,27 @@ fn quote(argument: &str) -> String {
             .chars()
             .any(|c| c.is_whitespace() || c.is_control() || "{};#'\"\\".contains(c))
     {
-        let mut quoted = String::from("\"");
-        for c in argument.chars() {
-            match c {
-                '\\' => quoted.push_str("\\\\"),
-                '"' => quoted.push_str("\\\""),
-                '\n' => quoted.push_str("\\n"),
-                '\r' => quoted.push_str("\\r"),
-                '\t' => quoted.push_str("\\t"),
-                c => quoted.push(c),
-            }
-        }
-        quoted.push('"');
-        quoted
+        quote_always(argument)
     } else {
         argument.to_owned()
     }
+}
+
+/// `argument` in double quotes, escaped as nginx reads it back.
+fn quote_always(argument: &str) -> String {
+    let mut quoted = String::from("\"");
+    for c in argument.chars() {
+        match c {
+            '\\' => quoted.push_str("\\\\"),
+            '"' => quoted.push_str("\\\""),
+            '\n' => quoted.push_str("\\n"),
+            '\r' => quoted.push_str("\\r"),
+            '\t' => quoted.push_str("\\t"),
+            c => quoted.push(c),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Copies the CA's certificate and CRL to where nginx reads them. Each is replaced by a rename -
@@ -895,6 +1361,60 @@ fn check_folder(folder: &Path, ca: &Ca) -> Result<()> {
         metadata.mode() & 0o7777
     );
     Ok(())
+}
+
+/// Rewrites the password file of every site whose HTTP auth ffca turned on, from `users`: after
+/// a password changed or a user went. A user who is gone is left out of every file. Tests nginx's
+/// configuration and reloads if a file changed; a refusal puts every file back. Returns the sites
+/// whose file changed, each with how many users it still lets in.
+pub fn publish_users(
+    nginx: &config::Nginx,
+    ca: &Ca,
+    users: &crate::users::Users,
+) -> Result<Vec<(String, usize)>> {
+    publish(nginx, ca)?;
+    let store = Store::new(&nginx.ca_files);
+    let mut written = Vec::new();
+    let mut changed = Vec::new();
+    for site in survey(nginx)?.sites {
+        let Auth::On(names) = &site.auth else {
+            continue;
+        };
+        if site.foreign_auth {
+            continue;
+        }
+        let kept: Vec<String> = names
+            .iter()
+            .filter(|n| users.get(n).is_some())
+            .cloned()
+            .collect();
+        let text = users.password_file(&kept)?;
+        let name = users_file_name(site.name());
+        let before = store.exists(&name).then(|| store.read(&name)).transpose()?;
+        if before.as_deref() == Some(text.as_str()) {
+            continue;
+        }
+        store.write(&name, text.as_bytes(), PUBLIC)?;
+        written.push(UsersFile {
+            store: Store::new(&nginx.ca_files),
+            name,
+            before,
+            written: true,
+        });
+        changed.push((site.name().to_owned(), kept.len()));
+    }
+    if written.is_empty() {
+        return Ok(changed);
+    }
+    let put_back = |error: anyhow::Error| -> anyhow::Error {
+        for file in &written {
+            let _ = file.put_back();
+        }
+        error.context("so every password file is back as it was")
+    };
+    run(&nginx.test).map_err(put_back)?;
+    run(&nginx.reload).map_err(put_back)?;
+    Ok(changed)
 }
 
 /// Publishes the CA's files and reloads nginx, after testing its configuration: what a new CRL
@@ -1074,8 +1594,8 @@ impl Parsed {
     /// The lines of ffca's blocks in `server`, each with the blank line before it: from a comment
     /// that is exactly `# BEGIN ffca` (or `# BEGIN ffca - ...`) to one that is exactly
     /// `# END ffca`, each on a line of its own, directly in the server block. Anything in one but
-    /// ffca's three directives, each on lines of its own, is refused: turning the site off would
-    /// delete it.
+    /// ffca's client-certificate and HTTP-auth statements, whole and on lines of their own, is
+    /// refused: turning the site off would delete it.
     fn regions(&self, server: &Statement, lines: &[&str]) -> Result<Vec<RangeInclusive<usize>>> {
         let open = server.tokens.end - 1;
         let inside = |c: &&Comment| {
@@ -1105,13 +1625,13 @@ impl Parsed {
         }
         let children = server.block.as_deref().unwrap_or_default();
         for region in &regions {
+            // A block's tokens run from its first word to its `}`.
             let ours = |index: usize| {
                 children.iter().any(|c| {
-                    c.block.is_none()
-                        && MANAGED.contains(&c.name.as_str())
-                        && c.tokens.contains(&index)
+                    is_managed(c)
+                        && (c.tokens.start..=c.close_token).contains(&index)
                         && region.contains(&c.first_line)
-                        && region.contains(&c.last_line)
+                        && region.contains(&c.close_line)
                 })
             };
             let foreign_token =

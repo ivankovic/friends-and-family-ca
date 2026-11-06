@@ -1117,3 +1117,303 @@ fn a_block_without_its_end_does_not_swallow_the_rest() {
         ]]
     );
 }
+
+const PASSTHROUGH_BLOCK: &str = r#"    # BEGIN ffca - client certificates, managed by Friends and Family CA
+    if ($remote_user !~ "^(?:boox)$") {
+        return 401;
+    }
+    error_page 401 @ffca_login;
+    location @ffca_login {
+        add_header WWW-Authenticate "Basic realm=\"books.example.org\"" always;
+        return 401;
+    }
+    # END ffca
+"#;
+
+#[test]
+fn passthrough_asks_for_a_login_and_names_who_may_try() {
+    let (_dir, nginx) = folder(&[]);
+    let auth = Auth::Passthrough(vec!["boox".into()]);
+    let planned = plan_auth(BOOKS, 0, &auth, &nginx).unwrap();
+    assert!(
+        planned.contains(&format!(
+            "    server_name books.example.org;\n\n{PASSTHROUGH_BLOCK}"
+        )),
+        "{planned}"
+    );
+    let site = &sites_in(Path::new("books.conf"), &planned, &nginx).unwrap()[0];
+    assert_eq!(
+        (site.mode, &site.auth, site.foreign_auth),
+        (Mode::Off, &auth, false)
+    );
+    assert_eq!(plan_auth(&planned, 0, &auth, &nginx).unwrap(), planned);
+    assert_eq!(plan_auth(&planned, 0, &Auth::Off, &nginx).unwrap(), BOOKS);
+}
+
+#[test]
+fn passthrough_without_names_lets_any_name_try() {
+    let (_dir, nginx) = folder(&[]);
+    let planned = plan_auth(BOOKS, 0, &Auth::Passthrough(Vec::new()), &nginx).unwrap();
+    assert!(
+        planned.contains("    if ($remote_user = \"\") {\n        return 401;\n    }\n"),
+        "{planned}"
+    );
+    let site = &sites_in(Path::new("books.conf"), &planned, &nginx).unwrap()[0];
+    assert_eq!(site.auth, Auth::Passthrough(Vec::new()));
+}
+
+#[test]
+fn a_dot_in_a_name_is_a_dot_not_any_character() {
+    let (_dir, nginx) = folder(&[]);
+    let auth = Auth::Passthrough(vec!["anna.k".into(), "boox".into()]);
+    let planned = plan_auth(BOOKS, 0, &auth, &nginx).unwrap();
+    assert!(
+        planned.contains(r#"if ($remote_user !~ "^(?:anna\\.k|boox)$") {"#),
+        "{planned}"
+    );
+    let site = &sites_in(Path::new("books.conf"), &planned, &nginx).unwrap()[0];
+    assert_eq!(site.auth, auth);
+}
+
+#[test]
+fn a_name_that_could_change_the_pattern_is_refused() {
+    let (_dir, nginx) = folder(&[]);
+    for bad in ["a)|.*(", "a b", "", "x$"] {
+        let auth = Auth::Passthrough(vec![bad.into()]);
+        assert!(plan_auth(BOOKS, 0, &auth, &nginx).is_err(), "{bad:?}");
+        assert!(
+            plan_auth(BOOKS, 0, &Auth::On(vec![bad.into()]), &nginx).is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn auth_on_points_nginx_at_the_sites_password_file() {
+    let (_dir, nginx) = folder(&[]);
+    let planned = plan_auth(BOOKS, 0, &Auth::On(vec!["anna".into()]), &nginx).unwrap();
+    assert!(
+        planned.contains(
+            "    auth_basic books.example.org;\n    auth_basic_user_file /etc/nginx/certs/ffca-users-books.example.org;\n"
+        ),
+        "{planned}"
+    );
+    assert_eq!(plan_auth(&planned, 0, &Auth::Off, &nginx).unwrap(), BOOKS);
+}
+
+#[test]
+fn the_two_settings_change_one_at_a_time() {
+    let (_dir, nginx) = folder(&[]);
+    let auth = Auth::Passthrough(vec!["boox".into()]);
+    let required = plan(BOOKS, 0, Mode::Required, &nginx).unwrap();
+    let both = plan_auth(&required, 0, &auth, &nginx).unwrap();
+    let read = |text: &str| {
+        let site = &sites_in(Path::new("books.conf"), text, &nginx).unwrap()[0];
+        (site.mode, site.auth.clone())
+    };
+    assert_eq!(read(&both), (Mode::Required, auth.clone()));
+    let optional = plan(&both, 0, Mode::Optional, &nginx).unwrap();
+    assert_eq!(
+        read(&optional),
+        (Mode::Optional, auth.clone()),
+        "the login stays"
+    );
+    let no_login = plan_auth(&optional, 0, &Auth::Off, &nginx).unwrap();
+    assert_eq!(
+        read(&no_login),
+        (Mode::Optional, Auth::Off),
+        "the certificate stays"
+    );
+    assert_eq!(plan(&no_login, 0, Mode::Off, &nginx).unwrap(), BOOKS);
+    // The other order, through `on`, ends where it started too.
+    let on = plan_auth(BOOKS, 0, &Auth::On(vec!["anna".into()]), &nginx).unwrap();
+    let with_certificate = plan(&on, 0, Mode::Required, &nginx).unwrap();
+    assert_eq!(read(&with_certificate).0, Mode::Required);
+    assert!(matches!(read(&with_certificate).1, Auth::On(_)));
+    let back = plan(&with_certificate, 0, Mode::Off, &nginx).unwrap();
+    assert_eq!(plan_auth(&back, 0, &Auth::Off, &nginx).unwrap(), BOOKS);
+}
+
+const PAGES: &str = "server {
+    listen 443 ssl;
+    server_name pages.example.org;
+    ssl_certificate     /etc/letsencrypt/live/example/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/example/privkey.pem;
+    auth_basic \"Pages\";
+    auth_basic_user_file /etc/nginx/pages.htpasswd;
+    location / { root /srv/pages; }
+}
+";
+
+#[test]
+fn a_sites_own_login_reads_as_on_and_is_left_alone_by_a_certificate_change() {
+    let (_dir, nginx) = folder(&[]);
+    let site = &sites_in(Path::new("pages.conf"), PAGES, &nginx).unwrap()[0];
+    assert_eq!(
+        (&site.auth, site.foreign_auth),
+        (&Auth::On(Vec::new()), true)
+    );
+    let required = plan(PAGES, 0, Mode::Required, &nginx).unwrap();
+    assert!(
+        required.contains("    auth_basic \"Pages\";\n"),
+        "{required}"
+    );
+    assert!(!required.contains("# ffca: auth_basic"), "{required}");
+    assert_eq!(plan(&required, 0, Mode::Off, &nginx).unwrap(), PAGES);
+}
+
+#[test]
+fn ffcas_login_comments_out_the_sites_own_and_off_comments_out_only_what_asks() {
+    let (_dir, nginx) = folder(&[]);
+    let planned = plan_auth(PAGES, 0, &Auth::Passthrough(Vec::new()), &nginx).unwrap();
+    assert!(
+        planned.contains("    # ffca: auth_basic \"Pages\";\n"),
+        "{planned}"
+    );
+    assert!(
+        planned.contains("    # ffca: auth_basic_user_file /etc/nginx/pages.htpasswd;\n"),
+        "{planned}"
+    );
+    let off = plan_auth(PAGES, 0, &Auth::Off, &nginx).unwrap();
+    assert!(off.contains("    # ffca: auth_basic \"Pages\";\n"), "{off}");
+    assert!(
+        off.contains("    auth_basic_user_file /etc/nginx/pages.htpasswd;\n"),
+        "only the line that asks goes: {off}"
+    );
+    assert_eq!(
+        sites_in(Path::new("pages.conf"), &off, &nginx).unwrap()[0].auth,
+        Auth::Off
+    );
+}
+
+#[test]
+fn a_foreign_line_among_ffcas_login_lines_is_left_to_a_person() {
+    let (_dir, nginx) = folder(&[]);
+    let planned = plan_auth(BOOKS, 0, &Auth::Passthrough(vec!["boox".into()]), &nginx).unwrap();
+    let tampered = planned.replace(
+        "    error_page 401 @ffca_login;\n",
+        "    error_page 401 @ffca_login;\n    add_header X-Extra 1;\n",
+    );
+    let error = plan_auth(&tampered, 0, &Auth::Off, &nginx).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("more than its own lines"),
+        "{error:#}"
+    );
+}
+
+fn users_with(names: &[&str]) -> crate::users::Users {
+    let mut users = crate::users::Users::default();
+    for name in names {
+        users.add(name, None).unwrap();
+    }
+    users
+}
+
+#[test]
+fn set_auth_on_writes_the_password_file_and_off_removes_it() {
+    let (dir, nginx) = folder(&[("books.conf", BOOKS)]);
+    let ca = ca(dir.path());
+    let users = users_with(&["anna", "ben"]);
+    let site = only_site(&nginx);
+    assert!(set_auth(&nginx, &ca, &users, &site, &Auth::On(vec!["anna".into()])).unwrap());
+    let file = nginx.ca_files.join("ffca-users-books.example.org");
+    let text = fs::read_to_string(&file).unwrap();
+    assert_eq!(text, users.password_file(&["anna".into()]).unwrap());
+    assert_eq!(
+        fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    let site = only_site(&nginx);
+    assert_eq!(site.auth, Auth::On(vec!["anna".into()]));
+    // More names: the site's lines stay, its file changes.
+    assert!(
+        set_auth(
+            &nginx,
+            &ca,
+            &users,
+            &site,
+            &Auth::On(vec!["anna".into(), "ben".into()])
+        )
+        .unwrap()
+    );
+    assert_eq!(
+        only_site(&nginx).auth,
+        Auth::On(vec!["anna".into(), "ben".into()])
+    );
+    assert!(set_auth(&nginx, &ca, &users, &only_site(&nginx), &Auth::Off).unwrap());
+    assert!(!file.exists());
+    assert_eq!(
+        fs::read_to_string(nginx.sites.join("books.conf")).unwrap(),
+        BOOKS
+    );
+}
+
+#[test]
+fn a_refused_login_change_puts_back_the_site_and_its_password_file() {
+    let (dir, mut nginx) = folder(&[("books.conf", BOOKS)]);
+    let ca = ca(dir.path());
+    let users = users_with(&["anna"]);
+    nginx.test = "false".into();
+    let error = set_auth(
+        &nginx,
+        &ca,
+        &users,
+        &only_site(&nginx),
+        &Auth::On(vec!["anna".into()]),
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("back as it was"), "{error:#}");
+    assert_eq!(
+        fs::read_to_string(nginx.sites.join("books.conf")).unwrap(),
+        BOOKS
+    );
+    assert!(!nginx.ca_files.join("ffca-users-books.example.org").exists());
+    assert!(
+        set_auth(
+            &nginx,
+            &ca,
+            &users,
+            &only_site(&nginx),
+            &Auth::On(vec!["nobody".into()])
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_new_password_or_a_user_gone_reaches_every_password_file() {
+    let (dir, nginx) = folder(&[("books.conf", BOOKS), ("pages.conf", PAGES)]);
+    let ca = ca(dir.path());
+    let mut users = users_with(&["anna", "ben"]);
+    let books = survey(&nginx).unwrap().sites.remove(0);
+    set_auth(
+        &nginx,
+        &ca,
+        &users,
+        &books,
+        &Auth::On(vec!["anna".into(), "ben".into()]),
+    )
+    .unwrap();
+    assert!(
+        publish_users(&nginx, &ca, &users).unwrap().is_empty(),
+        "nothing changed"
+    );
+    let password = users.set_password("anna", None).unwrap();
+    assert_eq!(
+        publish_users(&nginx, &ca, &users).unwrap(),
+        [("books.example.org".to_owned(), 2)]
+    );
+    let file = fs::read_to_string(nginx.ca_files.join("ffca-users-books.example.org")).unwrap();
+    let anna = file.lines().find(|l| l.starts_with("anna:")).unwrap();
+    assert!(crate::users::verify(
+        &password,
+        anna.split_once(':').unwrap().1
+    ));
+    users.remove("ben").unwrap();
+    assert_eq!(
+        publish_users(&nginx, &ca, &users).unwrap(),
+        [("books.example.org".to_owned(), 1)]
+    );
+    let names = survey(&nginx).unwrap().sites.remove(0).auth;
+    assert_eq!(names, Auth::On(vec!["anna".into()]));
+}

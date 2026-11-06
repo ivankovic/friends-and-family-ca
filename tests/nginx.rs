@@ -907,3 +907,195 @@ fn until(condition: impl Fn() -> bool, what: &str) {
         std::thread::sleep(Duration::from_millis(100));
     }
 }
+
+/// A site that serves a file, as a page would: `return` in a location answers before nginx
+/// checks `auth_basic`, so a site that only returns could not show a login being checked.
+const PAGE: &str = r#"server {
+    listen 127.0.0.1:PORT ssl;
+    server_name localhost;
+
+    location / {
+        root /etc/ffca/www;
+        default_type text/plain;
+    }
+}
+"#;
+
+/// The status the site gives `client` logging in as `login`, and the challenge it sends back.
+fn with_login(nginx: &Nginx, client: Client, login: Option<(&str, &str)>) -> (u16, Option<String>) {
+    let mut command = Command::new("curl");
+    command
+        .args([
+            "--silent",
+            "--show-error",
+            "--max-time",
+            "10",
+            "--output",
+            "/dev/null",
+        ])
+        .arg("--cacert")
+        .arg(nginx.config.path().join("server.crt"))
+        .args(["--dump-header", "-", "--write-out", "%{http_code}"]);
+    if let Client::With(certificate, key) = client {
+        command.arg("--cert").arg(certificate).arg("--key").arg(key);
+    }
+    if let Some((user, password)) = login {
+        command.args(["--user", &format!("{user}:{password}")]);
+    }
+    let output = command
+        .arg(format!("https://localhost:{}/", nginx.port))
+        .output()
+        .expect("these tests need the `curl` command");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let challenge = text
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("www-authenticate: ")
+                .or_else(|| l.strip_prefix("WWW-Authenticate: "))
+        })
+        .map(|v| v.trim().to_owned());
+    let status = text
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| {
+            panic!(
+                "curl got no answer: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    (status, challenge)
+}
+
+/// nginx serving PAGE from `sites`, and how ffca reaches it.
+fn page(ffca: &Ffca) -> (Nginx, config::Nginx) {
+    let nginx = Nginx::start_with(
+        ffca,
+        "    include /etc/ffca/sites/*.conf;",
+        &[("page.conf", PAGE)],
+    );
+    let www = nginx.config.path().join("www");
+    std::fs::create_dir(&www).unwrap();
+    std::fs::write(www.join("index.html"), "the page\n").unwrap();
+    let settings = settings(&nginx, "/etc/ffca/certs");
+    (nginx, settings)
+}
+
+fn until_login(nginx: &Nginx, client: Client, login: Option<(&str, &str)>, status: u16) {
+    until(
+        || with_login(nginx, client, login).0 == status,
+        &format!("{status} for {:?}", login.map(|l| l.0)),
+    );
+}
+
+#[test]
+fn http_auth_on_lets_in_only_its_users_with_their_passwords() {
+    let ffca = Ffca::initialised();
+    let (nginx, settings) = page(&ffca);
+    let ca = Ca::open(&Store::new(&ffca.state)).unwrap();
+    let mut users = friends_and_family_ca::users::Users::default();
+    let anna = users.add("anna", None).unwrap();
+    let ben = users.add("ben", None).unwrap();
+    until_login(&nginx, Client::Anonymous, None, 200);
+
+    let site = nginx::survey(&settings).unwrap().sites.remove(0);
+    let auth = nginx::Auth::On(vec!["anna".into()]);
+    assert!(nginx::set_auth(&settings, &ca, &users, &site, &auth).unwrap());
+    until_login(&nginx, Client::Anonymous, None, 401);
+    until(
+        || {
+            with_login(&nginx, Client::Anonymous, None).1.as_deref()
+                == Some("Basic realm=\"localhost\"")
+        },
+        "nginx asks for a login",
+    );
+    // nginx's crypt() (musl's, in nginx:alpine) checks ffca's SHA-512 hashes.
+    until_login(&nginx, Client::Anonymous, Some(("anna", &anna)), 200);
+    until_login(
+        &nginx,
+        Client::Anonymous,
+        Some(("anna", "not her password")),
+        401,
+    );
+    until_login(&nginx, Client::Anonymous, Some(("ben", &ben)), 401);
+
+    let new = users.set_password("anna", None).unwrap();
+    assert_eq!(
+        nginx::publish_users(&settings, &ca, &users).unwrap(),
+        [("localhost".to_owned(), 1)]
+    );
+    until_login(&nginx, Client::Anonymous, Some(("anna", &anna)), 401);
+    until_login(&nginx, Client::Anonymous, Some(("anna", &new)), 200);
+
+    let site = nginx::survey(&settings).unwrap().sites.remove(0);
+    assert!(nginx::set_auth(&settings, &ca, &users, &site, &nginx::Auth::Off).unwrap());
+    until_login(&nginx, Client::Anonymous, None, 200);
+    assert_eq!(
+        std::fs::read_to_string(settings.sites.join("page.conf")).unwrap(),
+        PAGE.replace("PORT", &nginx.port.to_string())
+    );
+}
+
+#[test]
+fn http_auth_passthrough_asks_for_a_login_and_lets_the_named_ones_through() {
+    let ffca = Ffca::initialised();
+    let (nginx, settings) = page(&ffca);
+    let ca = Ca::open(&Store::new(&ffca.state)).unwrap();
+    let users = friends_and_family_ca::users::Users::default();
+    let site = nginx::survey(&settings).unwrap().sites.remove(0);
+    let auth = nginx::Auth::Passthrough(vec!["boox".into()]);
+    assert!(nginx::set_auth(&settings, &ca, &users, &site, &auth).unwrap());
+    until_login(&nginx, Client::Anonymous, None, 401);
+    until(
+        || {
+            with_login(&nginx, Client::Anonymous, None).1.as_deref()
+                == Some("Basic realm=\"localhost\"")
+        },
+        "a client that waits to be asked is asked",
+    );
+    // nginx does not check the password: the site behind it does.
+    until_login(&nginx, Client::Anonymous, Some(("boox", "anything")), 200);
+    until_login(&nginx, Client::Anonymous, Some(("marko", "anything")), 401);
+    until_login(&nginx, Client::Anonymous, Some(("boo", "x")), 401);
+    until_login(&nginx, Client::Anonymous, Some(("booxx", "x")), 401);
+
+    let site = nginx::survey(&settings).unwrap().sites.remove(0);
+    let any = nginx::Auth::Passthrough(Vec::new());
+    assert!(nginx::set_auth(&settings, &ca, &users, &site, &any).unwrap());
+    until_login(&nginx, Client::Anonymous, Some(("marko", "anything")), 200);
+    until_login(&nginx, Client::Anonymous, None, 401);
+}
+
+#[test]
+fn the_certificate_and_the_login_are_two_gates() {
+    let ffca = Ffca::initialised();
+    ffca.ok(&["issue", "--person", "Anna", "--device", "phone"]);
+    let (certificate, key) = files(&ffca, "anna-phone");
+    let phone = Client::With(&certificate, &key);
+    let (nginx, settings) = page(&ffca);
+    let ca = Ca::open(&Store::new(&ffca.state)).unwrap();
+    let mut users = friends_and_family_ca::users::Users::default();
+    let anna = users.add("anna", None).unwrap();
+    let survey = || nginx::survey(&settings).unwrap().sites.remove(0);
+
+    // Required and passthrough: both, or nothing.
+    nginx::set_mode(&settings, &ca, &survey(), nginx::Mode::Required).unwrap();
+    let boox = nginx::Auth::Passthrough(vec!["boox".into()]);
+    nginx::set_auth(&settings, &ca, &users, &survey(), &boox).unwrap();
+    until_login(&nginx, phone, None, 401);
+    until_login(&nginx, Client::Anonymous, Some(("boox", "x")), 400);
+    until_login(&nginx, phone, Some(("boox", "x")), 200);
+
+    // Optional and on: the certificate is not needed, the login is.
+    nginx::set_mode(&settings, &ca, &survey(), nginx::Mode::Optional).unwrap();
+    let on = nginx::Auth::On(vec!["anna".into()]);
+    nginx::set_auth(&settings, &ca, &users, &survey(), &on).unwrap();
+    until_login(&nginx, Client::Anonymous, Some(("anna", &anna)), 200);
+    until_login(&nginx, Client::Anonymous, None, 401);
+    until_login(&nginx, phone, None, 401);
+    until_login(&nginx, phone, Some(("anna", &anna)), 200);
+    let site = survey();
+    assert_eq!((site.mode, site.auth), (nginx::Mode::Optional, on));
+}
