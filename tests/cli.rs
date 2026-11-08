@@ -281,13 +281,14 @@ fn renaming_reaches_the_ledger_and_the_next_certificate() {
     assert!(error.contains("is taken"), "{error}");
     ffca.ok(&["issue", "--person", "Ana", "--device", "old phone"]);
     let subject = std::process::Command::new("openssl")
-        .args(["x509", "-noout", "-subject", "-in"])
+        // RFC 2253, as nginx logs it: OpenSSL's default format changes between versions.
+        .args(["x509", "-noout", "-subject", "-nameopt", "RFC2253", "-in"])
         .arg(ffca.out.join("ana-old-phone.crt"))
         .output()
         .unwrap();
     assert_eq!(
         String::from_utf8(subject.stdout).unwrap().trim(),
-        "subject=OU = people, CN = Ana (old phone)"
+        "subject=CN=Ana (old phone),OU=people"
     );
 }
 
