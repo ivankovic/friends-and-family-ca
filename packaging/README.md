@@ -45,7 +45,8 @@ backups encrypted, and snapshots of the folder as private as the folder.
 
 ## 3. Tell it where nginx is
 
-On the **Nginx** tab, press `e`:
+On the **Nginx** tab, press `e`. Each field starts from a default; Ctrl-U clears one, and Ctrl-S
+saves from any field:
 
 | Field | What | Example |
 |---|---|---|
@@ -123,19 +124,25 @@ systemctl list-timers ffca-crl-refresh.timer
 ## 7. Invite a device
 
 On **People & agents**, press `p` for a new person (`n` adds a device to the selected one). The
-invite's QR code and link appear: scan it with the device, or send it the link. The link works
-once, for 24 hours.
+invite's QR code and link appear: scan it with the device, or send it the link - `c` puts the link
+on the clipboard of the terminal you sit at, if it allows that (most do, over SSH and in tmux
+too). The link works once, for 24 hours. The code fits an 80 by 24 terminal.
 
 * **iPhone, iPad**: open the link, press the button, download the profile, then in Settings tap
   *Profile Downloaded* and *Install*.
 * **Android, Boox**: open the link, press the button, download the `.p12` and install it with
   the password the page shows.
-* **Firefox, other computers**: the same `.p12`, imported in the browser's or the system's
-  certificate settings.
+* **Firefox, Chrome, Edge, other computers**: the same `.p12`, imported in the browser's or the
+  system's certificate settings.
 
-The **Invites** tab shows each invite: open, collected (when, and from where), expired or
-cancelled. If someone says they never collected an invite that shows as collected, revoke that
-device.
+The page puts the download for the device that opened it first. Once a site requires
+certificates (step 8), every invite made after that ends with a link to it, *Check that it
+works*: if the site opens, the certificate is installed.
+
+Until a device collects its invite, People & agents marks it `◌ invite open`; its details then say
+when it was collected, and from where. The **Invites** tab shows each invite: open, collected,
+expired or cancelled; `x` cancels an open one, after asking, and revokes its certificate. If
+someone says they never collected an invite that shows as collected, revoke that device.
 
 ## 8. Ask for certificates, a site at a time
 
@@ -143,7 +150,9 @@ On the **Nginx** tab, select a site and press `s`:
 
 1. **Optional** first: devices with a certificate are checked - a revoked one is refused - while
    everyone else still gets in. Try the site from each device.
-2. **Required** once they work: nobody gets in without a valid certificate from this CA.
+2. **Required** once they work: nobody gets in without a valid certificate from this CA. The
+   dialog says how many devices and agents hold one - certificates still in an open invite are
+   counted apart - and warns in red when none does, which would lock you out too.
 
 Every change shows its lines first, is tested with `nginx -t`, and is put back if nginx refuses
 it. Apps that cannot present a certificate (a TV's media player, some mobile apps) need their site

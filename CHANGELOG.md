@@ -27,10 +27,14 @@ The first release.
   clipboard of the terminal you sit at (OSC 52, over SSH too); cancelling one asks first.
 - **The terminal UI fits 80 by 24**: a dialog taller than the screen scrolls, the key hints keep
   `? help` and `q quit`, and long names are cut short rather than pushing columns out. Tab titles
-  count open invites and certificates about to expire. Forms take Ctrl-U, Ctrl-W, Ctrl-A, Ctrl-E.
-  Requiring a client certificate on a site says how many devices and agents still get in.
+  count open invites and certificates about to expire, and People marks a device whose invite is
+  not collected yet. `/` filters People & agents. Forms take Ctrl-U, Ctrl-W, Ctrl-A, Ctrl-E, and
+  Ctrl-S from any field. Requiring a client certificate on a site says how many devices and agents
+  still get in, counting apart those whose invite is still open. A site's login under `on` is a
+  checklist of ffca's users.
 - **The enrollment page**, `ffca serve`: opening a link shows whose certificate it is, and only
-  pressing the button uses the invite up. The download for the device that opened it comes first. It runs as nobody with the invites folder and nothing
+  pressing the button uses the invite up. The download for the device that opened it comes first,
+  and once a site requires certificates the page ends with a link to it, to check that it works. It runs as nobody with the invites folder and nothing
   else - an image is published on ghcr.io - and keeps invite secrets out of its log and nginx's.
   It is its own small HTTP server, with every request bounded in time and size.
 - **nginx.** The Nginx tab says where nginx's sites and CA files are and how to test and reload it;
