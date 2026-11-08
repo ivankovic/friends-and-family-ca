@@ -266,6 +266,10 @@ impl Component for AuthDialog {
                     ("Enter", "apply"),
                     ("Esc", "back"),
                 ],
+                // With no users there is nothing to tick: Space is not offered.
+                ON if self.users.is_empty() => {
+                    &[("↑ ↓", "kind"), ("Enter", "apply"), ("Esc", "back")]
+                }
                 ON => &[
                     ("↑ ↓", "move"),
                     ("Space", "tick a user"),

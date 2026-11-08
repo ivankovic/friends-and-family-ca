@@ -1534,3 +1534,17 @@ fn control_s_is_done_from_any_field() {
     );
     assert_shows(&mut app, "Issued to Anna (phone)");
 }
+
+#[test]
+fn with_no_users_the_login_dialog_offers_nothing_to_tick() {
+    let fixture = Fixture::new();
+    with_nginx(&fixture, "true", "true", None);
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('l'));
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    let shown = screen(&mut app);
+    assert!(shown.contains("ffca has no users yet"), "{shown}");
+    assert!(!shown.contains("Space tick a user"), "{shown}");
+}

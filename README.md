@@ -13,19 +13,20 @@ commands on their own device. Friends and Family CA is made for one administrato
 people who should never need to: you run a terminal UI over SSH, and they scan a QR code.
 
 ```
- Friends and Family CA · Domaci                                       CRL valid until 2 Nov 2026
- People & agents │ Invites │ Nginx │ CA
-╭──────────────────────────────────╮╭──────────────────────────────────────────────────────────╮
-│▾ Anna                            ││ Anna · phone                                             │
-│  ● phone          until 2028     ││                                                          │
-│  ● laptop         until 2028     ││ Current   439ce6f2   issued 3 Oct 2026, valid until 2028 │
-│▾ Ben                             ││           CN=Anna (phone),OU=people                      │
-│  ✕ tablet         retired        ││ Earlier   0330b08b   revoked 3 Oct 2026 · replaced       │
-│▾ Agents                          ││                                                          │
-│  ● backup         until 2028     ││                                                          │
-│  ◐ monitoring     expires in 12 d││                                                          │
-╰──────────────────────────────────╯╰──────────────────────────────────────────────────────────╯
- p new person  n new device  a new agent  u renew  r revoke  R rename  Tab switch  ? help  q quit
+ Friends and Family CA · Domaci                                  CRL valid until 8 Dec 2026
+ People & agents · 1 expiring │ Invites │ Nginx │ Users │ CA
+╭───────────────────────────────────╮╭─────────────────────────────────────────────────────╮
+│▾ Anna                             ││ Anna · phone                                        │
+│  ● phone          until 2028      ││                                                     │
+│  ● laptop         until 2028      ││ Current   678ea0c1   valid until 7 Nov 2028         │
+│▾ Ben                              ││           issued 8 Nov 2026                         │
+│  ✕ tablet         retired         ││           CN=Anna (phone),OU=people                 │
+│▾ Agents                           ││ Earlier   53ac3a73   revoked 8 Nov 2026 · replaced  │
+│  ● backup         until 2028      ││                                                     │
+│  ◐ monitoring     expires in 11 d ││                                                     │
+╰───────────────────────────────────╯╰─────────────────────────────────────────────────────╯
+
+ p new person  n new device  a new agent  u renew  r revoke  R rename  ? help  q quit
 ```
 
 # What it does
