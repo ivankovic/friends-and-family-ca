@@ -910,11 +910,13 @@ impl App {
         if let (Selection::Device { .. }, Some(enrollment)) =
             (&selection, self.config.enrollment.clone())
         {
-            match invite::make(
+            let check = self.check_site();
+            match invite::make_with_check(
                 &self.ca,
                 &invite::dir(self.ca.store()),
                 holder,
                 &enrollment.host,
+                check.as_deref(),
                 self.now,
             ) {
                 Ok(made) => {
@@ -970,6 +972,23 @@ impl App {
             }
             Err(error) => self.refuse(format!("{error:#}")),
         }
+    }
+
+    /// The site an invite sends its person to, to see that the certificate works: one that requires
+    /// this CA's certificate, else one that accepts it, by its first plain name.
+    fn check_site(&self) -> Option<String> {
+        let survey = nginx::survey(self.config.nginx.as_ref()?).ok()?;
+        let candidates = |mode: Mode| {
+            survey
+                .sites
+                .iter()
+                .filter(move |s| s.mode == mode && s.uses_ca && !s.duplicate)
+                .filter(|s| !self.is_enrollment(s))
+                .map(|s| s.name())
+                .find(|n| !n.contains(['*', '~']) && *n != "_" && n.contains('.'))
+        };
+        let name = candidates(Mode::Required).or_else(|| candidates(Mode::Optional))?;
+        Some(format!("https://{name}/"))
     }
 
     fn show_invite(&mut self, invite: &Invite) {

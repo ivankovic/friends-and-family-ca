@@ -71,6 +71,12 @@ pub struct Payload {
     pub p12: Vec<u8>,
     #[serde(with = "base64_bytes")]
     pub mobileconfig: Vec<u8>,
+    /// A site that asks for this CA's certificates, for the person to open once it is installed:
+    /// whether it opens is the check that it works. The enrollment page cannot ask for the
+    /// certificate itself: a device holding an expired or revoked one, which is what comes back
+    /// for a new one, would get nginx's 400 instead of the page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<String>,
 }
 
 /// An invite file: only its expiry is in the clear.
@@ -123,6 +129,19 @@ pub fn make(
     host: &str,
     now: OffsetDateTime,
 ) -> Result<Made> {
+    make_with_check(ca, folder, holder, host, None, now)
+}
+
+/// As [`make`], with `check` the address of a site the page sends the person to once the
+/// certificate is installed, to see that it works.
+pub fn make_with_check(
+    ca: &Ca,
+    folder: &Path,
+    holder: Holder,
+    host: &str,
+    check: Option<&str>,
+    now: OffsetDateTime,
+) -> Result<Made> {
     prepare_folder(folder)?;
     let issued = ca.issue(holder, Key::Generate, now, ca::DEFAULT_CLIENT_VALIDITY)?;
     let serial = issued.certificate.serial;
@@ -147,6 +166,7 @@ pub fn make(
             password,
             p12,
             mobileconfig,
+            check: check.map(str::to_owned),
         };
         let token = random_token()?;
         let now = issued.certificate.not_before + crate::ca::BACKDATE;

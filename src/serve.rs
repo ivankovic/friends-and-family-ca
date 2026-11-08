@@ -390,12 +390,25 @@ fn installation(id: &str, payload: &Payload, apple: bool) -> String {
     } else {
         (p12, profile)
     };
+    let check = match &payload.check {
+        Some(site) => format!(
+            r#"<h2>Check that it works</h2>
+<p>Once it is installed, open the site. When the browser asks which certificate to use, choose the one from <b>{ca}</b>.</p>
+<p><a class="button" href="{site}">Open {shown}</a></p>
+<p class="small">If the site opens, the certificate works. If the site says “400 Bad Request” or “No required SSL certificate was sent”, it is not installed yet.</p>
+"#,
+            ca = escape(&payload.ca),
+            site = escape(site),
+            shown = escape(site.trim_start_matches("https://").trim_end_matches('/')),
+        ),
+        None => String::new(),
+    };
     format!(
         r#"<h1>{holder}</h1>
 <p>The certificate's password:</p>
 <p class="password"><code>{password}</code></p>
 <p class="small">Installing it asks for this password. Tap it to select all of it, to copy.</p>
-{first}{second}<p class="small">These links work for ten minutes. Keep this page open until the certificate is installed.</p>"#,
+{first}{second}{check}<p class="small">These links work for ten minutes. Keep this page open until the certificate is installed.</p>"#,
         holder = escape(&payload.holder),
         password = escape(&payload.password),
     )

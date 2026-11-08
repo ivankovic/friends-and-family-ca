@@ -1368,3 +1368,35 @@ fn requiring_a_certificate_says_who_still_gets_in() {
         "2 devices and agents have a valid certificate from this CA: everyone else is refused.",
     );
 }
+
+/// An invite sends its person to a site that requires this CA's certificate, to see that it
+/// works; with no such site, nowhere. The enrollment site never counts.
+#[test]
+fn an_invite_names_a_site_that_requires_the_certificate_to_check_it_on() {
+    let fixture = Fixture::new();
+    with_enrollment(&fixture);
+    let invite_for = |app: &mut App, device: &str| {
+        key(app, KeyCode::Char('p'));
+        type_text(app, &format!("Anna {device}"));
+        key(app, KeyCode::Enter);
+        type_text(app, device);
+        key(app, KeyCode::Enter);
+        let token = token_on_screen(&screen(app));
+        key(app, KeyCode::Enter);
+        invite::open(&invites_folder(&fixture), &token, NOW).unwrap()
+    };
+    let mut app = fixture.app(NOW);
+    assert_eq!(invite_for(&mut app, "phone").check, None);
+
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('s'));
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "books.example.org is now required");
+    go_to(&mut app, Tab::People);
+    assert_eq!(
+        invite_for(&mut app, "laptop").check.as_deref(),
+        Some("https://books.example.org/")
+    );
+}

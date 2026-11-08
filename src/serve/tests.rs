@@ -429,3 +429,39 @@ fn the_device_s_own_download_comes_first() {
         assert_eq!(profile < p12, profile_first, "{client}:\n{body}");
     }
 }
+
+/// An invite that names a site to check against ends with that site, to open once the
+/// certificate is installed; one that names none says nothing about checking.
+#[test]
+fn the_page_ends_with_a_site_to_check_the_certificate_on() {
+    let dir = crate::test_dir();
+    let (ca, mut page, token) = page_with_invite(dir.path());
+    let body = text(&page.answer("POST", &format!("/i/{token}"), "x", NOW));
+    assert!(!body.contains("Check that it works"), "{body}");
+
+    let made = invite::make_with_check(
+        &ca,
+        &dir.path().join("invites"),
+        Holder::Device {
+            person: "Anna",
+            device: "laptop",
+        },
+        "k.example.org",
+        Some("https://cloud.example.org/"),
+        NOW,
+    )
+    .unwrap();
+    let token = made.link.rsplit('/').next().unwrap();
+    let body = text(&page.answer("POST", &format!("/i/{token}"), "x", NOW));
+    assert!(body.contains("Check that it works"), "{body}");
+    assert!(
+        body.contains(
+            r#"<a class="button" href="https://cloud.example.org/">Open cloud.example.org</a>"#
+        ),
+        "{body}"
+    );
+    assert!(
+        body.contains("choose the one from <b>Test &amp; family</b>"),
+        "{body}"
+    );
+}
