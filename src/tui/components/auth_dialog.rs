@@ -15,7 +15,11 @@
  *  along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 //! Choosing a site's HTTP auth - off, passthrough or on - and who may log in, with the lines that
-//! will change shown first, worked out again as the names are typed.
+//! will change shown first, worked out again at every key.
+//!
+//! One cursor runs down the three kinds and, under `on`, ffca's users, each ticked or not with
+//! Space: a name that is not a user cannot be chosen, so it cannot be misspelt. `passthrough` names
+//! are the site's own users, which ffca does not know, so they are typed.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -41,15 +45,21 @@ pub struct AuthDialog {
     /// The site's file as it is, or why it cannot be read.
     original: Result<String, String>,
     settings: config::Nginx,
-    /// ffca's users, for `on`.
-    users: Vec<String>,
+    /// ffca's users, for `on`, and whether each is ticked.
+    users: Vec<(String, bool)>,
     /// Why no login may be asked for here, if that is so: the enrollment site.
     refused: Option<String>,
     kind: usize,
-    /// The names, as typed: separated by commas or spaces.
+    /// The row the cursor is on: a kind, then (under `on`) a user.
+    cursor: usize,
+    /// The names for `passthrough`, as typed: separated by commas or spaces.
     names: String,
     scroll: Scroll,
 }
+
+/// The kinds' indexes in [`Auth::KINDS`].
+const PASSTHROUGH: usize = 1;
+const ON: usize = 2;
 
 impl AuthDialog {
     pub fn new(
@@ -60,7 +70,18 @@ impl AuthDialog {
         refused: Option<String>,
     ) -> AuthDialog {
         let kind = site.auth.kind();
-        let names = site.auth.names().join(", ");
+        let (names, ticked): (String, &[String]) = match &site.auth {
+            Auth::Passthrough(names) => (names.join(", "), &[]),
+            Auth::On(names) => (String::new(), names),
+            Auth::Off => (String::new(), &[]),
+        };
+        let users = users
+            .into_iter()
+            .map(|user| {
+                let on = ticked.contains(&user);
+                (user, on)
+            })
+            .collect();
         AuthDialog {
             site,
             original,
@@ -68,23 +89,42 @@ impl AuthDialog {
             users,
             refused,
             kind,
+            cursor: kind,
             names,
             scroll: Scroll::default(),
         }
     }
 
+    /// How many rows the cursor runs over.
+    fn rows(&self) -> usize {
+        Auth::KINDS.len() + if self.kind == ON { self.users.len() } else { 0 }
+    }
+
+    fn move_cursor(&mut self, down: bool) {
+        self.cursor = step(self.cursor, down, self.rows());
+        if self.cursor < Auth::KINDS.len() {
+            self.kind = self.cursor;
+        }
+    }
+
     /// What is chosen, as the site's new HTTP auth.
     fn auth(&self) -> Auth {
-        let names: Vec<String> = self
-            .names
-            .split([',', ' '])
-            .map(str::trim)
-            .filter(|n| !n.is_empty())
-            .map(str::to_owned)
-            .collect();
         match self.kind {
-            1 => Auth::Passthrough(names),
-            2 => Auth::On(names),
+            PASSTHROUGH => Auth::Passthrough(
+                self.names
+                    .split([',', ' '])
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            ),
+            ON => Auth::On(
+                self.users
+                    .iter()
+                    .filter(|(_, on)| *on)
+                    .map(|(user, _)| user.clone())
+                    .collect(),
+            ),
             _ => Auth::Off,
         }
     }
@@ -97,15 +137,14 @@ impl AuthDialog {
         {
             return Err(reason.clone());
         }
-        if let Auth::On(names) = &auth {
-            if names.is_empty() {
-                return Err("Name at least one user: nobody else gets in.".into());
-            }
-            if let Some(unknown) = names.iter().find(|n| !self.users.contains(n)) {
-                return Err(format!(
-                    "There is no user {unknown}: add them on the Users tab first."
-                ));
-            }
+        if let Auth::On(names) = &auth
+            && names.is_empty()
+        {
+            return Err(if self.users.is_empty() {
+                "ffca has no users yet: add them on the Users tab first.".into()
+            } else {
+                "Tick at least one user with Space: nobody else gets in.".into()
+            });
         }
         let original = self.original.clone()?;
         let planned = nginx::plan_auth(&original, self.site.index, &auth, &self.settings)
@@ -118,12 +157,20 @@ impl Component for AuthDialog {
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Esc => return Some(Action::CloseDialog),
-            KeyCode::Up => self.kind = step(self.kind, false, Auth::KINDS.len()),
-            KeyCode::Down => self.kind = step(self.kind, true, Auth::KINDS.len()),
-            KeyCode::Backspace => {
+            KeyCode::Up => self.move_cursor(false),
+            KeyCode::Down => self.move_cursor(true),
+            KeyCode::Backspace if self.kind == PASSTHROUGH => {
                 self.names.pop();
             }
-            KeyCode::Char(c) => self.names.push(c),
+            KeyCode::Char(c) if self.kind == PASSTHROUGH => self.names.push(c),
+            KeyCode::Char('k') => self.move_cursor(false),
+            KeyCode::Char('j') => self.move_cursor(true),
+            KeyCode::Char(' ') => {
+                let user = self.cursor.checked_sub(Auth::KINDS.len());
+                if let Some((_, on)) = user.and_then(|u| self.users.get_mut(u)) {
+                    *on = !*on;
+                }
+            }
             KeyCode::Enter if self.change().is_ok() => {
                 return Some(Action::SetSiteAuth(self.site.clone(), self.auth()));
             }
@@ -137,7 +184,7 @@ impl Component for AuthDialog {
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let mut lines: Vec<Line> = vec!["HTTP login".bold().into()];
         for (i, (kind, description)) in Auth::KINDS.iter().zip(DESCRIPTIONS).enumerate() {
-            let marker = if i == self.kind { "› " } else { "  " };
+            let marker = if i == self.cursor { "› " } else { "  " };
             let name = format!("{kind:<13}");
             let name = if i == self.kind {
                 name.bold()
@@ -152,28 +199,30 @@ impl Component for AuthDialog {
             lines.push(vec![marker.into(), name, description.dim(), now.dim()].into());
         }
         lines.push(Line::default());
-        if self.kind != 0 {
-            let help = if self.kind == 1 {
-                "  (none: any name may try)"
-            } else {
-                "  (ffca's users)"
-            };
+        if self.kind == PASSTHROUGH {
             lines.push(
                 vec![
                     "Users: ".bold(),
                     self.names.clone().into(),
                     "▏".into(),
-                    help.dim(),
+                    "  (none: any name may try)".dim(),
                 ]
                 .into(),
             );
-            if self.kind == 2 {
-                let known = if self.users.is_empty() {
-                    "none yet: add them on the Users tab".to_owned()
+            lines.push(Line::default());
+        }
+        if self.kind == ON && !self.users.is_empty() {
+            lines.push("Who may log in:".bold().into());
+            for (i, (user, on)) in self.users.iter().enumerate() {
+                let here = self.cursor == Auth::KINDS.len() + i;
+                let marker = if here { "› " } else { "  " };
+                let tick = if *on { "[x] " } else { "[ ] " };
+                let user = if here {
+                    user.clone().bold()
                 } else {
-                    self.users.join(", ")
+                    user.clone().into()
                 };
-                lines.push(vec!["ffca's users: ".dim(), known.dim()].into());
+                lines.push(vec![marker.into(), tick.into(), user].into());
             }
             lines.push(Line::default());
         }
@@ -210,12 +259,21 @@ impl Component for AuthDialog {
             self.site.name().to_string(),
             92,
             lines,
-            &[
-                ("↑ ↓", "kind"),
-                ("type", "users"),
-                ("Enter", "apply"),
-                ("Esc", "back"),
-            ],
+            match self.kind {
+                PASSTHROUGH => &[
+                    ("↑ ↓", "kind"),
+                    ("type", "users"),
+                    ("Enter", "apply"),
+                    ("Esc", "back"),
+                ],
+                ON => &[
+                    ("↑ ↓", "move"),
+                    ("Space", "tick a user"),
+                    ("Enter", "apply"),
+                    ("Esc", "back"),
+                ],
+                _ => &[("↑ ↓", "kind"), ("Enter", "apply"), ("Esc", "back")],
+            },
             &mut self.scroll,
         );
     }

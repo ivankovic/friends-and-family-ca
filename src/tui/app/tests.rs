@@ -1146,11 +1146,13 @@ fn a_site_s_login_is_turned_on_for_its_users_and_follows_their_passwords() {
     key(&mut app, KeyCode::Char('l'));
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);
-    assert_shows(&mut app, "Name at least one user");
+    assert_shows(&mut app, "Tick at least one user with Space");
+    assert_shows(&mut app, "[ ] anna");
+    // Typed letters are not names here: only ffca's users can be ticked.
     type_text(&mut app, "ben");
-    assert_shows(&mut app, "There is no user ben");
-    (0..3).for_each(|_| key(&mut app, KeyCode::Backspace));
-    type_text(&mut app, "anna");
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Char(' '));
+    assert_shows(&mut app, "› [x] anna");
     let screen = screen(&mut app);
     assert!(
         screen.contains("+ auth_basic books.example.org;"),
