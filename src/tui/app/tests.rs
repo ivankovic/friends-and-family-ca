@@ -1400,3 +1400,66 @@ fn an_invite_names_a_site_that_requires_the_certificate_to_check_it_on() {
         Some("https://books.example.org/")
     );
 }
+
+/// A device whose certificate is still in an open invite does not have it yet: the tree says so,
+/// and once it is collected the details say when and from where.
+#[test]
+fn the_tree_shows_an_invite_waiting_then_collected() {
+    let fixture = Fixture::new();
+    with_enrollment(&fixture);
+    let made = invite::make(
+        &fixture.ca(),
+        &invites_folder(&fixture),
+        ANNA_PHONE,
+        "k.example.invalid",
+        NOW,
+    )
+    .unwrap();
+    let mut app = fixture.app(NOW);
+    assert_shows(&mut app, "◌ phone          invite open");
+    key(&mut app, KeyCode::Down);
+    assert_shows(
+        &mut app,
+        "invite open until 4 Oct 2026: not on the device yet",
+    );
+    let token = made.link.rsplit('/').next().unwrap();
+    invite::collect(
+        &invites_folder(&fixture),
+        token,
+        NOW + Duration::minutes(5),
+        "203.0.113.7, iPhone",
+    )
+    .unwrap();
+    app.reload(NOW + Duration::minutes(6));
+    assert_shows(&mut app, "● phone          until 2028");
+    assert_shows(&mut app, "collected 3 Oct 2026 by 203.0.113.7, iPhone");
+    assert_shows(&mut app, "issued 3 Oct 2026 · CN=Anna (phone),OU=people");
+}
+
+/// A certificate still in its invite lets nobody in yet: requiring one counts it apart.
+#[test]
+fn requiring_a_certificate_does_not_count_invites_not_collected() {
+    let fixture = Fixture::new();
+    with_nginx(&fixture, "true", "true", Some("k.example.invalid"));
+    invite::make(
+        &fixture.ca(),
+        &invites_folder(&fixture),
+        ANNA_PHONE,
+        "k.example.invalid",
+        NOW,
+    )
+    .unwrap();
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('s'));
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Down);
+    assert_shows(
+        &mut app,
+        "No device or agent has a valid certificate from this CA yet",
+    );
+    assert_shows(
+        &mut app,
+        "1 more has an invite still open: they get in once it is collected.",
+    );
+}

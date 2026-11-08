@@ -65,17 +65,25 @@ pub struct ModeDialog {
     /// How many devices and agents hold a valid certificate from this CA: who still gets in
     /// once one is required.
     holders: usize,
+    /// How many more have one still in an open invite: they get in once they collect it.
+    waiting: usize,
     selected: usize,
     scroll: Scroll,
 }
 
 impl ModeDialog {
-    pub fn new(site: Site, changes: Vec<Result<Change, String>>, holders: usize) -> ModeDialog {
+    pub fn new(
+        site: Site,
+        changes: Vec<Result<Change, String>>,
+        holders: usize,
+        waiting: usize,
+    ) -> ModeDialog {
         let selected = Mode::ALL.iter().position(|m| *m == site.mode).unwrap_or(0);
         ModeDialog {
             site,
             changes,
             holders,
+            waiting,
             selected,
             scroll: Scroll::default(),
         }
@@ -135,6 +143,17 @@ impl Component for ModeDialog {
                     .dim(),
             };
             lines.push(line.into());
+            if self.waiting > 0 {
+                lines.push(
+                    format!(
+                        "{} more {} an invite still open: they get in once it is collected.",
+                        self.waiting,
+                        if self.waiting == 1 { "has" } else { "have" }
+                    )
+                    .dim()
+                    .into(),
+                );
+            }
             lines.push(Line::default());
         }
         match &self.changes[self.selected] {

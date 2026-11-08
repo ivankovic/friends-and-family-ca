@@ -29,7 +29,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wra
 use time::{Duration, OffsetDateTime};
 
 use super::{Component, Hint};
-use crate::ledger::{Certificate, KeyHolder, Ledger, Serial, Status};
+use crate::ledger::{Certificate, Invite, InviteState, KeyHolder, Ledger, Serial, Status};
 use crate::tui::action::{Action, Selection};
 use crate::tui::date;
 
@@ -194,7 +194,12 @@ impl People {
         let longest = self.holders().map(|h| h.name.chars().count()).max();
         let label = self
             .holders()
-            .map(|h| holder_state(h, self.now).1.chars().count())
+            .map(|h| {
+                holder_state(h, &self.ledger.invites, self.now)
+                    .1
+                    .chars()
+                    .count()
+            })
             .max()
             .unwrap_or(0);
         // "  ● " before the name, a space after it.
@@ -203,7 +208,7 @@ impl People {
     }
 
     fn holder_line(&self, holder: &KeyHolder, width: usize) -> Line<'static> {
-        let (symbol, label, color) = holder_state(holder, self.now);
+        let (symbol, label, color) = holder_state(holder, &self.ledger.invites, self.now);
         let name_width = self.name_width(width);
         vec![
             "  ".into(),
@@ -223,7 +228,8 @@ impl People {
             Row::Person(p) => {
                 let person = &self.ledger.people[p];
                 for device in &person.devices {
-                    let (symbol, label, color) = holder_state(device, self.now);
+                    let (symbol, label, color) =
+                        holder_state(device, &self.ledger.invites, self.now);
                     lines.push(
                         vec![
                             Span::styled(symbol, Style::new().fg(color)),
@@ -276,10 +282,22 @@ impl People {
                         ]
                         .into(),
                     );
-                    if Some(certificate.serial) == current
-                        && let Some(subject) = self.subjects.get(&certificate.serial)
-                    {
-                        lines.push(vec![" ".repeat(10).into(), subject.clone().dim()].into());
+                    let indent = || -> Span<'static> { " ".repeat(10).into() };
+                    if Some(certificate.serial) == current {
+                        let mut about = format!("issued {}", date(certificate.not_before));
+                        if let Some(subject) = self.subjects.get(&certificate.serial) {
+                            about.push_str(" · ");
+                            about.push_str(subject);
+                        }
+                        lines.push(vec![indent(), about.dim()].into());
+                    }
+                    if let Some(invite) = invite_of(&self.ledger.invites, certificate.serial) {
+                        let state = invite_state(invite);
+                        let state = match invite.state {
+                            InviteState::Open => state.fg(Color::Cyan),
+                            _ => state.dim(),
+                        };
+                        lines.push(vec![indent(), state].into());
                     }
                 }
                 if certificates.len() > 1 && holder.current(self.now).is_some() {
@@ -406,11 +424,19 @@ fn rows(ledger: &Ledger) -> Vec<Row> {
 }
 
 /// A holder at a glance: a symbol, a few words, and the symbol's colour.
-fn holder_state(holder: &KeyHolder, now: OffsetDateTime) -> (&'static str, String, Color) {
+fn holder_state(
+    holder: &KeyHolder,
+    invites: &[Invite],
+    now: OffsetDateTime,
+) -> (&'static str, String, Color) {
     if holder.retired.is_some() {
         return ("✕", "retired".into(), Color::Red);
     }
     if let Some(current) = holder.current(now) {
+        // Issued, but still in its invite: the device does not have it yet.
+        if invite_of(invites, current.serial).is_some_and(|i| i.state == InviteState::Open) {
+            return ("◌", "invite open".into(), Color::Cyan);
+        }
         let left = current.not_after - now;
         return if left < EXPIRY_WARNING {
             (
@@ -433,13 +459,31 @@ fn holder_state(holder: &KeyHolder, now: OffsetDateTime) -> (&'static str, Strin
     }
 }
 
+/// The invite that handed `serial` over, if it was handed over by one.
+pub fn invite_of(invites: &[Invite], serial: Serial) -> Option<&Invite> {
+    invites.iter().find(|i| i.serial == serial)
+}
+
+/// How an invite stands, for the line under its certificate.
+fn invite_state(invite: &Invite) -> String {
+    let when = invite.closed.map(date).unwrap_or_default();
+    match invite.state {
+        InviteState::Open => format!(
+            "invite open until {}: not on the device yet",
+            date(invite.expires)
+        ),
+        InviteState::Collected => match &invite.collected_by {
+            Some(by) => format!("collected {when} by {by}"),
+            None => format!("collected {when}"),
+        },
+        InviteState::Expired => format!("invite expired {when}, never collected"),
+        InviteState::Cancelled => format!("invite cancelled {when}"),
+    }
+}
+
 fn certificate_state(certificate: &Certificate, now: OffsetDateTime) -> String {
     match certificate.status(now) {
-        Status::Valid => format!(
-            "issued {}, valid until {}",
-            date(certificate.not_before),
-            date(certificate.not_after)
-        ),
+        Status::Valid => format!("valid until {}", date(certificate.not_after)),
         Status::Expired => format!("expired {}", date(certificate.not_after)),
         Status::Revoked => {
             let when = certificate.revoked.map(date).unwrap_or_default();

@@ -36,7 +36,7 @@ use super::components::invites_tab::InvitesTab;
 use super::components::message::Message;
 use super::components::mode_dialog::{ModeDialog, diff};
 use super::components::nginx_tab::NginxTab;
-use super::components::people::People;
+use super::components::people::{People, invite_of};
 use super::components::revoke_dialog::RevokeDialog;
 use super::components::users_tab::{self, UsersTab};
 use super::components::{Component, Hint, fitted_hint_line};
@@ -670,14 +670,28 @@ impl App {
                 Ok(diff(&original, &planned))
             })
             .collect();
-        let holders = self
-            .ledger
-            .certificates()
-            .filter(|(_, c)| c.status(self.now) == Status::Valid)
-            .map(|(holder, _)| holder.to_string())
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-        self.dialog = Some(Dialog::Mode(ModeDialog::new(site, changes, holders)));
+        // A certificate still in an open invite is not on its device yet: it lets nobody in.
+        let mut holders = std::collections::HashSet::new();
+        let mut waiting = std::collections::HashSet::new();
+        for (holder, certificate) in self.ledger.certificates() {
+            if certificate.status(self.now) != Status::Valid {
+                continue;
+            }
+            let open = invite_of(&self.ledger.invites, certificate.serial)
+                .is_some_and(|i| i.state == InviteState::Open);
+            if open {
+                waiting.insert(holder.to_string());
+            } else {
+                holders.insert(holder.to_string());
+            }
+        }
+        let waiting = waiting.difference(&holders).count();
+        self.dialog = Some(Dialog::Mode(ModeDialog::new(
+            site,
+            changes,
+            holders.len(),
+            waiting,
+        )));
     }
 
     fn set_site_mode(&mut self, site: &Site, mode: Mode) {
