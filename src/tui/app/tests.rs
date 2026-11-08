@@ -1105,7 +1105,7 @@ fn a_new_user_gets_a_password_shown_once_then_a_new_one_then_is_deleted() {
     assert_shows(&mut app, "no site lets them in");
     assert!(!screen(&mut app).contains(&first));
 
-    key(&mut app, KeyCode::Char('p'));
+    key(&mut app, KeyCode::Char('c'));
     key(&mut app, KeyCode::Enter);
     let second = password_on_screen(&screen(&mut app), "boox");
     key(&mut app, KeyCode::Esc);
@@ -1179,7 +1179,7 @@ fn a_site_s_login_is_turned_on_for_its_users_and_follows_their_passwords() {
     // A new password reaches the site's file at once.
     go_to(&mut app, Tab::Users);
     assert_shows(&mut app, "books.example.org");
-    key(&mut app, KeyCode::Char('p'));
+    key(&mut app, KeyCode::Char('c'));
     key(&mut app, KeyCode::Enter);
     assert_shows(
         &mut app,
@@ -1433,7 +1433,7 @@ fn the_tree_shows_an_invite_waiting_then_collected() {
     app.reload(NOW + Duration::minutes(6));
     assert_shows(&mut app, "● phone          until 2028");
     assert_shows(&mut app, "collected 3 Oct 2026 by 203.0.113.7, iPhone");
-    assert_shows(&mut app, "issued 3 Oct 2026 · CN=Anna (phone),OU=people");
+    assert_shows(&mut app, "issued 3 Oct 2026");
 }
 
 /// A certificate still in its invite lets nobody in yet: requiring one counts it apart.
@@ -1462,4 +1462,75 @@ fn requiring_a_certificate_does_not_count_invites_not_collected() {
         &mut app,
         "1 more has an invite still open: they get in once it is collected.",
     );
+}
+
+#[test]
+fn slash_narrows_the_tree_and_keys_typed_are_text() {
+    let fixture = Fixture::new();
+    fixture.issue(ANNA_PHONE, NOW, 700);
+    fixture.issue(ANNA_LAPTOP, NOW, 700);
+    fixture.issue(
+        Holder::Device {
+            person: "Ben",
+            device: "tablet",
+        },
+        NOW,
+        700,
+    );
+    fixture.issue(Holder::Agent("backup"), NOW, 700);
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Char('/'));
+    // q and Tab are text here, not quit and the next tab.
+    type_text(&mut app, "TABq");
+    key(&mut app, KeyCode::Backspace);
+    key(&mut app, KeyCode::Tab);
+    let shown = screen(&mut app);
+    assert!(shown.contains(" /TAB▏ "), "{shown}");
+    assert!(
+        !shown.contains("q quit"),
+        "q is text while typing:\n{shown}"
+    );
+    assert!(shown.contains("tablet") && shown.contains("Ben"), "{shown}");
+    assert!(
+        !shown.contains("phone") && !shown.contains("backup"),
+        "{shown}"
+    );
+    assert!(!app.should_quit());
+    key(&mut app, KeyCode::Enter);
+    // A person whose own name matches keeps every device.
+    key(&mut app, KeyCode::Char('/'));
+    (0..3).for_each(|_| key(&mut app, KeyCode::Backspace));
+    type_text(&mut app, "anna");
+    key(&mut app, KeyCode::Enter);
+    let shown = screen(&mut app);
+    assert!(
+        shown.contains("phone") && shown.contains("laptop"),
+        "{shown}"
+    );
+    assert!(!shown.contains("tablet"), "{shown}");
+    assert_shows(&mut app, "Esc drop filter");
+    // Esc drops the filter rather than quitting.
+    key(&mut app, KeyCode::Esc);
+    assert!(!app.should_quit());
+    assert_shows(&mut app, "backup");
+    key(&mut app, KeyCode::Char('/'));
+    type_text(&mut app, "nobody");
+    assert_shows(&mut app, "Nothing matches.");
+}
+
+#[test]
+fn control_s_is_done_from_any_field() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Char('p'));
+    assert_shows(&mut app, "Ctrl-S done");
+    type_text(&mut app, "Anna");
+    key(&mut app, KeyCode::Tab);
+    type_text(&mut app, "phone");
+    key(&mut app, KeyCode::BackTab);
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        NOW,
+    );
+    assert_shows(&mut app, "Issued to Anna (phone)");
 }

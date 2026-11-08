@@ -237,6 +237,9 @@ impl Component for Form {
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             // The line-editing keys of a shell: a default path is cleared with one, not dozens.
+            if key.code == KeyCode::Char('s') {
+                return Some(self.submit());
+            }
             let field = self.field();
             match key.code {
                 KeyCode::Char('a') => field.cursor = 0,
@@ -385,14 +388,12 @@ impl Component for Form {
         } else {
             "done"
         };
-        frame.render_widget(
-            Paragraph::new(hint_line(&[
-                ("Enter", enter),
-                ("Tab", "field"),
-                ("Esc", escape),
-            ])),
-            hints,
-        );
+        let mut keys = vec![("Enter", enter)];
+        if enter == "next" {
+            keys.push(("Ctrl-S", "done"));
+        }
+        keys.extend([("Tab", "field"), ("Esc", escape)]);
+        frame.render_widget(Paragraph::new(hint_line(&keys)), hints);
         let field = &self.fields[self.focus];
         let before: String = field.value.chars().take(field.cursor).collect();
         let x = inner.x + label_width as u16 + unicode_width(&before);

@@ -286,6 +286,9 @@ impl App {
             Some(Dialog::Auth(dialog)) => dialog.handle_key_event(key),
             Some(Dialog::Invite(dialog)) => dialog.handle_key_event(key),
             Some(Dialog::Message(message)) => message.handle_key_event(key),
+            None if self.tab == Tab::People && self.people.wants(&key) => {
+                self.people.handle_key_event(key)
+            }
             None => match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
                 KeyCode::Tab => Some(Action::NextTab),
@@ -1282,13 +1285,20 @@ impl App {
             Tab::Users => self.users_tab.hints(),
             Tab::Ca => self.ca_info.hints(),
         };
-        keys.push(("Tab", "switch"));
+        // While the People filter is typed, the shared keys are text: they are not offered.
+        let typing = self.tab == Tab::People && self.people.typing();
+        let always: &[Hint] = if typing {
+            &[]
+        } else {
+            keys.push(("Tab", "switch"));
+            &[("?", "help"), ("q", "quit")]
+        };
         let hints = Rect {
             x: hints.x + 1,
             width: hints.width.saturating_sub(1),
             ..hints
         };
-        let line = fitted_hint_line(&keys, &[("?", "help"), ("q", "quit")], hints.width.into());
+        let line = fitted_hint_line(&keys, always, hints.width.into());
         frame.render_widget(Paragraph::new(line), hints);
         match &mut self.dialog {
             Some(Dialog::Form(form)) => form.draw(frame, body),
@@ -1402,10 +1412,11 @@ fn help() -> Message {
                 "revoke the selected device or agent, or every device of a person",
             ),
             key("R", "rename the selected person, device or agent"),
+            key("/", "narrow People & agents to the names that contain what is typed"),
             key("e", "on the Nginx tab: where nginx is, and the enrollment site"),
             key("s", "on the Nginx tab: a site's client certificate: off, optional, required"),
             key("l", "on the Nginx tab: a site's HTTP login: off, passthrough, on, and who"),
-            key("n  p  d", "on the Users tab: a new user, a new password, delete"),
+            key("n  c  d", "on the Users tab: a new user, change a password, delete"),
             key("t", "on the Nginx tab: test nginx's configuration"),
             key("w", "on the Nginx tab: write the enrollment site"),
             key(
@@ -1416,6 +1427,7 @@ fn help() -> Message {
             key("T", "on the CA tab: set up the hourly refresh timer"),
             key("PgUp PgDn", "scroll a dialog taller than the screen"),
             key("Ctrl-U  W", "in a form: clear the field, delete a word (Ctrl-A, E: start, end)"),
+            key("Ctrl-S", "in a form: done, from any field"),
             key("q  Esc", "quit, or close a dialog"),
             Line::default(),
             "After a renewal, revoke the device again as \"replaced\": that revokes every certificate but the newest."

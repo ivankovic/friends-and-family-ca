@@ -16,6 +16,10 @@
  */
 //! The People & agents tab: a tree of people with their devices, then agents, on the left; the
 //! selected one's certificates on the right.
+//!
+//! `/` narrows the tree to the names that contain what is typed: a person stays with all their
+//! devices when their own name matches, and with the matching ones otherwise. While the filter
+//! is typed, every key is text - q and Tab too - until Enter keeps it or Esc drops it.
 
 use std::collections::HashMap;
 
@@ -51,6 +55,9 @@ pub struct People {
     now: OffsetDateTime,
     rows: Vec<Row>,
     selected: usize,
+    /// What the tree is narrowed to, and whether it is being typed.
+    filter: Option<String>,
+    typing: bool,
 }
 
 impl Default for People {
@@ -61,6 +68,8 @@ impl Default for People {
             now: OffsetDateTime::UNIX_EPOCH,
             rows: Vec::new(),
             selected: 0,
+            filter: None,
+            typing: false,
         }
     }
 }
@@ -74,17 +83,57 @@ impl People {
         subjects: HashMap<Serial, String>,
         now: OffsetDateTime,
     ) {
-        let kept = self.selection();
         self.ledger = ledger;
         self.subjects = subjects;
         self.now = now;
-        self.rows = rows(&self.ledger);
+        self.refresh();
+    }
+
+    /// Rebuilds the rows, filtered, keeping the selection where it was if it is still shown.
+    fn refresh(&mut self) {
+        let kept = self.selection();
+        self.rows = rows(&self.ledger, self.filter.as_deref().unwrap_or(""));
         self.selected = kept
             .and_then(|kept| {
                 (0..self.rows.len()).find(|&i| self.selection_at(i).as_ref() == Some(&kept))
             })
             .or_else(|| self.rows.iter().position(|r| *r != Row::AgentsHeading))
             .unwrap_or(0);
+    }
+
+    /// Whether `key` is this tab's even before the keys every tab shares: while the filter is
+    /// typed, all of them are; with a filter set, Esc drops it rather than quitting.
+    pub fn wants(&self, key: &KeyEvent) -> bool {
+        self.typing || (self.filter.is_some() && key.code == KeyCode::Esc)
+    }
+
+    /// Whether the filter is being typed.
+    pub fn typing(&self) -> bool {
+        self.typing
+    }
+
+    fn filter_key(&mut self, key: KeyEvent) {
+        let filter = self.filter.get_or_insert_with(String::new);
+        match key.code {
+            KeyCode::Esc => {
+                self.filter = None;
+                self.typing = false;
+            }
+            KeyCode::Enter => {
+                self.typing = false;
+                if filter.is_empty() {
+                    self.filter = None;
+                }
+            }
+            KeyCode::Backspace => {
+                filter.pop();
+            }
+            KeyCode::Char(c) => filter.push(c),
+            KeyCode::Up => return self.move_selection(false),
+            KeyCode::Down => return self.move_selection(true),
+            _ => return,
+        }
+        self.refresh();
     }
 
     /// Moves the selection to `selection`, if it is shown.
@@ -123,6 +172,9 @@ impl People {
 
     /// The keys that do something for the current selection.
     pub fn hints(&self) -> Vec<Hint> {
+        if self.typing {
+            return vec![("type", "filter"), ("Enter", "keep"), ("Esc", "drop")];
+        }
         let mut hints = vec![("p", "new person")];
         if matches!(
             self.rows.get(self.selected),
@@ -141,6 +193,11 @@ impl People {
             }
             _ => {}
         }
+        hints.push(if self.filter.is_some() {
+            ("Esc", "drop filter")
+        } else {
+            ("/", "filter")
+        });
         hints
     }
 
@@ -284,12 +341,11 @@ impl People {
                     );
                     let indent = || -> Span<'static> { " ".repeat(10).into() };
                     if Some(certificate.serial) == current {
-                        let mut about = format!("issued {}", date(certificate.not_before));
+                        let issued = format!("issued {}", date(certificate.not_before));
+                        lines.push(vec![indent(), issued.dim()].into());
                         if let Some(subject) = self.subjects.get(&certificate.serial) {
-                            about.push_str(" · ");
-                            about.push_str(subject);
+                            lines.push(vec![indent(), subject.clone().dim()].into());
                         }
-                        lines.push(vec![indent(), about.dim()].into());
                     }
                     if let Some(invite) = invite_of(&self.ledger.invites, certificate.serial) {
                         let state = invite_state(invite);
@@ -322,6 +378,10 @@ impl People {
 
 impl Component for People {
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
+        if self.wants(&key) {
+            self.filter_key(key);
+            return None;
+        }
         let selection = self.selection();
         let active = self.selected_holder().is_some_and(|h| h.retired.is_none());
         match key.code {
@@ -354,13 +414,17 @@ impl Component for People {
                 _ => {}
             },
             KeyCode::Char('R') => return selection.map(Action::AskRename),
+            KeyCode::Char('/') => {
+                self.typing = true;
+                self.filter.get_or_insert_with(String::new);
+            }
             _ => {}
         }
         None
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        if self.rows.is_empty() {
+        if self.rows.is_empty() && self.filter.is_none() {
             let text = vec![
                 Line::default(),
                 "  No one has a certificate yet.".into(),
@@ -379,7 +443,7 @@ impl Component for People {
         }
         let [left, right] =
             Layout::horizontal([Constraint::Percentage(40), Constraint::Min(30)]).areas(area);
-        let block = |title: &'static str| {
+        let block = |title: String| {
             Block::default()
                 .title(title)
                 .borders(Borders::ALL)
@@ -387,14 +451,22 @@ impl Component for People {
                 .border_style(Style::new().dim())
         };
         let width = usize::from(left.width.saturating_sub(2));
-        let items: Vec<ListItem> = self.rows.iter().map(|&row| self.item(row, width)).collect();
+        let mut items: Vec<ListItem> = self.rows.iter().map(|&row| self.item(row, width)).collect();
+        if items.is_empty() {
+            items.push(ListItem::new(" Nothing matches.".dim()));
+        }
+        let title = match &self.filter {
+            Some(filter) if self.typing => format!(" /{filter}▏ "),
+            Some(filter) => format!(" /{filter} "),
+            None => String::new(),
+        };
         let list = List::new(items)
-            .block(block(""))
+            .block(block(title))
             .highlight_style(Style::new().reversed());
         let mut state = ListState::default().with_selected(Some(self.selected));
         frame.render_stateful_widget(list, left, &mut state);
         let details = Paragraph::new(self.details())
-            .block(block("").padding(ratatui::widgets::Padding::horizontal(1)))
+            .block(block(String::new()).padding(ratatui::widgets::Padding::horizontal(1)))
             .wrap(Wrap { trim: false });
         frame.render_widget(details, right);
     }
@@ -410,15 +482,27 @@ fn fit(text: &str, width: usize) -> String {
     cut
 }
 
-fn rows(ledger: &Ledger) -> Vec<Row> {
+/// The tree's rows, narrowed to names that contain `filter`, ignoring case.
+fn rows(ledger: &Ledger, filter: &str) -> Vec<Row> {
+    let filter = filter.to_lowercase();
+    let matches = |name: &str| name.to_lowercase().contains(&filter);
     let mut rows = Vec::new();
     for (p, person) in ledger.people.iter().enumerate() {
-        rows.push(Row::Person(p));
-        rows.extend((0..person.devices.len()).map(|d| Row::Device(p, d)));
+        let all = matches(&person.name);
+        let devices: Vec<usize> = (0..person.devices.len())
+            .filter(|&d| all || matches(&person.devices[d].name))
+            .collect();
+        if all || !devices.is_empty() {
+            rows.push(Row::Person(p));
+            rows.extend(devices.into_iter().map(|d| Row::Device(p, d)));
+        }
     }
-    if !ledger.agents.is_empty() {
+    let agents: Vec<usize> = (0..ledger.agents.len())
+        .filter(|&a| matches(&ledger.agents[a].name))
+        .collect();
+    if !agents.is_empty() {
         rows.push(Row::AgentsHeading);
-        rows.extend((0..ledger.agents.len()).map(Row::Agent));
+        rows.extend(agents.into_iter().map(Row::Agent));
     }
     rows
 }

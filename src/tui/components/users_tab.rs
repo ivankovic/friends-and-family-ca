@@ -62,7 +62,7 @@ impl UsersTab {
     pub fn hints(&self) -> Vec<Hint> {
         let mut hints = vec![("n", "new user")];
         if self.selected().is_some() {
-            hints.push(("p", "new password"));
+            hints.push(("c", "change password"));
             hints.push(("d", "delete"));
         }
         hints
@@ -73,7 +73,7 @@ impl Component for UsersTab {
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Char('n') => return Some(Action::AskNewUser),
-            KeyCode::Char('p') => {
+            KeyCode::Char('c') => {
                 return self
                     .selected()
                     .map(|r| Action::AskNewPassword(r.name.clone()));
