@@ -121,5 +121,11 @@ pub enum Action {
     InstallTimer,
     WriteEnrollmentSite,
     ShowInvite(crate::ledger::Invite),
+    /// Ask before cancelling an invite: that revokes its certificate.
+    AskCancelInvite(crate::ledger::Invite),
     CancelInvite(crate::ledger::Serial),
+    /// Put an invite's link on the clipboard of the terminal the administrator sits at.
+    CopyInvite(crate::ledger::Invite),
+    /// Put this text on that clipboard.
+    Copy(String),
 }

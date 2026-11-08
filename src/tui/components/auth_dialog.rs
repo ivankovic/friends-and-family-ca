@@ -22,10 +22,9 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
 
 use super::mode_dialog::diff;
-use super::{Component, dialog, hint_line, step};
+use super::{Component, Scroll, step, text_dialog};
 use crate::config;
 use crate::nginx::{self, Auth, Site};
 use crate::tui::action::Action;
@@ -49,6 +48,7 @@ pub struct AuthDialog {
     kind: usize,
     /// The names, as typed: separated by commas or spaces.
     names: String,
+    scroll: Scroll,
 }
 
 impl AuthDialog {
@@ -69,6 +69,7 @@ impl AuthDialog {
             refused,
             kind,
             names,
+            scroll: Scroll::default(),
         }
     }
 
@@ -126,7 +127,9 @@ impl Component for AuthDialog {
             KeyCode::Enter if self.change().is_ok() => {
                 return Some(Action::SetSiteAuth(self.site.clone(), self.auth()));
             }
-            _ => {}
+            code => {
+                self.scroll.handle(code, false);
+            }
         }
         None
     }
@@ -201,22 +204,19 @@ impl Component for AuthDialog {
                 );
             }
         }
-        let height = lines.len() as u16 + 4;
-        let inner = dialog(frame, area, self.site.name().to_string(), 92, height);
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-        let hints = Rect {
-            y: inner.bottom().saturating_sub(1),
-            height: 1,
-            ..inner
-        };
-        frame.render_widget(
-            Paragraph::new(hint_line(&[
+        text_dialog(
+            frame,
+            area,
+            self.site.name().to_string(),
+            92,
+            lines,
+            &[
                 ("↑ ↓", "kind"),
                 ("type", "users"),
                 ("Enter", "apply"),
                 ("Esc", "back"),
-            ])),
-            hints,
+            ],
+            &mut self.scroll,
         );
     }
 }

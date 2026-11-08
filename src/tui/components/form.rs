@@ -16,7 +16,7 @@
  */
 //! A dialog of one or more text fields: a new device, a new agent, a new name.
 
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Stylize};
@@ -235,6 +235,44 @@ impl Field {
 
 impl Component for Form {
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            // The line-editing keys of a shell: a default path is cleared with one, not dozens.
+            let field = self.field();
+            match key.code {
+                KeyCode::Char('a') => field.cursor = 0,
+                KeyCode::Char('e') => field.cursor = field.value.chars().count(),
+                KeyCode::Char('u') => {
+                    let at = field.byte_at(field.cursor);
+                    field.value.replace_range(..at, "");
+                    field.cursor = 0;
+                }
+                KeyCode::Char('w') => {
+                    let before: Vec<char> = field.value.chars().take(field.cursor).collect();
+                    let kept = before.len()
+                        - before
+                            .iter()
+                            .rev()
+                            .take_while(|c| c.is_whitespace())
+                            .count();
+                    let word = before[..kept]
+                        .iter()
+                        .rev()
+                        .take_while(|c| !c.is_whitespace() && **c != '/')
+                        .count();
+                    // A word ends at a slash too, so a path loses one folder at a time.
+                    let start = if word == 0 && kept > 0 {
+                        kept - 1
+                    } else {
+                        kept - word
+                    };
+                    let (from, to) = (field.byte_at(start), field.byte_at(field.cursor));
+                    field.value.replace_range(from..to, "");
+                    field.cursor = start;
+                }
+                _ => {}
+            }
+            return None;
+        }
         match key.code {
             KeyCode::Esc => return Some(Action::CloseDialog),
             KeyCode::Enter if self.focus + 1 < self.fields.len() => self.focus += 1,
@@ -291,7 +329,12 @@ impl Component for Form {
                 .div_ceil(usize::from(WIDTH) - 4)
                 .max(1)
         });
-        let height = 2 * self.fields.len() as u16 + 5 + message_lines as u16;
+        // On a short screen the fields lose the blank rows between them, so that the message and
+        // the hints still show.
+        let roomy = 2 * self.fields.len() as u16 + 5 + message_lines as u16;
+        let spaced = roomy <= area.height;
+        let rows_per_field: u16 = if spaced { 2 } else { 1 };
+        let height = rows_per_field * self.fields.len() as u16 + 5 + message_lines as u16;
         let inner = dialog(frame, area, self.title.clone(), WIDTH, height);
         let label_width = self.fields.iter().map(|f| f.label.len()).max().unwrap_or(0) + 2;
         let mut lines = vec![Line::default()];
@@ -308,6 +351,11 @@ impl Component for Form {
                 field.value.clone()
             };
             lines.push(vec![label, shown.into()].into());
+            if spaced {
+                lines.push(Line::default());
+            }
+        }
+        if !spaced {
             lines.push(Line::default());
         }
         match (&self.error, &self.note) {
@@ -316,7 +364,11 @@ impl Component for Form {
             (None, None) => lines.push(Line::default()),
         }
         let paragraph = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
-        frame.render_widget(paragraph, inner);
+        let text = Rect {
+            height: inner.height.saturating_sub(1),
+            ..inner
+        };
+        frame.render_widget(paragraph, text);
         let hints = Rect {
             y: inner.bottom().saturating_sub(1),
             height: 1,
@@ -344,7 +396,7 @@ impl Component for Form {
         let field = &self.fields[self.focus];
         let before: String = field.value.chars().take(field.cursor).collect();
         let x = inner.x + label_width as u16 + unicode_width(&before);
-        let y = inner.y + 1 + 2 * self.focus as u16;
+        let y = inner.y + 1 + rows_per_field * self.focus as u16;
         frame.set_cursor_position(Position::new(x.min(inner.right().saturating_sub(1)), y));
     }
 }

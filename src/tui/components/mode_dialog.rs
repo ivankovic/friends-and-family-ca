@@ -21,9 +21,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
 
-use super::{Component, dialog, hint_line, step};
+use super::{Component, Scroll, step, text_dialog};
 use crate::nginx::{Mode, Site};
 use crate::tui::action::Action;
 
@@ -44,14 +43,15 @@ pub struct Change {
 pub fn diff(original: &str, planned: &str) -> Change {
     let before: Vec<&str> = original.lines().collect();
     let after: Vec<&str> = planned.lines().collect();
+    // A blank line carries nothing worth reading: a bare "+" would only puzzle.
     let removed = before
         .iter()
-        .filter(|l| !after.contains(l))
+        .filter(|l| !l.trim().is_empty() && !after.contains(l))
         .map(|l| l.trim().to_owned())
         .collect();
     let added = after
         .iter()
-        .filter(|l| !before.contains(l))
+        .filter(|l| !l.trim().is_empty() && !before.contains(l))
         .map(|l| l.trim().to_owned())
         .collect();
     Change { removed, added }
@@ -62,16 +62,22 @@ pub struct ModeDialog {
     site: Site,
     /// For each mode in `Mode::ALL`: what it would change, or why it cannot.
     changes: Vec<Result<Change, String>>,
+    /// How many devices and agents hold a valid certificate from this CA: who still gets in
+    /// once one is required.
+    holders: usize,
     selected: usize,
+    scroll: Scroll,
 }
 
 impl ModeDialog {
-    pub fn new(site: Site, changes: Vec<Result<Change, String>>) -> ModeDialog {
+    pub fn new(site: Site, changes: Vec<Result<Change, String>>, holders: usize) -> ModeDialog {
         let selected = Mode::ALL.iter().position(|m| *m == site.mode).unwrap_or(0);
         ModeDialog {
             site,
             changes,
+            holders,
             selected,
+            scroll: Scroll::default(),
         }
     }
 }
@@ -92,7 +98,9 @@ impl Component for ModeDialog {
                     Mode::ALL[self.selected],
                 ));
             }
-            _ => {}
+            code => {
+                self.scroll.handle(code, false);
+            }
         }
         None
     }
@@ -115,6 +123,20 @@ impl Component for ModeDialog {
             lines.push(vec![marker.into(), name, description.dim(), now.dim()].into());
         }
         lines.push(Line::default());
+        // Requiring a certificate before anyone has one locks everyone out, the administrator
+        // too: say who will still get in.
+        if Mode::ALL[self.selected] == Mode::Required && self.site.mode != Mode::Required {
+            let line = match self.holders {
+                0 => "No device or agent has a valid certificate from this CA yet: nobody gets in, you included."
+                    .fg(Color::Red),
+                1 => "1 device or agent has a valid certificate from this CA: it alone gets in."
+                    .fg(Color::Yellow),
+                n => format!("{n} devices and agents have a valid certificate from this CA: everyone else is refused.")
+                    .dim(),
+            };
+            lines.push(line.into());
+            lines.push(Line::default());
+        }
         match &self.changes[self.selected] {
             Err(reason) => lines.push(reason.clone().fg(Color::Red).into()),
             Ok(change) if change.removed.is_empty() && change.added.is_empty() => {
@@ -142,17 +164,14 @@ impl Component for ModeDialog {
                 );
             }
         }
-        let height = lines.len() as u16 + 4;
-        let inner = dialog(frame, area, self.site.name().to_string(), 92, height);
-        frame.render_widget(Paragraph::new(lines), inner);
-        let hints = Rect {
-            y: inner.bottom().saturating_sub(1),
-            height: 1,
-            ..inner
-        };
-        frame.render_widget(
-            Paragraph::new(hint_line(&[("Enter", "apply"), ("Esc", "back")])),
-            hints,
+        text_dialog(
+            frame,
+            area,
+            self.site.name().to_string(),
+            92,
+            lines,
+            &[("Enter", "apply"), ("Esc", "back")],
+            &mut self.scroll,
         );
     }
 }

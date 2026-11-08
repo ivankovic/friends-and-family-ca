@@ -77,7 +77,12 @@ const ANNA_LAPTOP: Holder = Holder::Device {
 };
 
 fn screen(app: &mut App) -> String {
-    let mut terminal = Terminal::new(TestBackend::new(110, 40)).unwrap();
+    screen_of(app, 110, 40)
+}
+
+/// The screen on a terminal of `width` by `height`: 80 by 24 is a plain SSH session's.
+fn screen_of(app: &mut App, width: u16, height: u16) -> String {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
     terminal.draw(|frame| app.draw(frame)).unwrap();
     let buffer = terminal.backend().buffer();
     (0..buffer.area.height)
@@ -652,6 +657,10 @@ fn a_site_is_set_to_required_after_its_change_is_shown() {
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);
     let screen = screen(&mut app);
+    assert!(
+        screen.contains("No device or agent has a valid certificate from this CA yet"),
+        "requiring one before anyone has one locks everybody out:\n{screen}"
+    );
     assert!(screen.contains("+ ssl_verify_client on;"), "{screen}");
     assert!(
         screen.contains("+ ssl_crl /etc/nginx/certs/ffca.crl;"),
@@ -827,8 +836,22 @@ fn the_invites_tab_shows_an_invite_again_and_cancels_it() {
         ),
         made.link
     );
+    key(&mut app, KeyCode::Char('c'));
+    assert_eq!(app.take_clipboard().as_deref(), Some(made.link.as_str()));
     key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('c'));
+    assert_eq!(
+        app.take_clipboard().as_deref(),
+        Some(made.link.as_str()),
+        "the tab copies the selected invite's link too"
+    );
+    // Cancelling revokes a certificate: it asks first, and Esc leaves the invite open.
     key(&mut app, KeyCode::Char('x'));
+    assert_shows(&mut app, "Cancel the invite for Anna (phone)");
+    key(&mut app, KeyCode::Esc);
+    assert_shows(&mut app, "open, 21 h left");
+    key(&mut app, KeyCode::Char('x'));
+    key(&mut app, KeyCode::Enter);
     assert_shows(
         &mut app,
         "Cancelled the invite; its certificate is revoked.",
@@ -1219,4 +1242,127 @@ fn the_enrollment_site_never_asks_for_a_login() {
     assert_shows(&mut app, "This is the enrollment site");
     let file = std::fs::read_to_string(settings.sites.join("enroll.conf")).unwrap();
     assert!(!file.contains("remote_user"), "{file}");
+}
+
+#[test]
+fn help_scrolls_on_80_by_24_down_to_its_last_line() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Char('?'));
+    let first = screen_of(&mut app, 80, 24);
+    assert!(first.contains("↓ more"), "{first}");
+    assert!(first.contains("Enter close"), "{first}");
+    assert!(!first.contains("but the newest."), "{first}");
+    key(&mut app, KeyCode::End);
+    let last = screen_of(&mut app, 80, 24);
+    assert!(
+        last.contains("on the CA tab: set up the hourly refresh timer"),
+        "{last}"
+    );
+    assert!(last.contains("but the newest."), "{last}");
+    assert!(last.contains("↑ more"), "{last}");
+    assert!(last.contains("Enter close"), "{last}");
+}
+
+#[test]
+fn the_nginx_settings_form_fits_80_by_24_with_its_note() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('e'));
+    let screen = screen_of(&mut app, 80, 24);
+    for expected in [
+        "Site configs",
+        "Page runs as",
+        "running as uid:gid.",
+        "Esc cancel",
+    ] {
+        assert!(screen.contains(expected), "no {expected:?} on\n{screen}");
+    }
+}
+
+#[test]
+fn control_u_and_w_clear_a_form_field() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('e'));
+    let control = |app: &mut App, c: char| {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL), NOW)
+    };
+    control(&mut app, 'w');
+    assert_shows(&mut app, "Site configs        /etc/nginx/ ");
+    control(&mut app, 'w');
+    assert_shows(&mut app, "Site configs        /etc/nginx ");
+    control(&mut app, 'u');
+    type_text(&mut app, "/srv/sites");
+    assert_shows(&mut app, "Site configs        /srv/sites ");
+}
+
+#[test]
+fn the_hint_line_keeps_help_and_quit_on_80_columns() {
+    let fixture = Fixture::new();
+    fixture.issue(ANNA_PHONE, NOW, 700);
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Down);
+    let screen = screen_of(&mut app, 80, 24);
+    let hints = screen.lines().last().unwrap();
+    assert!(hints.ends_with("? help  q quit"), "{hints:?}");
+    assert!(hints.starts_with(" p new person"), "{hints:?}");
+}
+
+#[test]
+fn tab_titles_count_what_needs_looking_at() {
+    let fixture = Fixture::new();
+    with_enrollment(&fixture);
+    fixture.issue(ANNA_LAPTOP, NOW, 10);
+    invite::make(
+        &fixture.ca(),
+        &invites_folder(&fixture),
+        ANNA_PHONE,
+        "k.example.invalid",
+        NOW,
+    )
+    .unwrap();
+    let mut app = fixture.app(NOW);
+    assert_shows(
+        &mut app,
+        "People & agents · 1 expiring │ Invites · 1 open │ Nginx",
+    );
+}
+
+#[test]
+fn a_notice_goes_after_a_while() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Ca);
+    key(&mut app, KeyCode::Char('c'));
+    assert_shows(&mut app, "Signed a new CRL");
+    app.reload(NOW + Duration::seconds(10));
+    assert_shows(&mut app, "Signed a new CRL");
+    app.reload(NOW + Duration::seconds(30));
+    let screen = screen(&mut app);
+    assert!(!screen.contains("Signed a new CRL"), "{screen}");
+}
+
+#[test]
+fn requiring_a_certificate_says_who_still_gets_in() {
+    let fixture = Fixture::new();
+    with_nginx(&fixture, "true", "true", None);
+    fixture.issue(ANNA_PHONE, NOW, 700);
+    fixture.issue(ANNA_LAPTOP, NOW, 700);
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('s'));
+    key(&mut app, KeyCode::Down);
+    let screen = screen(&mut app);
+    assert!(
+        !screen.contains("everyone else is refused"),
+        "only for required:\n{screen}"
+    );
+    key(&mut app, KeyCode::Down);
+    assert_shows(
+        &mut app,
+        "2 devices and agents have a valid certificate from this CA: everyone else is refused.",
+    );
 }

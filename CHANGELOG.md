@@ -23,9 +23,14 @@ The first release.
   day. It holds the certificate packed for the device - a configuration profile for iPhone and
   iPad, a `.p12` for Android, Windows, macOS and the browsers, either locked with a password the
   page shows - sealed so that only the link opens it. The device's key is never written to disk. The Invites tab shows each one open, collected (when, and from where),
-  expired or cancelled.
+  expired or cancelled. The QR code fits a plain 80 by 24 terminal; `c` puts the link on the
+  clipboard of the terminal you sit at (OSC 52, over SSH too); cancelling one asks first.
+- **The terminal UI fits 80 by 24**: a dialog taller than the screen scrolls, the key hints keep
+  `? help` and `q quit`, and long names are cut short rather than pushing columns out. Tab titles
+  count open invites and certificates about to expire. Forms take Ctrl-U, Ctrl-W, Ctrl-A, Ctrl-E.
+  Requiring a client certificate on a site says how many devices and agents still get in.
 - **The enrollment page**, `ffca serve`: opening a link shows whose certificate it is, and only
-  pressing the button uses the invite up. It runs as nobody with the invites folder and nothing
+  pressing the button uses the invite up. The download for the device that opened it comes first. It runs as nobody with the invites folder and nothing
   else - an image is published on ghcr.io - and keeps invite secrets out of its log and nginx's.
   It is its own small HTTP server, with every request bounded in time and size.
 - **nginx.** The Nginx tab says where nginx's sites and CA files are and how to test and reload it;

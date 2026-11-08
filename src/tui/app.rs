@@ -39,13 +39,13 @@ use super::components::nginx_tab::NginxTab;
 use super::components::people::People;
 use super::components::revoke_dialog::RevokeDialog;
 use super::components::users_tab::{self, UsersTab};
-use super::components::{Component, Hint, hint_line};
+use super::components::{Component, Hint, fitted_hint_line};
 use super::date;
 use crate::ca::{self, Ca, CrlStatus, Key};
 use crate::config::{self, Config};
 use crate::files::issue_to_files;
 use crate::invite;
-use crate::ledger::{Invite, Ledger, Place, Status, Target};
+use crate::ledger::{Invite, InviteState, Ledger, Place, Status, Target};
 use crate::nginx::{self, Auth, Mode, Site};
 use crate::store::PRIVATE;
 use crate::timer;
@@ -80,10 +80,16 @@ enum Dialog {
     Message(Message),
 }
 
+/// How long the line above the key hints keeps saying what happened, and why something failed:
+/// after that it says nothing, rather than reporting an old change as news on every tab.
+const NOTICE_SHOWN: Duration = Duration::seconds(20);
+const ERROR_SHOWN: Duration = Duration::seconds(60);
+
 /// The line above the key hints: what the last action did, or why it failed.
 struct Notice {
     text: String,
     error: bool,
+    at: OffsetDateTime,
 }
 
 pub struct App {
@@ -114,6 +120,9 @@ pub struct App {
     ca_info: CaInfo,
     dialog: Option<Dialog>,
     notice: Option<Notice>,
+    /// Text to put on the clipboard of the administrator's terminal: the event loop sends it as
+    /// an OSC 52 sequence, which travels over SSH to the terminal itself.
+    clipboard: Option<String>,
     quit: bool,
 }
 
@@ -140,6 +149,7 @@ impl App {
             ca_info: CaInfo::default(),
             dialog: None,
             notice: None,
+            clipboard: None,
             quit: false,
         };
         app.reload(now);
@@ -150,6 +160,11 @@ impl App {
 
     pub fn should_quit(&self) -> bool {
         self.quit
+    }
+
+    /// What is waiting to go on the terminal's clipboard, once.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.clipboard.take()
     }
 
     /// Greets a CA that was just created: where to point the web server, and what to do next.
@@ -200,11 +215,18 @@ impl App {
             }
             Ok(())
         })();
+        if let Some(notice) = &self.notice {
+            let shown = if notice.error {
+                ERROR_SHOWN
+            } else {
+                NOTICE_SHOWN
+            };
+            if now - notice.at > shown {
+                self.notice = None;
+            }
+        }
         if let Err(error) = result {
-            self.notice = Some(Notice {
-                text: format!("{error:#}"),
-                error: true,
-            });
+            self.fail(format!("{error:#}"));
         }
         let subjects: HashMap<_, _> = self
             .ledger
@@ -448,7 +470,34 @@ impl App {
             }
             Action::WriteEnrollmentSite => self.write_enrollment_site(),
             Action::ShowInvite(invite) => self.show_invite(&invite),
+            Action::AskCancelInvite(invite) => {
+                self.dialog = Some(Dialog::Message(Message::confirm(
+                    format!("Cancel the invite for {}", invite.holder),
+                    vec![
+                        "Its link stops working, and the certificate it holds is revoked.".into(),
+                        "To give the device a certificate after all, renew it with u on People & agents."
+                            .dim()
+                            .into(),
+                    ],
+                    Action::CancelInvite(invite.serial),
+                    "cancel the invite",
+                )));
+            }
+            Action::CopyInvite(invite) => {
+                if let Some(enrollment) = &self.config.enrollment {
+                    let link = invite::link(&enrollment.host, &invite.token);
+                    self.perform(Action::Copy(link));
+                }
+            }
+            Action::Copy(text) => {
+                self.clipboard = Some(text);
+                self.tell(
+                    "Sent the link to your terminal's clipboard (if it allows OSC 52; the link is also on screen)."
+                        .into(),
+                );
+            }
             Action::CancelInvite(serial) => {
+                self.dialog = None;
                 match invite::cancel(&self.ca, &invite::dir(self.ca.store()), serial, self.now) {
                     Ok(()) => {
                         self.tell("Cancelled the invite; its certificate is revoked.".into());
@@ -621,7 +670,14 @@ impl App {
                 Ok(diff(&original, &planned))
             })
             .collect();
-        self.dialog = Some(Dialog::Mode(ModeDialog::new(site, changes)));
+        let holders = self
+            .ledger
+            .certificates()
+            .filter(|(_, c)| c.status(self.now) == Status::Valid)
+            .map(|(holder, _)| holder.to_string())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
+        self.dialog = Some(Dialog::Mode(ModeDialog::new(site, changes, holders)));
     }
 
     fn set_site_mode(&mut self, site: &Site, mode: Mode) {
@@ -938,8 +994,12 @@ impl App {
     fn tend_invites(&mut self) -> bool {
         match invite::tend(&self.ca, &invite::dir(self.ca.store()), self.now) {
             Ok(tended) => {
-                for holder in &tended.collected {
-                    self.tell(format!("{holder} collected their invite."));
+                match tended.collected.as_slice() {
+                    [] => {}
+                    [holder] => self.tell(format!("{holder} collected their invite.")),
+                    holders => {
+                        self.tell(format!("{} collected their invites.", holders.join(", ")))
+                    }
                 }
                 if !tended.problems.is_empty() {
                     self.fail(format!(
@@ -1047,11 +1107,19 @@ impl App {
     }
 
     fn tell(&mut self, text: String) {
-        self.notice = Some(Notice { text, error: false });
+        self.notice = Some(Notice {
+            text,
+            error: false,
+            at: self.now,
+        });
     }
 
     fn fail(&mut self, text: String) {
-        self.notice = Some(Notice { text, error: true });
+        self.notice = Some(Notice {
+            text,
+            error: true,
+            at: self.now,
+        });
     }
 
     /// A refusal: shown in the open form, which stays open, or as a notice.
@@ -1144,7 +1212,13 @@ impl App {
         ])
         .areas(frame.area());
         self.draw_title(frame, title);
-        let titles: Vec<Line> = TABS.iter().map(|(_, name)| Line::from(*name)).collect();
+        let titles: Vec<Line> = TABS
+            .iter()
+            .map(|(tab, name)| match self.tab_count(*tab) {
+                Some(count) => Line::from(vec![(*name).into(), format!(" · {count}").dim()]),
+                None => Line::from(*name),
+            })
+            .collect();
         let selected = TABS
             .iter()
             .position(|(tab, _)| *tab == self.tab)
@@ -1175,22 +1249,46 @@ impl App {
             Tab::Users => self.users_tab.hints(),
             Tab::Ca => self.ca_info.hints(),
         };
-        keys.extend([("Tab", "switch"), ("?", "help"), ("q", "quit")]);
+        keys.push(("Tab", "switch"));
         let hints = Rect {
             x: hints.x + 1,
             width: hints.width.saturating_sub(1),
             ..hints
         };
-        frame.render_widget(Paragraph::new(hint_line(&keys)), hints);
+        let line = fitted_hint_line(&keys, &[("?", "help"), ("q", "quit")], hints.width.into());
+        frame.render_widget(Paragraph::new(line), hints);
         match &mut self.dialog {
             Some(Dialog::Form(form)) => form.draw(frame, body),
             Some(Dialog::Revoke(dialog)) => dialog.draw(frame, body),
             Some(Dialog::Mode(dialog)) => dialog.draw(frame, body),
             Some(Dialog::Auth(dialog)) => dialog.draw(frame, body),
-            Some(Dialog::Invite(dialog)) => dialog.draw(frame, body),
+            // The QR code needs every row the terminal has: on 80 by 24 it covers the whole screen.
+            Some(Dialog::Invite(dialog)) => {
+                frame.render_widget(ratatui::widgets::Clear, frame.area());
+                dialog.draw(frame, frame.area());
+            }
             Some(Dialog::Message(message)) => message.draw(frame, body),
             None => {}
         }
+    }
+
+    /// What a tab's title counts, if anything needs looking at there: open invites, and devices
+    /// and agents whose certificate expires soon.
+    fn tab_count(&self, tab: Tab) -> Option<String> {
+        let count = match tab {
+            Tab::Invites => {
+                let open = self
+                    .ledger
+                    .invites
+                    .iter()
+                    .filter(|i| i.state == InviteState::Open)
+                    .count();
+                return (open > 0).then(|| format!("{open} open"));
+            }
+            Tab::People => self.people.expiring(),
+            _ => 0,
+        };
+        (count > 0).then(|| format!("{count} expiring"))
     }
 
     fn draw_title(&self, frame: &mut Frame, area: Rect) {
@@ -1277,9 +1375,14 @@ fn help() -> Message {
             key("n  p  d", "on the Users tab: a new user, a new password, delete"),
             key("t", "on the Nginx tab: test nginx's configuration"),
             key("w", "on the Nginx tab: write the enrollment site"),
-            key("Enter  x", "on the Invites tab: show an invite's QR code again, cancel it"),
+            key(
+                "Enter  c  x",
+                "on the Invites tab: show an invite's QR code again, copy its link, cancel it",
+            ),
             key("c", "on the CA tab: sign a new CRL now"),
             key("T", "on the CA tab: set up the hourly refresh timer"),
+            key("PgUp PgDn", "scroll a dialog taller than the screen"),
+            key("Ctrl-U  W", "in a form: clear the field, delete a word (Ctrl-A, E: start, end)"),
             key("q  Esc", "quit, or close a dialog"),
             Line::default(),
             "After a renewal, revoke the device again as \"replaced\": that revokes every certificate but the newest."

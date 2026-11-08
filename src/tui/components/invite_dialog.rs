@@ -90,80 +90,97 @@ impl Component for InviteDialog {
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => Some(Action::CloseDialog),
+            KeyCode::Char('c') => Some(Action::Copy(self.link.clone())),
             _ => None,
         }
     }
 
+    /// `area` is the whole screen: the code is drawn beside its explanation where there is room,
+    /// and otherwise with only the link and the status under it, which fits a link of the usual
+    /// length (a version 4 code) in 80 by 24.
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        // The link has a line of its own, unwrapped, under the code: it is copied from the
-        // terminal into a message, and a wrapped one would come out in pieces.
+        // The link has a line of its own, unwrapped: it is copied from the terminal into a
+        // message, and a wrapped one would come out in pieces.
         let code_width = self.code_width();
+        let code_height = self.code.len() as u16;
         let link_width = self.link.chars().count() as u16;
-        let width = (code_width + 48).max(link_width + 4);
-        let height = self.code.len() as u16 + 8;
-        let inner = dialog(
-            frame,
-            area,
-            format!("Invite for {}", self.holder),
-            width,
-            height,
-        );
-        if inner.height < height - 2 || inner.width < code_width + 22 {
-            // A clipped code does not scan: show none rather than half of one.
-            let lines: Vec<Line> = vec![
-                "Send the device this link:".into(),
-                Line::default(),
-                self.link.clone().cyan().into(),
-                Line::default(),
-                self.status.clone().into(),
-                Line::default(),
-                format!(
-                    "Make the terminal at least {} by {} to see its QR code.",
-                    width + 2,
-                    height + 6
-                )
-                .fg(Color::Yellow)
-                .into(),
-            ];
-            frame.render_widget(Paragraph::new(lines), inner);
-            let hints = Rect {
-                y: inner.bottom().saturating_sub(1),
-                height: 1,
-                ..inner
-            };
-            frame.render_widget(Paragraph::new(hint_line(&[("Enter", "close")])), hints);
-            return;
-        }
-        let [top, below] = Layout::vertical([
-            Constraint::Length(self.code.len() as u16),
-            Constraint::Min(4),
-        ])
-        .areas(inner);
-        let [code, _, text] = Layout::horizontal([
-            Constraint::Length(code_width),
-            Constraint::Length(2),
-            Constraint::Min(20),
-        ])
-        .areas(top);
-        frame.render_widget(Paragraph::new(self.code.clone()), code);
-        let beside: Vec<Line> = vec![
-            "Scan it with the device, or send it the link below.".into(),
-            Line::default(),
-            self.status.clone().into(),
-            Line::default(),
-            "It opens a page that hands the certificate over, with how to install it."
-                .dim()
-                .into(),
-        ];
-        frame.render_widget(Paragraph::new(beside).wrap(Wrap { trim: false }), text);
-        let lines: Vec<Line> = vec![Line::default(), self.link.clone().cyan().into()];
-        frame.render_widget(Paragraph::new(lines), below);
-        let hints = Rect {
+        let title = format!("Invite for {}", self.holder);
+        let hints = hint_line(&[("c", "copy link"), ("Enter", "close")]);
+        let hint_row = |inner: Rect| Rect {
             y: inner.bottom().saturating_sub(1),
             height: 1,
             ..inner
         };
-        frame.render_widget(Paragraph::new(hint_line(&[("Enter", "close")])), hints);
+
+        let beside = ((code_width + 48).max(link_width + 4), code_height + 8);
+        if beside.0 <= area.width && beside.1 <= area.height {
+            let inner = dialog(frame, area, title, beside.0, beside.1);
+            let [top, below] =
+                Layout::vertical([Constraint::Length(code_height), Constraint::Min(4)])
+                    .areas(inner);
+            let [code, _, text] = Layout::horizontal([
+                Constraint::Length(code_width),
+                Constraint::Length(2),
+                Constraint::Min(20),
+            ])
+            .areas(top);
+            frame.render_widget(Paragraph::new(self.code.clone()), code);
+            let explained: Vec<Line> = vec![
+                "Scan it with the device, or send it the link below.".into(),
+                Line::default(),
+                self.status.clone().into(),
+                Line::default(),
+                "It opens a page that hands the certificate over, with how to install it."
+                    .dim()
+                    .into(),
+            ];
+            frame.render_widget(Paragraph::new(explained).wrap(Wrap { trim: false }), text);
+            let lines: Vec<Line> = vec![Line::default(), self.link.clone().cyan().into()];
+            frame.render_widget(Paragraph::new(lines), below);
+            frame.render_widget(Paragraph::new(hints), hint_row(inner));
+            return;
+        }
+
+        // The code, then the link, the status and the hints: one row each, inside the frame.
+        let stacked = (code_width.max(link_width) + 4, code_height + 5);
+        if stacked.0 <= area.width && stacked.1 <= area.height {
+            let inner = dialog(frame, area, title, stacked.0, stacked.1);
+            let [code, link, status] = Layout::vertical([
+                Constraint::Length(code_height),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .areas(inner);
+            let code = Rect {
+                x: inner.x + (inner.width.saturating_sub(code_width)) / 2,
+                width: code_width.min(inner.width),
+                ..code
+            };
+            frame.render_widget(Paragraph::new(self.code.clone()), code);
+            frame.render_widget(Paragraph::new(self.link.clone().cyan()), link);
+            frame.render_widget(Paragraph::new(self.status.clone().dim()), status);
+            frame.render_widget(Paragraph::new(hints), hint_row(inner));
+            return;
+        }
+
+        // A clipped code does not scan: show none rather than half of one.
+        let inner = dialog(frame, area, title, link_width + 4, 11);
+        let lines: Vec<Line> = vec![
+            "Send the device this link:".into(),
+            Line::default(),
+            self.link.clone().cyan().into(),
+            Line::default(),
+            self.status.clone().into(),
+            Line::default(),
+            format!(
+                "Make the terminal at least {} by {} to see its QR code.",
+                stacked.0, stacked.1
+            )
+            .fg(Color::Yellow)
+            .into(),
+        ];
+        frame.render_widget(Paragraph::new(lines), inner);
+        frame.render_widget(Paragraph::new(hints), hint_row(inner));
     }
 }
 
@@ -204,9 +221,24 @@ mod tests {
         assert!(screen.contains("▀▀▀"), "{screen}");
     }
 
+    /// 80 by 24 is what an SSH session opens at: the code fits, with the link whole under it.
+    #[test]
+    fn the_code_fits_a_plain_80_by_24_terminal() {
+        let screen = screen(80, 24);
+        assert!(screen.contains("▀▀▀"), "{screen}");
+        assert!(
+            screen.contains(
+                "https://k.domaci.ivankovic.me/i/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            "{screen}"
+        );
+        assert!(screen.contains("Works once"), "{screen}");
+        assert!(screen.contains("Enter close"), "{screen}");
+    }
+
     #[test]
     fn a_terminal_too_small_for_the_code_gets_the_link_and_why() {
-        let screen = screen(80, 24);
+        let screen = screen(80, 20);
         assert!(!screen.contains('▀'), "no clipped code:\n{screen}");
         assert!(
             screen.contains(

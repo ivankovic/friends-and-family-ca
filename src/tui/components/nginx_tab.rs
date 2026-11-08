@@ -151,7 +151,9 @@ impl NginxTab {
         lines
     }
 
-    fn item(&self, site: &Site) -> ListItem<'static> {
+    /// A site's row in a list `width` wide: its file's name is left out when the row would not
+    /// otherwise have room for its notes, which matter more.
+    fn item(&self, site: &Site, width: usize) -> ListItem<'static> {
         let (symbol, color) = match site.mode {
             Mode::Off => ("○", Color::DarkGray),
             Mode::Optional => ("◐", Color::Yellow),
@@ -172,9 +174,21 @@ impl NginxTab {
         if site.duplicate {
             note.push_str("  another block has this name: nginx ignores one");
         }
+        let name_width = self
+            .sites()
+            .iter()
+            .map(|s| s.name().chars().count() + 2)
+            .max()
+            .unwrap_or(0)
+            .min(34);
+        let file = if width >= 100 {
+            format!("{:<22}", site.file_name())
+        } else {
+            String::new()
+        };
         ListItem::new(Line::from(vec![
-            format!(" {:<34}", site.name()).into(),
-            format!("{:<22}", site.file_name()).dim(),
+            format!(" {:<name_width$}", site.name()).into(),
+            file.dim(),
             Span::styled(symbol, Style::new().fg(color)),
             format!(" {:<10}", site.mode.to_string()).into(),
             match site.auth {
@@ -225,7 +239,9 @@ impl Component for NginxTab {
             .border_style(Style::new().dim());
         match &self.survey {
             Some(Ok(survey)) => {
-                let mut items: Vec<ListItem> = survey.sites.iter().map(|s| self.item(s)).collect();
+                let width = usize::from(sites.width.saturating_sub(2));
+                let mut items: Vec<ListItem> =
+                    survey.sites.iter().map(|s| self.item(s, width)).collect();
                 if items.is_empty() {
                     items.push(ListItem::new(
                         " No HTTPS server blocks in these files.".dim(),

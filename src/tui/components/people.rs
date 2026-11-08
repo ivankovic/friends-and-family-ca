@@ -144,6 +144,16 @@ impl People {
         hints
     }
 
+    /// How many devices and agents have a current certificate that expires within
+    /// [`EXPIRY_WARNING`]: they need renewing.
+    pub fn expiring(&self) -> usize {
+        self.holders()
+            .filter(|h| h.retired.is_none())
+            .filter_map(|h| h.current(self.now))
+            .filter(|c| c.not_after - self.now < EXPIRY_WARNING)
+            .count()
+    }
+
     fn move_selection(&mut self, down: bool) {
         let mut next = self.selected;
         loop {
@@ -159,22 +169,46 @@ impl People {
         }
     }
 
-    fn item(&self, row: Row) -> ListItem<'static> {
+    fn item(&self, row: Row, width: usize) -> ListItem<'static> {
         let line: Line = match row {
-            Row::Person(p) => vec!["▾ ".dim(), self.ledger.people[p].name.clone().bold()].into(),
+            Row::Person(p) => {
+                let name = fit(&self.ledger.people[p].name, width.saturating_sub(2));
+                vec!["▾ ".dim(), name.bold()].into()
+            }
             Row::AgentsHeading => vec!["▾ ".dim(), "Agents".bold().italic()].into(),
-            Row::Device(p, d) => self.holder_line(&self.ledger.people[p].devices[d]),
-            Row::Agent(a) => self.holder_line(&self.ledger.agents[a]),
+            Row::Device(p, d) => self.holder_line(&self.ledger.people[p].devices[d], width),
+            Row::Agent(a) => self.holder_line(&self.ledger.agents[a], width),
         };
         ListItem::new(line)
     }
 
-    fn holder_line(&self, holder: &KeyHolder) -> Line<'static> {
+    /// The holders shown, devices and agents alike.
+    fn holders(&self) -> impl Iterator<Item = &KeyHolder> {
+        let devices = self.ledger.people.iter().flat_map(|p| &p.devices);
+        devices.chain(&self.ledger.agents)
+    }
+
+    /// How wide a holder's name is in a list `width` wide: as wide as the longest (and at least
+    /// 14, so that the states line up as a column), less if that would push the states out.
+    fn name_width(&self, width: usize) -> usize {
+        let longest = self.holders().map(|h| h.name.chars().count()).max();
+        let label = self
+            .holders()
+            .map(|h| holder_state(h, self.now).1.chars().count())
+            .max()
+            .unwrap_or(0);
+        // "  ● " before the name, a space after it.
+        let room = width.saturating_sub(5 + label);
+        longest.unwrap_or(0).max(14).min(room).max(6)
+    }
+
+    fn holder_line(&self, holder: &KeyHolder, width: usize) -> Line<'static> {
         let (symbol, label, color) = holder_state(holder, self.now);
+        let name_width = self.name_width(width);
         vec![
             "  ".into(),
             Span::styled(symbol, Style::new().fg(color)),
-            format!(" {:<14} ", holder.name).into(),
+            format!(" {:<name_width$} ", fit(&holder.name, name_width)).into(),
             Span::from(label).dim(),
         ]
         .into()
@@ -318,7 +352,7 @@ impl Component for People {
                     "p".bold(),
                     " to add a person and their first device, or ".into(),
                     "a".bold(),
-                    " to an agent.".into(),
+                    " to add an agent.".into(),
                 ]
                 .into(),
             ];
@@ -326,7 +360,7 @@ impl Component for People {
             return;
         }
         let [left, right] =
-            Layout::horizontal([Constraint::Percentage(36), Constraint::Min(30)]).areas(area);
+            Layout::horizontal([Constraint::Percentage(40), Constraint::Min(30)]).areas(area);
         let block = |title: &'static str| {
             Block::default()
                 .title(title)
@@ -334,7 +368,8 @@ impl Component for People {
                 .border_set(border::ROUNDED)
                 .border_style(Style::new().dim())
         };
-        let items: Vec<ListItem> = self.rows.iter().map(|&row| self.item(row)).collect();
+        let width = usize::from(left.width.saturating_sub(2));
+        let items: Vec<ListItem> = self.rows.iter().map(|&row| self.item(row, width)).collect();
         let list = List::new(items)
             .block(block(""))
             .highlight_style(Style::new().reversed());
@@ -345,6 +380,16 @@ impl Component for People {
             .wrap(Wrap { trim: false });
         frame.render_widget(details, right);
     }
+}
+
+/// `text`, cut to `width` characters with an ellipsis if it is longer.
+fn fit(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
 }
 
 fn rows(ledger: &Ledger) -> Vec<Row> {

@@ -21,6 +21,10 @@
 //! against the CA and decides which component sees the next key. Only the `App` touches the CA,
 //! so every change goes through the same locks and checks as the command line.
 //!
+//! Copying puts text on the clipboard of the terminal the administrator sits at, not this
+//! machine's: an OSC 52 sequence, which the terminal acts on and SSH carries unchanged. A terminal
+//! that does not allow it ignores it, so the text is always on screen as well.
+//!
 //! Other processes change the CA too (`crl-refresh` from its timer, the command line, later the
 //! enrollment page), so the UI re-reads the ledger after every action and every few seconds.
 
@@ -61,6 +65,9 @@ pub fn run(store: Store, out: PathBuf) -> Result<()> {
                 {
                     session.handle_key(key, OffsetDateTime::now_utc());
                 }
+                if let Some(text) = session.take_clipboard() {
+                    copy(&text)?;
+                }
             } else {
                 session.reload(OffsetDateTime::now_utc());
             }
@@ -69,6 +76,23 @@ pub fn run(store: Store, out: PathBuf) -> Result<()> {
             }
         }
     })
+}
+
+/// Asks the terminal to put `text` on its clipboard.
+fn copy(text: &str) -> Result<()> {
+    use base64::Engine;
+    use std::io::Write;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text);
+    let mut stdout = std::io::stdout();
+    write!(stdout, "{}", osc52(&encoded))?;
+    stdout.flush()?;
+    Ok(())
+}
+
+/// The OSC 52 sequence that sets the clipboard to `encoded`, base64 already. tmux passes it on to
+/// the terminal outside by itself (its `set-clipboard` is `external` unless changed).
+fn osc52(encoded: &str) -> String {
+    format!("\x1b]52;c;{encoded}\x07")
 }
 
 /// A date as people write it: "3 Oct 2026".

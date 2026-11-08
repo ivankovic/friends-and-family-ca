@@ -21,9 +21,8 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
 
-use super::{Component, Hint, dialog, hint_line};
+use super::{Component, Hint, Scroll, text_dialog};
 use crate::tui::action::Action;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +31,7 @@ pub struct Message {
     lines: Vec<Line<'static>>,
     /// What Enter does, if it does more than close: the dialog asks before it.
     confirm: Option<(Action, &'static str)>,
+    scroll: Scroll,
 }
 
 impl Message {
@@ -40,6 +40,7 @@ impl Message {
             title: title.into(),
             lines,
             confirm: None,
+            scroll: Scroll::default(),
         }
     }
 
@@ -66,31 +67,28 @@ impl Component for Message {
                     .map_or(Action::CloseDialog, |(a, _)| a.clone()),
             ),
             KeyCode::Esc | KeyCode::Char('q') => Some(Action::CloseDialog),
-            _ => None,
+            code => {
+                self.scroll.handle(code, true);
+                None
+            }
         }
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let width = 76;
-        let wrapped: usize = self
-            .lines
-            .iter()
-            .map(|l| l.width().div_ceil(usize::from(width) - 4).max(1))
-            .sum();
-        let height = wrapped as u16 + 5;
-        let inner = dialog(frame, area, self.title.clone(), width, height);
         let mut lines = vec![Line::default()];
         lines.extend(self.lines.iter().cloned());
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-        let hints = Rect {
-            y: inner.bottom().saturating_sub(1),
-            height: 1,
-            ..inner
-        };
         let keys: &[Hint] = match &self.confirm {
             Some((_, what)) => &[("Enter", what), ("Esc", "back")],
             None => &[("Enter", "close")],
         };
-        frame.render_widget(Paragraph::new(hint_line(keys)), hints);
+        text_dialog(
+            frame,
+            area,
+            self.title.clone(),
+            76,
+            lines,
+            keys,
+            &mut self.scroll,
+        );
     }
 }

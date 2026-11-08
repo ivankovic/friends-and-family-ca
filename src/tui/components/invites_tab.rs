@@ -87,7 +87,7 @@ impl InvitesTab {
     pub fn hints(&self) -> Vec<Hint> {
         match self.selected_invite() {
             Some(invite) if invite.state == InviteState::Open => {
-                vec![("Enter", "show"), ("x", "cancel")]
+                vec![("Enter", "show"), ("c", "copy link"), ("x", "cancel")]
             }
             _ => Vec::new(),
         }
@@ -147,7 +147,8 @@ impl Component for InvitesTab {
                 self.selected = step(self.selected, true, self.invites.len())
             }
             KeyCode::Enter => return open.map(Action::ShowInvite),
-            KeyCode::Char('x') => return open.map(|i| Action::CancelInvite(i.serial)),
+            KeyCode::Char('c') => return open.map(Action::CopyInvite),
+            KeyCode::Char('x') => return open.map(Action::AskCancelInvite),
             _ => {}
         }
         None

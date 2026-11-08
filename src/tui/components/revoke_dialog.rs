@@ -21,9 +21,8 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
 
-use super::{Component, dialog, hint_line, step};
+use super::{Component, Scroll, step, text_dialog};
 use crate::ledger::Reason;
 use crate::tui::action::{Action, Selection};
 
@@ -48,6 +47,7 @@ pub struct RevokeDialog {
     /// holder's newest - which "replaced" keeps.
     reaches: Vec<(String, bool)>,
     selected: usize,
+    scroll: Scroll,
 }
 
 impl RevokeDialog {
@@ -58,6 +58,7 @@ impl RevokeDialog {
             selection,
             reaches,
             selected: if replacing { 1 } else { 0 },
+            scroll: Scroll::default(),
         }
     }
 }
@@ -78,15 +79,14 @@ impl Component for RevokeDialog {
                     REASONS[self.selected].0,
                 ));
             }
-            _ => {}
+            code => {
+                self.scroll.handle(code, false);
+            }
         }
         None
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let height = REASONS.len() as u16 + self.reaches.len() as u16 + 10;
-        let title = format!("Revoke {}", self.selection);
-        let inner = dialog(frame, area, title, 72, height);
         let mut lines = vec!["Why?".bold().into()];
         for (i, (_, name, description)) in REASONS.iter().enumerate() {
             let marker = if i == self.selected { "› " } else { "  " };
@@ -124,15 +124,14 @@ impl Component for RevokeDialog {
                 .dim()
                 .into(),
         );
-        frame.render_widget(Paragraph::new(lines), inner);
-        let hints = Rect {
-            y: inner.bottom().saturating_sub(1),
-            height: 1,
-            ..inner
-        };
-        frame.render_widget(
-            Paragraph::new(hint_line(&[("Enter", "revoke"), ("Esc", "back")])),
-            hints,
+        text_dialog(
+            frame,
+            area,
+            format!("Revoke {}", self.selection),
+            72,
+            lines,
+            &[("Enter", "revoke"), ("Esc", "back")],
+            &mut self.scroll,
         );
     }
 }

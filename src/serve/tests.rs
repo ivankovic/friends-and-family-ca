@@ -348,8 +348,8 @@ fn the_password_is_shown_for_both_downloads() {
     let dir = crate::test_dir();
     let (_ca, mut page, token) = page_with_invite(dir.path());
     let body = text(&page.answer("POST", &format!("/i/{token}"), "x", NOW));
-    assert_eq!(body.matches("<code>").count(), 1, "{body}");
-    let password = body.find("<code>").unwrap();
+    assert_eq!(body.matches("<code").count(), 1, "{body}");
+    let password = body.find("<code").unwrap();
     assert!(password < body.find(".mobileconfig").unwrap());
     assert!(password < body.find(".p12").unwrap());
     assert!(body.contains("type the password when it asks"), "{body}");
@@ -406,5 +406,26 @@ fn the_root_says_what_the_site_is() {
         let reply = page.answer("GET", path, "x", NOW);
         assert_eq!(reply.status, 200, "{path:?}");
         assert!(text(&reply).contains("Invites are collected here"));
+    }
+}
+
+/// The download for the device that opened the page comes first: the profile for an iPhone, iPad
+/// or a Mac (which an iPad says it is), the `.p12` for everything else.
+#[test]
+fn the_device_s_own_download_comes_first() {
+    for (client, profile_first) in [
+        ("203.0.113.7, iPhone", true),
+        ("203.0.113.7, iPad", true),
+        ("203.0.113.7, Mac", true),
+        ("203.0.113.7, Android", false),
+        ("203.0.113.7, Windows", false),
+        ("203.0.113.7, an unknown device", false),
+    ] {
+        let dir = crate::test_dir();
+        let (_ca, mut page, token) = page_with_invite(dir.path());
+        let body = text(&page.answer("POST", &format!("/i/{token}"), client, NOW));
+        let profile = body.find(".mobileconfig").unwrap();
+        let p12 = body.find(".p12").unwrap();
+        assert_eq!(profile < p12, profile_first, "{client}:\n{body}");
     }
 }

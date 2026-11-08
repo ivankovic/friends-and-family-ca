@@ -74,6 +74,14 @@ impl Session {
         self.quit || matches!(&self.stage, Stage::Ready(app) if app.should_quit())
     }
 
+    /// What is waiting to go on the terminal's clipboard: see [`App::take_clipboard`].
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        match &mut self.stage {
+            Stage::Ready(app) => app.take_clipboard(),
+            _ => None,
+        }
+    }
+
     pub fn reload(&mut self, now: OffsetDateTime) {
         self.now = now;
         if let Stage::Ready(app) = &mut self.stage {

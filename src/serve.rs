@@ -106,7 +106,7 @@ impl Page {
                 };
                 match invite::collect(&self.folder, token, now, client) {
                     Ok(payload) => {
-                        let body = installation(&id, &payload);
+                        let body = installation(&id, &payload, is_apple(client));
                         let title = payload.holder.clone();
                         let until = now.checked_add(DOWNLOAD_WINDOW).unwrap_or(now);
                         self.downloads.insert(id, (payload, until));
@@ -354,27 +354,49 @@ fn invitation(token: &str, payload: &Payload) -> String {
     )
 }
 
-fn installation(id: &str, payload: &Payload) -> String {
-    format!(
-        r#"<h1>{holder}</h1>
-<p>The certificate's password: <code>{password}</code></p>
-<p class="small">Installing it asks for this password.</p>
-<h2>iPhone or iPad</h2>
+/// Whether `client`, as [`handle`] writes it ("203.0.113.7, iPhone"), is an Apple device, which
+/// installs the profile; anything else installs the `.p12`. iPadOS calls itself a Mac.
+fn is_apple(client: &str) -> bool {
+    matches!(client.rsplit(", ").next(), Some("iPhone" | "iPad" | "Mac"))
+}
+
+/// The installation page: the password, then both downloads, the one for the device that
+/// opened the page first.
+fn installation(id: &str, payload: &Payload, apple: bool) -> String {
+    let profile = format!(
+        r#"<h2>iPhone or iPad</h2>
 <p><a class="button" href="/d/{id}/{stem}.mobileconfig">Download the profile</a></p>
 <ol>
 <li>Allow the download.</li>
 <li>Open <b>Settings</b>, tap <b>Profile Downloaded</b> near the top, then <b>Install</b>, and type the password when it asks.</li>
 </ol>
-<h2>Android, Boox, a computer</h2>
+"#,
+        stem = escape(&payload.stem),
+    );
+    let p12 = format!(
+        r#"<h2>Android, Boox, a computer</h2>
 <p><a class="button" href="/d/{id}/{stem}.p12">Download the certificate</a></p>
 <ol>
 <li>Android: open the file, or go to <b>Settings › Security › Encryption &amp; credentials › Install a certificate › VPN &amp; app user certificate</b>, and type the password.</li>
 <li>Firefox: <b>Settings › Privacy &amp; Security › View Certificates › Your Certificates › Import</b>.</li>
+<li>Chrome, Edge: <b>Settings › Privacy and security › Security › Manage certificates</b>, then import the file into <b>Your certificates</b> (on Windows and macOS, opening the file does the same).</li>
 <li>Windows, macOS: open the file and type the password.</li>
 </ol>
-<p class="small">These links work for ten minutes. Keep this page open until the certificate is installed.</p>"#,
-        holder = escape(&payload.holder),
+"#,
         stem = escape(&payload.stem),
+    );
+    let (first, second) = if apple {
+        (profile, p12)
+    } else {
+        (p12, profile)
+    };
+    format!(
+        r#"<h1>{holder}</h1>
+<p>The certificate's password:</p>
+<p class="password"><code>{password}</code></p>
+<p class="small">Installing it asks for this password. Tap it to select all of it, to copy.</p>
+{first}{second}<p class="small">These links work for ten minutes. Keep this page open until the certificate is installed.</p>"#,
+        holder = escape(&payload.holder),
         password = escape(&payload.password),
     )
 }
@@ -390,6 +412,7 @@ h1 {{ font-size: 1.4em; }} h2 {{ font-size: 1.1em; margin-top: 2em; }}
 button, a.button {{ display: inline-block; font: inherit; padding: .7em 1.4em; border-radius: .5em; border: 0; background: #1f5fbf; color: #fff; text-decoration: none; }}
 code {{ font-size: 1.2em; background: #eee; padding: .2em .4em; border-radius: .3em; }}
 .small {{ color: #666; font-size: .9em; }}
+.password code {{ font-size: 1.6em; letter-spacing: .08em; user-select: all; -webkit-user-select: all; word-break: break-all; }}
 @media (prefers-color-scheme: dark) {{ body {{ background: #161616; color: #ddd; }} code {{ background: #333; }} .small {{ color: #999; }} }}
 </style></head>
 <body>
