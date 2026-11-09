@@ -67,7 +67,7 @@ path = "src/main.rs"
 rustls-pki-types = "1"
 rustls-webpki = { version = "0.103", features = ["ring"] }
 tempfile = "3"
-vt100 = "0.16.2"
+vt100 = "0.18.1"
 
 # Dependencies optimized even in debug builds: key generation and signing in an unoptimized `ring`
 # make every test that issues a certificate several times slower, and nobody steps through them.

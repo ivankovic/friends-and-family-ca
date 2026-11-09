@@ -81,7 +81,11 @@ impl Terminal {
             child,
             chunks,
             output: Vec::new(),
-            screen: vt100::Parser::new(ROWS, COLUMNS, 0),
+            screen: vt100::Parser::new(
+                std::num::NonZeroU16::new(ROWS).expect("a screen has rows"),
+                std::num::NonZeroU16::new(COLUMNS).expect("a screen has columns"),
+                0,
+            ),
         }
     }
 

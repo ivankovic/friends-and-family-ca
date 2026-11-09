@@ -1821,6 +1821,11 @@ Used by:
 - clap_builder 4.6.7 (https://github.com/clap-rs/clap)
 - clap_derive 4.6.7 (https://github.com/clap-rs/clap)
 - clap_lex 1.1.1 (https://github.com/clap-rs/clap)
+- serde_spanned 1.1.3 (https://github.com/toml-rs/toml)
+- toml 1.1.8+spec-1.1.0 (https://github.com/toml-rs/toml)
+- toml_datetime 1.1.3+spec-1.1.0 (https://github.com/toml-rs/toml)
+- toml_parser 1.1.5+spec-1.1.0 (https://github.com/toml-rs/toml)
+- toml_writer 1.2.0+spec-1.1.0 (https://github.com/toml-rs/toml)
 
 ```
                                  Apache License
@@ -2462,11 +2467,6 @@ Used by:
 - colorchoice 1.0.5 (https://github.com/rust-cli/anstyle.git)
 - is_terminal_polyfill 1.70.2 (https://github.com/polyfill-rs/is_terminal_polyfill)
 - once_cell_polyfill 1.70.2 (https://github.com/polyfill-rs/once_cell_polyfill)
-- serde_spanned 1.1.1 (https://github.com/toml-rs/toml)
-- toml 1.1.6+spec-1.1.0 (https://github.com/toml-rs/toml)
-- toml_datetime 1.1.1+spec-1.1.0 (https://github.com/toml-rs/toml)
-- toml_parser 1.1.3+spec-1.1.0 (https://github.com/toml-rs/toml)
-- toml_writer 1.1.2+spec-1.1.0 (https://github.com/toml-rs/toml)
 
 ```
                                  Apache License
@@ -3780,7 +3780,7 @@ Used by:
 - ident_case 1.0.1 (https://github.com/TedDriggs/ident_case)
 - indoc 2.0.7 (https://github.com/dtolnay/indoc)
 - itoa 1.0.18 (https://github.com/dtolnay/itoa)
-- libc 0.2.190 (https://github.com/rust-lang/libc)
+- libc 0.2.191 (https://github.com/rust-lang/libc)
 - litrs 1.0.0 (https://github.com/LukasKalbertodt/litrs)
 - num-conv 0.2.2 (https://github.com/jhpratt/num-conv)
 - proc-macro2 1.0.107 (https://github.com/dtolnay/proc-macro2)
@@ -3792,7 +3792,7 @@ Used by:
 - serde 1.0.229 (https://github.com/serde-rs/serde)
 - serde_core 1.0.229 (https://github.com/serde-rs/serde)
 - serde_derive 1.0.229 (https://github.com/serde-rs/serde)
-- serde_json 1.0.151 (https://github.com/serde-rs/json)
+- serde_json 1.0.154 (https://github.com/serde-rs/json)
 - syn 2.0.119 (https://github.com/dtolnay/syn)
 - syn 3.0.6 (https://github.com/dtolnay/syn)
 - thiserror-impl 2.0.21 (https://github.com/dtolnay/thiserror)
