@@ -25,7 +25,7 @@
 
 # The build image is pinned by digest, which dependabot moves; it has musl-dev already, so the
 # build fetches nothing but the crates Cargo.lock names, checked against their hashes.
-FROM docker.io/library/rust:1-alpine@sha256:a96ea6d18d4062e38f16cfbadd8b4541d622f2527dd0a5eca1fb36d301da4e88 AS build
+FROM docker.io/library/rust:1-alpine@sha256:44819b27be4c97b0e4d7203bd2e02c4820f97700211b6a37fb4c246a2de59383 AS build
 WORKDIR /src
 COPY . .
 # musl links statically: the binary needs nothing from the image it runs in.
