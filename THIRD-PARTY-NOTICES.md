@@ -1822,7 +1822,7 @@ Used by:
 - clap_derive 4.6.7 (https://github.com/clap-rs/clap)
 - clap_lex 1.1.1 (https://github.com/clap-rs/clap)
 - serde_spanned 1.1.3 (https://github.com/toml-rs/toml)
-- toml 1.1.8+spec-1.1.0 (https://github.com/toml-rs/toml)
+- toml 1.2.1+spec-1.1.0 (https://github.com/toml-rs/toml)
 - toml_datetime 1.1.3+spec-1.1.0 (https://github.com/toml-rs/toml)
 - toml_parser 1.1.5+spec-1.1.0 (https://github.com/toml-rs/toml)
 - toml_writer 1.2.0+spec-1.1.0 (https://github.com/toml-rs/toml)
