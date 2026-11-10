@@ -40,6 +40,8 @@ pub struct Row {
 pub struct UsersTab {
     rows: Vec<Row>,
     selected: usize,
+    /// How far the list is scrolled, kept between draws.
+    list: ListState,
 }
 
 impl UsersTab {
@@ -97,8 +99,7 @@ impl Component for UsersTab {
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let about: Vec<Line> = vec![
             Line::default(),
-            "  Logins nginx checks itself, on a site whose HTTP login is on (the Nginx tab, l)."
-                .into(),
+            "  Logins nginx checks itself, on sites whose HTTP login is on (Nginx tab, l).".into(),
             "  A site that passes logins through checks them itself: its users are its own."
                 .dim()
                 .into(),
@@ -133,13 +134,14 @@ impl Component for UsersTab {
                 })
                 .collect()
         };
-        let selected = (!self.rows.is_empty()).then_some(self.selected);
+        self.list
+            .select((!self.rows.is_empty()).then_some(self.selected));
         frame.render_stateful_widget(
             List::new(items)
                 .block(block)
                 .highlight_style(Style::new().reversed()),
             list,
-            &mut ListState::default().with_selected(selected),
+            &mut self.list,
         );
     }
 }

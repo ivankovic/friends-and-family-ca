@@ -16,6 +16,9 @@
  */
 //! The Nginx tab: how ffca reaches nginx, the enrollment site, and every site's two gates: its
 //! client-certificate mode and its HTTP login.
+//!
+//! What is unusual about a site is a word or two in its row, and a sentence under the list while
+//! the site is selected: the row has no room for the sentence on 80 columns.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
@@ -25,7 +28,7 @@ use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::{Component, Hint, step};
+use super::{Component, Hint, fit, hang, step};
 use crate::config;
 use crate::nginx::{Auth, Mode, Site, Survey};
 use crate::tui::action::Action;
@@ -39,6 +42,8 @@ pub struct NginxTab {
     dns: Option<Result<String, String>>,
     survey: Option<Result<Survey, String>>,
     selected: usize,
+    /// How far the list is scrolled, kept between draws.
+    list: ListState,
 }
 
 impl NginxTab {
@@ -151,6 +156,45 @@ impl NginxTab {
         lines
     }
 
+    /// What is unusual about a site: a word or two for its row, and the sentence that explains
+    /// them.
+    fn notes(&self, site: &Site) -> Vec<(&'static str, String)> {
+        let name = site.name();
+        let mut notes = Vec::new();
+        if self.is_enrollment(site) {
+            notes.push((
+                "enrollment site",
+                format!(
+                    "{name} is the enrollment site: it never asks for a certificate or a login."
+                ),
+            ));
+        } else if site.mode != Mode::Off && !site.uses_ca {
+            notes.push((
+                "another CA",
+                format!("{name} asks for a certificate of another CA, not this one's."),
+            ));
+        }
+        if site.any_issuer {
+            notes.push((
+                "any issuer",
+                format!("{name} has optional_no_ca: a certificate of any issuer gets in."),
+            ));
+        }
+        if site.foreign_auth {
+            notes.push((
+                "own login",
+                format!("{name} has a login that ffca did not write."),
+            ));
+        }
+        if site.duplicate {
+            notes.push((
+                "duplicate",
+                format!("Another server block has the name {name}: nginx ignores one of them."),
+            ));
+        }
+        notes
+    }
+
     /// A site's row in a list `width` wide: its file's name is left out when the row would not
     /// otherwise have room for its notes, which matter more.
     fn item(&self, site: &Site, width: usize) -> ListItem<'static> {
@@ -159,35 +203,29 @@ impl NginxTab {
             Mode::Optional => ("◐", Color::Yellow),
             Mode::Required => ("●", Color::Green),
         };
-        let mut note = String::new();
-        if self.is_enrollment(site) {
-            note.push_str("  enrollment site: never asks");
-        } else if site.mode != Mode::Off && !site.uses_ca {
-            note.push_str("  another CA's certificate");
-        }
-        if site.any_issuer {
-            note.push_str("  optional_no_ca: any issuer gets in");
-        }
-        if site.foreign_auth {
-            note.push_str("  a login ffca did not write");
-        }
-        if site.duplicate {
-            note.push_str("  another block has this name: nginx ignores one");
-        }
+        let note: String = self
+            .notes(site)
+            .iter()
+            .map(|(word, _)| format!("  {word}"))
+            .collect();
         let name_width = self
             .sites()
             .iter()
             .map(|s| s.name().chars().count() + 2)
             .max()
             .unwrap_or(0)
-            .min(34);
+            .min(if width >= 100 { 34 } else { 30 });
         let file = if width >= 100 {
             format!("{:<22}", site.file_name())
         } else {
             String::new()
         };
         ListItem::new(Line::from(vec![
-            format!(" {:<name_width$}", site.name()).into(),
+            format!(
+                " {:<name_width$}",
+                fit(site.name(), name_width.saturating_sub(1))
+            )
+            .into(),
             file.dim(),
             Span::styled(symbol, Style::new().fg(color)),
             format!(" {:<10}", site.mode.to_string()).into(),
@@ -222,13 +260,28 @@ impl Component for NginxTab {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let summary = self.summary();
-        let [top, sites] = Layout::vertical([
+        let columns = usize::from(area.width);
+        // A long path continues under its start, beside the labels.
+        let summary: Vec<Line> = self
+            .summary()
+            .into_iter()
+            .flat_map(|line| hang(line, 18, columns))
+            .collect();
+        let notes: Vec<Line> = self
+            .selected_site()
+            .map(|site| self.notes(site))
+            .unwrap_or_default()
+            .into_iter()
+            .flat_map(|(_, sentence)| hang(format!(" {sentence}").dim().into(), 1, columns))
+            .collect();
+        let [top, sites, below] = Layout::vertical([
             Constraint::Length(summary.len() as u16 + 1),
             Constraint::Min(3),
+            Constraint::Length(notes.len() as u16),
         ])
         .areas(area);
         frame.render_widget(Paragraph::new(summary), top);
+        frame.render_widget(Paragraph::new(notes), below);
         if self.settings.is_none() {
             return;
         }
@@ -256,12 +309,9 @@ impl Component for NginxTab {
                 let list = List::new(items)
                     .block(block)
                     .highlight_style(Style::new().reversed());
-                let selected = (!survey.sites.is_empty()).then_some(self.selected);
-                frame.render_stateful_widget(
-                    list,
-                    sites,
-                    &mut ListState::default().with_selected(selected),
-                );
+                self.list
+                    .select((!survey.sites.is_empty()).then_some(self.selected));
+                frame.render_stateful_widget(list, sites, &mut self.list);
             }
             Some(Err(error)) => {
                 let text = Paragraph::new(Line::from(format!(" {error}").fg(Color::Red)))

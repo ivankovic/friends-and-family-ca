@@ -20,18 +20,19 @@ use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 
-use super::{Component, Hint};
+use super::{Component, Hint, hang_all};
 use crate::tui::action::Action;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct CaInfo {
-    lines: Vec<Line<'static>>,
+    /// Each line with the indent of the rows it wraps onto: a path continues under its start.
+    lines: Vec<(usize, Line<'static>)>,
 }
 
 impl CaInfo {
-    pub fn update(&mut self, lines: Vec<Line<'static>>) {
+    pub fn update(&mut self, lines: Vec<(usize, Line<'static>)>) {
         self.lines = lines;
     }
 
@@ -54,7 +55,7 @@ impl Component for CaInfo {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let mut lines = vec![Line::default()];
-        lines.extend(self.lines.iter().cloned());
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
+        lines.extend(hang_all(self.lines.clone(), area.width.into()));
+        frame.render_widget(Paragraph::new(lines), area);
     }
 }

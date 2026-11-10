@@ -18,7 +18,12 @@
 //!
 //! Every dialog fits the screen it is drawn on, down to the 80 by 24 of a plain SSH session: one
 //! taller than that scrolls ([`Scroll`]) rather than running off the bottom, and its row of key
-//! hints has a line of its own, never drawn over its text.
+//! hints has a line of its own, never drawn over its text. A dialog that would leave only a sliver
+//! of the screen beside it takes the whole width instead ([`dialog_width`]): a few columns of the
+//! tab behind it read as noise.
+//!
+//! Text that wraps keeps its column: [`hang`] wraps a line by words and indents the rows that
+//! follow, so that a description beside a key or an option stays beside it.
 
 pub mod auth_dialog;
 pub mod ca_info;
@@ -65,19 +70,24 @@ pub fn hint_line(hints: &[Hint]) -> Line<'static> {
     spans.into()
 }
 
+/// How many columns [`hint_line`] takes for `hints`.
+pub fn hints_width(hints: &[Hint]) -> usize {
+    let texts: usize = hints
+        .iter()
+        .map(|(key, what)| key.chars().count() + 1 + what.chars().count())
+        .sum();
+    texts + 2 * hints.len().saturating_sub(1)
+}
+
 /// Hints as one line no wider than `width`: the tab's own hints as far as they fit, then
-/// `always`, which every tab shares and are never dropped.
+/// `always`, which are never dropped.
 pub fn fitted_hint_line(hints: &[Hint], always: &[Hint], width: usize) -> Line<'static> {
-    let width_of = |hints: &[Hint]| -> usize {
-        hints
-            .iter()
-            .map(|(key, what)| key.chars().count() + 1 + what.chars().count() + 2)
-            .sum()
-    };
-    let room = width.saturating_sub(width_of(always));
     let mut shown: Vec<Hint> = Vec::new();
     for hint in hints {
-        if width_of(&shown) + width_of(&[*hint]) > room {
+        let mut with = shown.clone();
+        with.push(*hint);
+        with.extend_from_slice(always);
+        if hints_width(&with) > width {
             break;
         }
         shown.push(*hint);
@@ -86,7 +96,7 @@ pub fn fitted_hint_line(hints: &[Hint], always: &[Hint], width: usize) -> Line<'
     hint_line(&shown)
 }
 
-/// How far a dialog's text is scrolled, for a dialog that may be taller than the screen.
+/// How far a text is scrolled: a dialog's, or a pane's, that may be taller than its room.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Scroll {
     offset: u16,
@@ -112,6 +122,48 @@ impl Scroll {
         self.offset = offset.min(self.max);
         true
     }
+
+    /// Takes in what is drawn - `rows` of text, `page` of them showing - and returns how far the
+    /// text is scrolled, which is never past its end.
+    pub fn fit(&mut self, rows: u16, page: u16) -> u16 {
+        self.page = page;
+        self.max = rows.saturating_sub(page);
+        self.offset = self.offset.min(self.max);
+        self.offset
+    }
+
+    /// Back to the top: for a text that is another one now.
+    pub fn reset(&mut self) {
+        self.offset = 0;
+    }
+
+    /// What to say where the text is cut, if it is: which way there is more, and the keys.
+    pub fn more(&self) -> Option<&'static str> {
+        (self.max > 0).then_some(match (self.offset > 0, self.offset < self.max) {
+            (true, true) => "↑ ↓ more · PgUp PgDn",
+            (false, _) => "↓ more · PgDn",
+            (true, false) => "↑ more · PgUp",
+        })
+    }
+}
+
+/// A dialog is as wide as it asks to be, unless fewer than this many columns of its area would be
+/// left beside it, both sides together: then it takes them all.
+const SLIVER: u16 = 10;
+
+/// How wide a dialog that asks for `width` is drawn in `area`.
+pub fn dialog_width(width: u16, area: Rect) -> u16 {
+    if area.width < width.saturating_add(SLIVER) {
+        area.width
+    } else {
+        width
+    }
+}
+
+/// How many columns of text a dialog that asks for `width` has in `area`: inside its borders and
+/// its padding.
+pub fn text_width(width: u16, area: Rect) -> usize {
+    usize::from(dialog_width(width, area).saturating_sub(4))
 }
 
 /// A dialog of `lines` with `hints` under them: `width` wide and as tall as its wrapped text, but
@@ -127,25 +179,17 @@ pub fn text_dialog(
     scroll: &mut Scroll,
 ) {
     // Borders and padding take two columns each side; borders, the gap and the hints, four rows.
-    let width = width.min(area.width);
     let paragraph = Paragraph::new(lines).wrap(Wrap { trim: false });
-    let rows = paragraph.line_count(width.saturating_sub(4)) as u16;
+    let rows = paragraph.line_count(text_width(width, area) as u16) as u16;
     let inner = dialog(frame, area, title, width, rows.saturating_add(4));
     let page = inner.height.saturating_sub(2);
-    scroll.page = page;
-    scroll.max = rows.saturating_sub(page);
-    scroll.offset = scroll.offset.min(scroll.max);
+    let offset = scroll.fit(rows, page);
     let text = Rect {
         height: page,
         ..inner
     };
-    frame.render_widget(paragraph.scroll((scroll.offset, 0)), text);
-    if scroll.max > 0 {
-        let more = match (scroll.offset > 0, scroll.offset < scroll.max) {
-            (true, true) => "↑ ↓ more · PgUp PgDn",
-            (false, _) => "↓ more · PgDn",
-            (true, false) => "↑ more · PgUp",
-        };
+    frame.render_widget(paragraph.scroll((offset, 0)), text);
+    if let Some(more) = scroll.more() {
         let gap = Rect {
             y: inner.bottom().saturating_sub(2),
             height: 1,
@@ -164,7 +208,7 @@ pub fn text_dialog(
 /// Clears and frames a dialog of `width` by `height`, centred in `area`; returns its inside,
 /// padded by a column on each side so that wrapped text keeps its margin.
 pub fn dialog(frame: &mut Frame, area: Rect, title: String, width: u16, height: u16) -> Rect {
-    let [area] = Layout::horizontal([Constraint::Length(width.min(area.width))])
+    let [area] = Layout::horizontal([Constraint::Length(dialog_width(width, area))])
         .flex(Flex::Center)
         .areas(area);
     let [area] = Layout::vertical([Constraint::Length(height.min(area.height))])
@@ -188,5 +232,153 @@ pub fn step(selected: usize, down: bool, len: usize) -> usize {
         (selected + 1).min(len.saturating_sub(1))
     } else {
         selected.saturating_sub(1)
+    }
+}
+
+/// `text`, cut to `width` characters with an ellipsis if it is longer.
+pub fn fit(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
+    cut.push('…');
+    cut
+}
+
+/// A character with its style: what [`hang`] moves between rows.
+type Cell = (char, Style);
+
+fn columns(cells: &[Cell]) -> usize {
+    cells
+        .iter()
+        .map(|(c, _)| Span::raw(c.to_string()).width())
+        .sum()
+}
+
+/// `line` wrapped by words to `width` columns, every row after the first indented by `indent`:
+/// "  optional  asked for; without one you get in" continues under "asked", not at the margin.
+/// Styles are kept; a word wider than a row is cut where the row ends.
+pub fn hang(line: Line<'static>, indent: usize, width: usize) -> Vec<Line<'static>> {
+    if line.width() <= width || width == 0 {
+        return vec![line];
+    }
+    let indent = if indent < width { indent } else { 0 };
+    let cells: Vec<Cell> = line
+        .spans
+        .iter()
+        .flat_map(|span| span.content.chars().map(|c| (c, span.style)))
+        .collect();
+    // Runs of spaces and runs of anything else, in turn.
+    let mut tokens: Vec<&[Cell]> = Vec::new();
+    let mut start = 0;
+    for i in 1..=cells.len() {
+        if i == cells.len() || (cells[i].0 == ' ') != (cells[start].0 == ' ') {
+            tokens.push(&cells[start..i]);
+            start = i;
+        }
+    }
+    let margin = || vec![(' ', Style::default()); indent];
+    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let mut row: Vec<Cell> = Vec::new();
+    let mut gap: &[Cell] = &[];
+    // Whether the row holds a word yet, beyond its margin.
+    let mut filled = false;
+    for token in tokens {
+        if token[0].0 == ' ' {
+            // The spaces a row would begin with after a break are the break itself.
+            if filled || rows.is_empty() {
+                gap = token;
+            }
+            continue;
+        }
+        if columns(&row) + columns(gap) + columns(token) <= width {
+            row.extend_from_slice(gap);
+            row.extend_from_slice(token);
+        } else {
+            if filled {
+                rows.push(std::mem::replace(&mut row, margin()));
+            } else {
+                row.extend_from_slice(gap);
+            }
+            for cell in token {
+                if columns(&row) + columns(&[*cell]) > width {
+                    rows.push(std::mem::replace(&mut row, margin()));
+                }
+                row.push(*cell);
+            }
+        }
+        gap = &[];
+        filled = true;
+    }
+    rows.push(row);
+    rows.into_iter()
+        .map(|row| {
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut text = String::new();
+            let mut style = Style::default();
+            for (c, cell_style) in row {
+                if cell_style != style && !text.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut text), style));
+                }
+                style = cell_style;
+                text.push(c);
+            }
+            spans.push(Span::styled(text, style));
+            Line::from(spans).style(line.style)
+        })
+        .collect()
+}
+
+/// Each of `lines` wrapped by [`hang`] with its own indent, to `width` columns.
+pub fn hang_all(lines: Vec<(usize, Line<'static>)>, width: usize) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .flat_map(|(indent, line)| hang(line, indent, width))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn texts(lines: &[Line]) -> Vec<String> {
+        lines.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn a_wrapped_line_continues_under_its_text() {
+        let line: Line = vec![
+            "  optional  ".bold(),
+            "asked for; a broken one is refused".dim(),
+        ]
+        .into();
+        let rows = hang(line, 12, 30);
+        assert_eq!(
+            texts(&rows),
+            [
+                "  optional  asked for; a",
+                "            broken one is",
+                "            refused"
+            ]
+        );
+        assert_eq!(rows[1].spans.last().unwrap().style, Style::new().dim());
+    }
+
+    #[test]
+    fn a_line_that_fits_is_left_alone() {
+        let line = Line::from("short");
+        assert_eq!(hang(line.clone(), 4, 10), vec![line]);
+    }
+
+    #[test]
+    fn a_word_wider_than_a_row_is_cut_at_its_end() {
+        let rows = hang(Line::from("see /a/very/long/path now"), 2, 10);
+        assert_eq!(texts(&rows), ["see", "  /a/very/", "  long/pat", "  h now"]);
+    }
+
+    #[test]
+    fn hints_drop_from_the_end_and_always_stay() {
+        let line = fitted_hint_line(&[("a", "one"), ("b", "two")], &[("q", "quit")], 14);
+        assert_eq!(line.to_string(), "a one  q quit");
     }
 }

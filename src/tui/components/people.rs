@@ -20,6 +20,10 @@
 //! `/` narrows the tree to the names that contain what is typed: a person stays with all their
 //! devices when their own name matches, and with the matching ones otherwise. While the filter
 //! is typed, every key is text - q and Tab too - until Enter keeps it or Esc drops it.
+//!
+//! The tree is as wide as its longest row, within limits, and the details have the rest: on 80
+//! columns a device's name is whole more often than a fixed share of the screen would leave it.
+//! The details scroll, with PgUp and PgDn, when a device has more certificates than rows.
 
 use std::collections::HashMap;
 
@@ -32,7 +36,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap};
 use time::{Duration, OffsetDateTime};
 
-use super::{Component, Hint};
+use super::{Component, Hint, Scroll, fit};
 use crate::ledger::{Certificate, Invite, InviteState, KeyHolder, Ledger, Serial, Status};
 use crate::tui::action::{Action, Selection};
 use crate::tui::date;
@@ -58,6 +62,12 @@ pub struct People {
     /// What the tree is narrowed to, and whether it is being typed.
     filter: Option<String>,
     typing: bool,
+    /// How far the tree is scrolled: kept between draws, so that the rows around the selection
+    /// stay where they are while it moves among them.
+    list: ListState,
+    /// How far the details are scrolled, and whose details they are.
+    details_scroll: Scroll,
+    detailed: Option<Selection>,
 }
 
 impl Default for People {
@@ -70,6 +80,9 @@ impl Default for People {
             selected: 0,
             filter: None,
             typing: false,
+            list: ListState::default(),
+            details_scroll: Scroll::default(),
+            detailed: None,
         }
     }
 }
@@ -184,7 +197,7 @@ impl People {
         }
         hints.push(("a", "new agent"));
         match self.rows.get(self.selected) {
-            Some(Row::Person(_)) => hints.extend([("r", "revoke all devices"), ("R", "rename")]),
+            Some(Row::Person(_)) => hints.extend([("r", "revoke all"), ("R", "rename")]),
             Some(Row::Device(..) | Row::Agent(_)) => {
                 if self.selected_holder().is_some_and(|h| h.retired.is_none()) {
                     hints.extend([("u", "renew"), ("r", "revoke")]);
@@ -194,7 +207,7 @@ impl People {
             _ => {}
         }
         hints.push(if self.filter.is_some() {
-            ("Esc", "drop filter")
+            ("Esc", "clear")
         } else {
             ("/", "filter")
         });
@@ -229,10 +242,10 @@ impl People {
     fn item(&self, row: Row, width: usize) -> ListItem<'static> {
         let line: Line = match row {
             Row::Person(p) => {
-                let name = fit(&self.ledger.people[p].name, width.saturating_sub(2));
-                vec!["▾ ".dim(), name.bold()].into()
+                let name = fit(&self.ledger.people[p].name, width.saturating_sub(1));
+                vec![" ".into(), name.bold()].into()
             }
-            Row::AgentsHeading => vec!["▾ ".dim(), "Agents".bold().italic()].into(),
+            Row::AgentsHeading => vec![" ".into(), "Agents".bold().italic()].into(),
             Row::Device(p, d) => self.holder_line(&self.ledger.people[p].devices[d], width),
             Row::Agent(a) => self.holder_line(&self.ledger.agents[a], width),
         };
@@ -245,12 +258,9 @@ impl People {
         devices.chain(&self.ledger.agents)
     }
 
-    /// How wide a holder's name is in a list `width` wide: as wide as the longest (and at least
-    /// 14, so that the states line up as a column), less if that would push the states out.
-    fn name_width(&self, width: usize) -> usize {
-        let longest = self.holders().map(|h| h.name.chars().count()).max();
-        let label = self
-            .holders()
+    /// The longest state any holder is in, in characters: "invite open".
+    fn label_width(&self) -> usize {
+        self.holders()
             .map(|h| {
                 holder_state(h, &self.ledger.invites, self.now)
                     .1
@@ -258,7 +268,31 @@ impl People {
                     .count()
             })
             .max()
-            .unwrap_or(0);
+            .unwrap_or(0)
+    }
+
+    /// How wide the tree is, borders included, on a tab `width` wide: as wide as its longest
+    /// row, within limits. The details keep the 48 columns their longest line needs - a serial
+    /// and "valid until 30 Sep 2028" - unless that leaves the tree under two fifths of the tab.
+    fn tree_width(&self, width: u16) -> u16 {
+        let person = self
+            .ledger
+            .people
+            .iter()
+            .map(|p| 1 + p.name.chars().count());
+        let holder = self
+            .holders()
+            .map(|h| 4 + h.name.chars().count().max(14) + 1 + self.label_width());
+        let content = person.chain(holder).max().unwrap_or(0) as u16;
+        let most = width.saturating_sub(48).max(width * 2 / 5);
+        (content + 2).clamp(30, 48).min(most)
+    }
+
+    /// How wide a holder's name is in a list `width` wide: as wide as the longest (and at least
+    /// 14, so that the states line up as a column), less if that would push the states out.
+    fn name_width(&self, width: usize) -> usize {
+        let longest = self.holders().map(|h| h.name.chars().count()).max();
+        let label = self.label_width();
         // "  ● " before the name, a space after it.
         let room = width.saturating_sub(5 + label);
         longest.unwrap_or(0).max(14).min(room).max(6)
@@ -407,7 +441,7 @@ impl Component for People {
                 });
             }
             KeyCode::Char('a') => return Some(Action::AskNewAgent),
-            KeyCode::Char('u') if active => return selection.map(Action::Issue),
+            KeyCode::Char('u') if active => return selection.map(Action::AskRenew),
             KeyCode::Char('r') => match &selection {
                 Some(Selection::Person(_)) => return selection.map(Action::AskRevoke),
                 Some(_) if active => return selection.map(Action::AskRevoke),
@@ -418,7 +452,9 @@ impl Component for People {
                 self.typing = true;
                 self.filter.get_or_insert_with(String::new);
             }
-            _ => {}
+            code => {
+                self.details_scroll.handle(code, false);
+            }
         }
         None
     }
@@ -441,8 +477,11 @@ impl Component for People {
             frame.render_widget(Paragraph::new(text), area);
             return;
         }
-        let [left, right] =
-            Layout::horizontal([Constraint::Percentage(40), Constraint::Min(30)]).areas(area);
+        let [left, right] = Layout::horizontal([
+            Constraint::Length(self.tree_width(area.width)),
+            Constraint::Min(0),
+        ])
+        .areas(area);
         let block = |title: String| {
             Block::default()
                 .title(title)
@@ -463,23 +502,40 @@ impl Component for People {
         let list = List::new(items)
             .block(block(title))
             .highlight_style(Style::new().reversed());
-        let mut state = ListState::default().with_selected(Some(self.selected));
-        frame.render_stateful_widget(list, left, &mut state);
-        let details = Paragraph::new(self.details())
-            .block(block(String::new()).padding(ratatui::widgets::Padding::horizontal(1)))
-            .wrap(Wrap { trim: false });
-        frame.render_widget(details, right);
-    }
-}
+        self.list.select(Some(self.selected));
+        frame.render_stateful_widget(list, left, &mut self.list);
 
-/// `text`, cut to `width` characters with an ellipsis if it is longer.
-fn fit(text: &str, width: usize) -> String {
-    if text.chars().count() <= width {
-        return text.to_owned();
+        let selection = self.selection();
+        if selection != self.detailed {
+            self.detailed = selection;
+            self.details_scroll.reset();
+        }
+        let frame_of = block(String::new()).padding(ratatui::widgets::Padding::horizontal(1));
+        let inner = frame_of.inner(right);
+        frame.render_widget(frame_of, right);
+        let details = Paragraph::new(self.details()).wrap(Wrap { trim: false });
+        let rows = details.line_count(inner.width) as u16;
+        // Details taller than the pane give their last row to the line that says so.
+        let page = if rows > inner.height {
+            inner.height.saturating_sub(1)
+        } else {
+            inner.height
+        };
+        let offset = self.details_scroll.fit(rows, page);
+        let text = Rect {
+            height: page,
+            ..inner
+        };
+        frame.render_widget(details.scroll((offset, 0)), text);
+        if let Some(more) = self.details_scroll.more() {
+            let last = Rect {
+                y: inner.bottom().saturating_sub(1),
+                height: 1,
+                ..inner
+            };
+            frame.render_widget(Paragraph::new(Line::from(more.dim()).right_aligned()), last);
+        }
     }
-    let mut cut: String = text.chars().take(width.saturating_sub(1)).collect();
-    cut.push('…');
-    cut
 }
 
 /// The tree's rows, narrowed to names that contain `filter`, ignoring case.
@@ -523,11 +579,7 @@ fn holder_state(
         }
         let left = current.not_after - now;
         return if left < EXPIRY_WARNING {
-            (
-                "◐",
-                format!("expires in {} d", left.whole_days()),
-                Color::Yellow,
-            )
+            ("◐", format!("{} d left", left.whole_days()), Color::Yellow)
         } else {
             (
                 "●",
@@ -539,13 +591,22 @@ fn holder_state(
     match holder.certificates.iter().max_by_key(|c| c.not_before) {
         Some(last) if last.revoked.is_some() => ("✕", "revoked".into(), Color::Red),
         Some(_) => ("○", "expired".into(), Color::DarkGray),
-        None => ("○", "no certificate".into(), Color::DarkGray),
+        None => ("○", "none".into(), Color::DarkGray),
     }
 }
 
 /// The invite that handed `serial` over, if it was handed over by one.
 pub fn invite_of(invites: &[Invite], serial: Serial) -> Option<&Invite> {
     invites.iter().find(|i| i.serial == serial)
+}
+
+/// Where an invite was collected from, the kind of device first: the page writes
+/// "203.0.113.7, iPhone", and it is the device that tells whether the right person has it.
+pub fn collector(by: &str) -> String {
+    match by.rsplit_once(", ") {
+        Some((address, device)) => format!("{device} at {address}"),
+        None => by.to_owned(),
+    }
 }
 
 /// How an invite stands, for the line under its certificate.
@@ -557,7 +618,7 @@ fn invite_state(invite: &Invite) -> String {
             date(invite.expires)
         ),
         InviteState::Collected => match &invite.collected_by {
-            Some(by) => format!("collected {when} by {by}"),
+            Some(by) => format!("collected {when} by {}", collector(by)),
             None => format!("collected {when}"),
         },
         InviteState::Expired => format!("invite expired {when}, never collected"),

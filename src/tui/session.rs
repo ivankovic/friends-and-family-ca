@@ -17,6 +17,9 @@
 //! What the UI shows from start to finish: setting up the CA when there is none, the CA once
 //! there is one, or what keeps it from opening. `ffca tui` always opens; the administrator never
 //! needs the command line to get started.
+//!
+//! A folder that may not be read is neither of the first two: whether it holds a CA cannot be
+//! told, so the UI offers no new one and blames no damage - it says to run as root.
 
 use std::path::PathBuf;
 
@@ -25,19 +28,21 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Line;
-use ratatui::widgets::{Paragraph, Wrap};
+use ratatui::widgets::Paragraph;
 use time::OffsetDateTime;
 
 use super::action::Action;
 use super::app::App;
 use super::components::form::Form;
-use super::components::{Component, hint_line};
+use super::components::{Component, hang, hint_line};
 use crate::ca::{self, Ca};
 use crate::store::Store;
 
 enum Stage {
     /// No CA yet: the form that creates one.
     Setup(Form),
+    /// A folder, or a CA in it, that this user may not read.
+    Denied,
     /// A CA that cannot be opened, and why.
     Unusable(String),
     Ready(Box<App>),
@@ -53,13 +58,15 @@ pub struct Session {
 
 impl Session {
     pub fn new(store: Store, out: PathBuf, now: OffsetDateTime) -> Session {
-        let stage = if !store.exists(ca::CERTIFICATE_FILE) {
-            Stage::Setup(Form::create_ca(&default_name(), setup_note(&store)))
-        } else {
-            match Ca::open(&store) {
+        // A certificate that cannot even be looked for is not a missing one.
+        let stage = match std::fs::metadata(store.path(ca::CERTIFICATE_FILE)) {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => Stage::Denied,
+            Err(_) => Stage::Setup(Form::create_ca(&default_name(), setup_note(&store))),
+            Ok(_) => match Ca::open(&store) {
                 Ok(ca) => Stage::Ready(Box::new(App::new(ca, out.clone(), now))),
+                Err(error) if denied(&error) => Stage::Denied,
                 Err(error) => Stage::Unusable(format!("{error:#}")),
-            }
+            },
         };
         Session {
             store,
@@ -97,7 +104,7 @@ impl Session {
         }
         match &mut self.stage {
             Stage::Ready(app) => app.handle_key(key, now),
-            Stage::Unusable(_) => {
+            Stage::Unusable(_) | Stage::Denied => {
                 if matches!(key.code, KeyCode::Char('q') | KeyCode::Esc) {
                     self.quit = true;
                 }
@@ -130,13 +137,8 @@ impl Session {
                 self.stage = Stage::Ready(Box::new(app));
             }
             Err(error) => {
-                let denied = error.chain().any(|cause| {
-                    cause
-                        .downcast_ref::<std::io::Error>()
-                        .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
-                });
                 let mut text = format!("{error:#}");
-                if denied {
+                if denied(&error) {
                     text.push_str(
                         ". Run ffca as root (sudo), or give it a folder you own with --state-dir or FFCA_STATE_DIR.",
                     );
@@ -177,6 +179,24 @@ impl Session {
                 form.draw(frame, below);
                 frame.render_widget(Paragraph::new(hint_line(&[("Esc", "quit")])), hints);
             }
+            Stage::Denied => {
+                let text = vec![
+                    Line::default(),
+                    vec![
+                        format!("  Cannot read {}: run ", self.store.dir().display()).into(),
+                        "sudo ffca".bold(),
+                        ".".into(),
+                    ]
+                    .into(),
+                    Line::default(),
+                    "  The CA's folder and its key are for their owner only, and ffca runs as someone else."
+                        .dim()
+                        .into(),
+                    "  Another folder: --state-dir or FFCA_STATE_DIR.".dim().into(),
+                ];
+                frame.render_widget(Paragraph::new(indented(text, body.width)), body);
+                frame.render_widget(Paragraph::new(hint_line(&[("q", "quit")])), hints);
+            }
             Stage::Unusable(error) => {
                 let text = vec![
                     Line::default(),
@@ -187,7 +207,7 @@ impl Session {
                     "  ffca changes nothing here. Restore the folder from a backup, or move it away to start a new CA."
                         .into(),
                 ];
-                frame.render_widget(Paragraph::new(text).wrap(Wrap { trim: false }), body);
+                frame.render_widget(Paragraph::new(indented(text, body.width)), body);
                 frame.render_widget(Paragraph::new(hint_line(&[("q", "quit")])), hints);
             }
             Stage::Ready(_) => unreachable!("drawn above"),
@@ -201,6 +221,23 @@ impl Session {
             _ => None,
         }
     }
+}
+
+/// `lines` wrapped to `width` columns, the rows they wrap onto under their margin of two.
+fn indented(lines: Vec<Line<'static>>, width: u16) -> Vec<Line<'static>> {
+    lines
+        .into_iter()
+        .flat_map(|line| hang(line, 2, width.into()))
+        .collect()
+}
+
+/// Whether `error` comes from a file or folder this user may not use.
+fn denied(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|e| e.kind() == std::io::ErrorKind::PermissionDenied)
+    })
 }
 
 /// Where the CA will be created, and how to choose another place.

@@ -15,15 +15,20 @@
  *  along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 //! A dialog of one or more text fields: a new device, a new agent, a new name.
+//!
+//! A field has one row, however long its value: a value wider than its row shows the part around
+//! the cursor, with an ellipsis where it is cut. The message under the fields - the note, or why
+//! the last submission was refused - has rows of its own, kept even on a screen too short for
+//! every field.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Line;
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Paragraph, Wrap};
 
-use super::{Component, dialog, hint_line};
+use super::{Component, dialog, hint_line, text_width};
 use crate::tui::action::{Action, Selection};
 
 /// What the form is for, which decides the action its fields become.
@@ -231,6 +236,43 @@ impl Field {
             .nth(cursor)
             .map_or(self.value.len(), |(i, _)| i)
     }
+
+    /// What shows of the value in `room` columns, and how many of the characters shown come
+    /// before the cursor. The last column is kept for a cursor past the end; a value longer than
+    /// the rest shows the part around the cursor - its start, when the field is not `focused` -
+    /// with an ellipsis at each end that is cut.
+    fn window(&self, room: usize, focused: bool) -> (String, usize) {
+        let chars: Vec<char> = if self.secret {
+            vec!['•'; self.value.chars().count()]
+        } else {
+            self.value.chars().collect()
+        };
+        let visible = room.saturating_sub(1);
+        if chars.len() <= visible {
+            return (chars.into_iter().collect(), self.cursor);
+        }
+        if visible == 0 {
+            return (String::new(), 0);
+        }
+        let cursor = if focused { self.cursor } else { 0 };
+        let last_start = chars.len() - visible;
+        // A character still shows after the cursor, before the ellipsis.
+        let start = if cursor + 2 <= visible {
+            0
+        } else if cursor == chars.len() {
+            last_start
+        } else {
+            (cursor + 2 - visible).min(last_start)
+        };
+        let mut shown = chars[start..start + visible].to_vec();
+        if start > 0 {
+            shown[0] = '…';
+        }
+        if start < last_start {
+            shown[visible - 1] = '…';
+        }
+        (shown.into_iter().collect(), cursor - start)
+    }
 }
 
 impl Component for Form {
@@ -323,60 +365,63 @@ impl Component for Form {
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
         const WIDTH: u16 = 72;
-        // The message under the fields wraps; the dialog grows to show all of it. Inside are the
-        // borders and a column of padding on each side.
-        let message = self.error.as_ref().or(self.note.as_ref());
-        let message_lines = message.map_or(1, |m| {
-            ratatui::text::Span::from(m.as_str())
-                .width()
-                .div_ceil(usize::from(WIDTH) - 4)
-                .max(1)
-        });
+        // The message under the fields wraps; the dialog grows to show all of it.
+        let message: Line = match (&self.error, &self.note) {
+            (Some(error), _) => format!("✕ {error}").fg(Color::Red).into(),
+            (None, Some(note)) => note.clone().dim().into(),
+            (None, None) => Line::default(),
+        };
+        let message = Paragraph::new(message).wrap(Wrap { trim: false });
+        let message_rows = (message.line_count(text_width(WIDTH, area) as u16) as u16).max(1);
+        let fields = self.fields.len() as u16;
         // On a short screen the fields lose the blank rows between them, so that the message and
         // the hints still show.
-        let roomy = 2 * self.fields.len() as u16 + 5 + message_lines as u16;
-        let spaced = roomy <= area.height;
+        let spaced = 2 * fields + 5 + message_rows <= area.height;
         let rows_per_field: u16 = if spaced { 2 } else { 1 };
-        let height = rows_per_field * self.fields.len() as u16 + 5 + message_lines as u16;
+        let height = rows_per_field * fields + 5 + message_rows;
         let inner = dialog(frame, area, self.title.clone(), WIDTH, height);
-        let label_width = self.fields.iter().map(|f| f.label.len()).max().unwrap_or(0) + 2;
-        let mut lines = vec![Line::default()];
-        for (i, field) in self.fields.iter().enumerate() {
-            let label = format!("{:<label_width$}", field.label);
-            let label = if i == self.focus {
-                label.bold()
-            } else {
-                label.dim()
-            };
-            let shown = if field.secret {
-                "•".repeat(field.value.chars().count())
-            } else {
-                field.value.clone()
-            };
-            lines.push(vec![label, shown.into()].into());
-            if spaced {
-                lines.push(Line::default());
-            }
-        }
-        if !spaced {
-            lines.push(Line::default());
-        }
-        match (&self.error, &self.note) {
-            (Some(error), _) => lines.push(error.clone().fg(Color::Red).into()),
-            (None, Some(note)) => lines.push(note.clone().dim().into()),
-            (None, None) => lines.push(Line::default()),
-        }
-        let paragraph = Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false });
-        let text = Rect {
-            height: inner.height.saturating_sub(1),
-            ..inner
-        };
-        frame.render_widget(paragraph, text);
         let hints = Rect {
             y: inner.bottom().saturating_sub(1),
             height: 1,
             ..inner
         };
+        // Spaced, the message follows the last field's blank row and a blank row follows it;
+        // otherwise it ends where the hints begin, and on a screen too short for all of this it
+        // is the fields that give way.
+        let message_y = if spaced {
+            inner.y + 1 + rows_per_field * fields
+        } else {
+            hints.y.saturating_sub(message_rows).max(inner.y)
+        };
+        let message_area = Rect {
+            y: message_y,
+            height: message_rows.min(hints.y.saturating_sub(message_y)),
+            ..inner
+        };
+        let label_width = self.fields.iter().map(|f| f.label.len()).max().unwrap_or(0) + 2;
+        let room = usize::from(inner.width).saturating_sub(label_width);
+        for (i, field) in self.fields.iter().enumerate() {
+            let y = inner.y + 1 + rows_per_field * i as u16;
+            if y >= message_area.y {
+                break;
+            }
+            let label = format!("{:<label_width$}", field.label);
+            let focused = i == self.focus;
+            let label = if focused { label.bold() } else { label.dim() };
+            let (shown, before) = field.window(room, focused);
+            if focused {
+                let before: String = shown.chars().take(before).collect();
+                let x = inner.x + label_width as u16 + unicode_width(&before);
+                frame.set_cursor_position(Position::new(x.min(inner.right().saturating_sub(1)), y));
+            }
+            let row = Rect {
+                y,
+                height: 1,
+                ..inner
+            };
+            frame.render_widget(Paragraph::new(Line::from(vec![label, shown.into()])), row);
+        }
+        frame.render_widget(message, message_area);
         // Without a CA there is nothing to go back to: Esc leaves.
         let escape = if self.purpose == Purpose::CreateCa {
             "quit"
@@ -394,11 +439,6 @@ impl Component for Form {
         }
         keys.extend([("Tab", "field"), ("Esc", escape)]);
         frame.render_widget(Paragraph::new(hint_line(&keys)), hints);
-        let field = &self.fields[self.focus];
-        let before: String = field.value.chars().take(field.cursor).collect();
-        let x = inner.x + label_width as u16 + unicode_width(&before);
-        let y = inner.y + 1 + rows_per_field * self.focus as u16;
-        frame.set_cursor_position(Position::new(x.min(inner.right().saturating_sub(1)), y));
     }
 }
 

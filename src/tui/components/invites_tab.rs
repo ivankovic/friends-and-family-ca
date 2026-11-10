@@ -25,7 +25,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 use time::OffsetDateTime;
 
-use super::{Component, Hint, step};
+use super::people::collector;
+use super::{Component, Hint, fit, step};
 use crate::ledger::{Invite, InviteState};
 use crate::tui::action::Action;
 use crate::tui::date;
@@ -40,6 +41,8 @@ pub struct InvitesTab {
     enabled: bool,
     now: OffsetDateTime,
     selected: usize,
+    /// How far the list is scrolled, kept between draws.
+    list: ListState,
 }
 
 impl Default for InvitesTab {
@@ -49,6 +52,7 @@ impl Default for InvitesTab {
             enabled: false,
             now: OffsetDateTime::UNIX_EPOCH,
             selected: 0,
+            list: ListState::default(),
         }
     }
 }
@@ -89,11 +93,15 @@ impl InvitesTab {
             Some(invite) if invite.state == InviteState::Open => {
                 vec![("Enter", "show"), ("c", "copy link"), ("x", "cancel")]
             }
-            _ => Vec::new(),
+            Some(_) => vec![("Enter", "details")],
+            None => Vec::new(),
         }
     }
 
-    fn item(&self, invite: &Invite) -> ListItem<'static> {
+    /// An invite's row in a list `width` wide. The holder has a column as wide as the longest,
+    /// up to 30, and is cut beyond it; the state is cut where the row ends, which costs a
+    /// collected invite the end of its address and not the device before it.
+    fn item(&self, invite: &Invite, width: usize) -> ListItem<'static> {
         let (symbol, color, state) = match invite.state {
             InviteState::Open => {
                 let left = invite.expires - self.now;
@@ -102,7 +110,7 @@ impl InvitesTab {
                 } else {
                     format!("{} min", left.whole_minutes().max(0))
                 };
-                ("◐", Color::Yellow, format!("open, {left} left"))
+                ("◌", Color::Cyan, format!("open, {left} left"))
             }
             InviteState::Collected => (
                 "●",
@@ -110,7 +118,7 @@ impl InvitesTab {
                 format!(
                     "collected {} by {}",
                     invite.closed.map(date).unwrap_or_default(),
-                    invite.collected_by.as_deref().unwrap_or("?")
+                    invite.collected_by.as_deref().map_or("?".into(), collector)
                 ),
             ),
             InviteState::Expired => (
@@ -124,21 +132,23 @@ impl InvitesTab {
                 format!("cancelled {}", invite.closed.map(date).unwrap_or_default()),
             ),
         };
+        let longest = self.invites.iter().map(|i| i.holder.chars().count()).max();
+        let holder_width = longest.unwrap_or(0).clamp(14, 30);
+        // " ◌ " before the holder, a space after it.
+        let room = width.saturating_sub(4 + holder_width);
         ListItem::new(Line::from(vec![
             " ".into(),
             Span::styled(symbol, Style::new().fg(color)),
-            format!(" {:<30} ", invite.holder).into(),
-            Span::from(state).dim(),
+            format!(" {:<holder_width$} ", fit(&invite.holder, holder_width)).into(),
+            Span::from(fit(&state, room)).dim(),
         ]))
     }
 }
 
 impl Component for InvitesTab {
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
-        let open = self
-            .selected_invite()
-            .filter(|i| i.state == InviteState::Open)
-            .cloned();
+        let selected = self.selected_invite().cloned();
+        let open = selected.clone().filter(|i| i.state == InviteState::Open);
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = step(self.selected, false, self.invites.len())
@@ -146,7 +156,7 @@ impl Component for InvitesTab {
             KeyCode::Down | KeyCode::Char('j') => {
                 self.selected = step(self.selected, true, self.invites.len())
             }
-            KeyCode::Enter => return open.map(Action::ShowInvite),
+            KeyCode::Enter => return selected.map(Action::ShowInvite),
             KeyCode::Char('c') => return open.map(Action::CopyInvite),
             KeyCode::Char('x') => return open.map(Action::AskCancelInvite),
             _ => {}
@@ -168,10 +178,10 @@ impl Component for InvitesTab {
                         "n".bold(),
                         " and ".into(),
                         "u".bold(),
-                        " make one: a link, and its QR code, that hands a device its certificate."
-                            .into(),
+                        " make one: a link, and its QR code,".into(),
                     ]
                     .into(),
+                    "  that hands a device its certificate.".into(),
                 ]
             } else {
                 vec![
@@ -189,14 +199,12 @@ impl Component for InvitesTab {
             .borders(Borders::ALL)
             .border_set(border::ROUNDED)
             .border_style(Style::new().dim());
-        let items: Vec<ListItem> = self.invites.iter().map(|i| self.item(i)).collect();
+        let width = usize::from(area.width.saturating_sub(2));
+        let items: Vec<ListItem> = self.invites.iter().map(|i| self.item(i, width)).collect();
         let list = List::new(items)
             .block(block)
             .highlight_style(Style::new().reversed());
-        frame.render_stateful_widget(
-            list,
-            area,
-            &mut ListState::default().with_selected(Some(self.selected)),
-        );
+        self.list.select(Some(self.selected));
+        frame.render_stateful_widget(list, area, &mut self.list);
     }
 }

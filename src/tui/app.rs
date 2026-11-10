@@ -15,6 +15,21 @@
  *  along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 //! The application: which tab and dialog are showing, and carrying out what they ask for.
+//!
+//! The frame, top to bottom: the title with how the CRL stands; a row of its own for an expired
+//! CRL, which locks everyone out; the tabs, with the keys every tab shares at their right end;
+//! the tab; what the last action did; the tab's own keys. On 80 columns the last row has room
+//! for every key of a tab because the shared ones are not on it - and of those, the way to the
+//! help is the last to give way to what the tabs count.
+//!
+//! What went wrong is told in one of two places. Something the administrator asked for that did
+//! not happen is explained in a dialog, whole, until it is closed. What the UI finds by itself,
+//! re-reading the CA every few seconds, goes on the notice line - marked as an error by more
+//! than its colour, and wrapped rather than cut - since a dialog would open over whatever the
+//! administrator is typing.
+//!
+//! Keys that change the CA ask first, each in a dialog that says what will happen. Esc closes a
+//! dialog and never leaves the UI; `q` leaves, from where no dialog is open.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -22,7 +37,7 @@ use std::path::PathBuf;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Color, Stylize};
+use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Tabs};
 use time::{Duration, OffsetDateTime};
@@ -36,10 +51,10 @@ use super::components::invites_tab::InvitesTab;
 use super::components::message::Message;
 use super::components::mode_dialog::{ModeDialog, diff};
 use super::components::nginx_tab::NginxTab;
-use super::components::people::{People, invite_of};
+use super::components::people::{People, collector, invite_of};
 use super::components::revoke_dialog::RevokeDialog;
 use super::components::users_tab::{self, UsersTab};
-use super::components::{Component, Hint, fitted_hint_line};
+use super::components::{Component, Hint, fit, fitted_hint_line, hang, hint_line, hints_width};
 use super::date;
 use crate::ca::{self, Ca, CrlStatus, Key};
 use crate::config::{self, Config};
@@ -62,6 +77,21 @@ enum Tab {
     Users,
     Ca,
 }
+
+/// The UI is made for 80 by 24 and more. Smaller than this it would draw rows cut short and
+/// dialogs without their last lines, so it says so instead and takes no key but `q`.
+const MIN_SIZE: (u16, u16) = (60, 16);
+
+/// The keys every tab shares, at the right end of the tab row: all of them, or as many as the
+/// tabs and what they count leave room for.
+const SHARED: [&[Hint]; 3] = [
+    &[("Tab", "switch"), ("?", "help"), ("q", "quit")],
+    &[("?", "help"), ("q", "quit")],
+    &[("?", "help")],
+];
+
+/// How many rows the line above the key hints may take, for a notice too long for one.
+const NOTICE_ROWS: usize = 3;
 
 const TABS: [(Tab, &str); 5] = [
     (Tab::People, "People & agents"),
@@ -123,6 +153,9 @@ pub struct App {
     /// Text to put on the clipboard of the administrator's terminal: the event loop sends it as
     /// an OSC 52 sequence, which travels over SSH to the terminal itself.
     clipboard: Option<String>,
+    /// Whether the last draw found the terminal smaller than [`MIN_SIZE`]: the screen then shows
+    /// none of what the keys would act on, so they do nothing.
+    too_small: bool,
     quit: bool,
 }
 
@@ -150,6 +183,7 @@ impl App {
             dialog: None,
             notice: None,
             clipboard: None,
+            too_small: false,
             quit: false,
         };
         app.reload(now);
@@ -180,11 +214,10 @@ impl App {
             vec![
                 "Next, on the ".into(),
                 "Nginx".bold(),
-                " tab, tell it where nginx is: it then keeps the CA's certificate and".into(),
+                " tab, tell it where nginx is: it then keeps the CA's certificate and revocation list where nginx reads them, and sets your sites to ask for certificates."
+                    .into(),
             ]
             .into(),
-            "revocation list where nginx reads them, and sets your sites to ask for certificates."
-                .into(),
             Line::default(),
             "Back up the state folder: without the key, every certificate has to be issued again."
                 .fg(Color::Yellow)
@@ -271,12 +304,42 @@ impl App {
             survey,
         );
         self.ca_info.update(self.ca_lines());
+        self.follow_invite();
+    }
+
+    /// Tells the dialog that shows an invite, if one is open, that its invite no longer is:
+    /// collected, most likely, by the device it was held up to.
+    fn follow_invite(&mut self) {
+        let Some(Dialog::Invite(dialog)) = &mut self.dialog else {
+            return;
+        };
+        let Some(invite) = invite_of(&self.ledger.invites, dialog.serial()) else {
+            return;
+        };
+        dialog.close(match (invite.state, &invite.collected_by) {
+            (InviteState::Open, _) => return,
+            (InviteState::Collected, Some(by)) => {
+                format!("Collected just now, from {}.", collector(by))
+            }
+            (InviteState::Collected, None) => "Collected just now.".to_owned(),
+            (InviteState::Expired, _) => {
+                "This invite has expired, never collected: its certificate is revoked. Renew the device to invite it again."
+                    .to_owned()
+            }
+            (InviteState::Cancelled, _) => {
+                "This invite has been cancelled: its certificate is revoked.".to_owned()
+            }
+        });
     }
 
     pub fn handle_key(&mut self, key: KeyEvent, now: OffsetDateTime) {
         self.now = now;
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.quit = true;
+            return;
+        }
+        if self.too_small {
+            self.quit = key.code == KeyCode::Char('q');
             return;
         }
         let action = match &mut self.dialog {
@@ -290,9 +353,14 @@ impl App {
                 self.people.handle_key_event(key)
             }
             None => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => Some(Action::Quit),
+                // Esc closes dialogs and drops the filter; it does not also leave the UI, which
+                // a second press out of habit would otherwise do.
+                KeyCode::Char('q') => Some(Action::Quit),
                 KeyCode::Tab => Some(Action::NextTab),
                 KeyCode::BackTab => Some(Action::PreviousTab),
+                KeyCode::Char(digit @ '1'..='5') => {
+                    Some(Action::GoToTab(digit as usize - '1' as usize))
+                }
                 KeyCode::Char('?') => Some(Action::Help),
                 _ => match self.tab {
                     Tab::People => self.people.handle_key_event(key),
@@ -325,7 +393,12 @@ impl App {
                 };
                 self.tab = TABS[(at + step) % TABS.len()].0;
             }
-            Action::Help => self.dialog = Some(Dialog::Message(help())),
+            Action::GoToTab(place) => {
+                if let Some((tab, _)) = TABS.get(place) {
+                    self.tab = *tab;
+                }
+            }
+            Action::Help => self.dialog = Some(Dialog::Message(help(self.tab))),
             Action::CloseDialog => self.dialog = None,
             Action::AskNewPerson => self.dialog = Some(Dialog::Form(Form::new_person())),
             Action::AskNewDevice { person } => {
@@ -343,7 +416,37 @@ impl App {
                     self.dialog = Some(Dialog::Revoke(RevokeDialog::new(selection, reaches)));
                 }
             }
-            Action::Issue(selection) => self.issue(selection),
+            Action::AskRenew(selection) => {
+                let invited = matches!(selection, Selection::Device { .. })
+                    && self.config.enrollment.is_some();
+                let how = if invited {
+                    "A new certificate, and an invite that hands it to the device.".to_owned()
+                } else {
+                    format!(
+                        "A new certificate, written with its key to files in {}.",
+                        self.out.display()
+                    )
+                };
+                self.dialog = Some(Dialog::Message(Message::confirm(
+                    format!("Renew {selection}"),
+                    vec![
+                        how.into(),
+                        "The current certificate keeps working until it expires, or until you revoke it as replaced, with r."
+                            .dim()
+                            .into(),
+                    ],
+                    Action::Issue(selection),
+                    "renew",
+                )));
+            }
+            Action::Issue(selection) => {
+                // Asked for by a form, which stays open if it is refused, or by a question,
+                // which has been answered.
+                if matches!(self.dialog, Some(Dialog::Message(_))) {
+                    self.dialog = None;
+                }
+                self.issue(selection)
+            }
             Action::IssueToNewPerson(selection) => {
                 let name = match &selection {
                     Selection::Device { person, .. } => person.as_str(),
@@ -368,7 +471,7 @@ impl App {
                         });
                         self.reach_nginx();
                     }
-                    Err(error) => self.fail(format!("{error:#}")),
+                    Err(error) => self.explain("Not revoked", &error),
                 }
                 self.reload(self.now);
             }
@@ -398,7 +501,7 @@ impl App {
                         ));
                         self.reach_nginx();
                     }
-                    Err(error) => self.fail(format!("{error:#}")),
+                    Err(error) => self.explain("The CRL is not signed", &error),
                 }
                 self.reload(self.now);
             }
@@ -457,16 +560,7 @@ impl App {
                 );
                 match installed {
                     Ok(()) => self.tell("The refresh timer is set up: hourly.".into()),
-                    Err(error) => {
-                        let lines = format!("{error:#}")
-                            .lines()
-                            .map(|l| Line::from(l.to_owned()))
-                            .collect();
-                        self.dialog = Some(Dialog::Message(Message::new(
-                            "The timer is not set up",
-                            lines,
-                        )));
-                    }
+                    Err(error) => self.explain("The timer is not set up", &error),
                 }
                 self.timer = timer::state(&self.systemctl);
                 self.reload(self.now);
@@ -488,16 +582,19 @@ impl App {
             }
             Action::CopyInvite(invite) => {
                 if let Some(enrollment) = &self.config.enrollment {
-                    let link = invite::link(&enrollment.host, &invite.token);
-                    self.perform(Action::Copy(link));
+                    self.clipboard = Some(invite::link(&enrollment.host, &invite.token));
+                    self.tell(format!(
+                        "Link for {} copied, if your terminal allows it (OSC 52). Enter shows it.",
+                        invite.holder
+                    ));
                 }
             }
             Action::Copy(text) => {
                 self.clipboard = Some(text);
-                self.tell(
-                    "Sent the link to your terminal's clipboard (if it allows OSC 52; the link is also on screen)."
-                        .into(),
-                );
+                // An invite's dialog says so itself: it covers the line this would be on.
+                if !matches!(self.dialog, Some(Dialog::Invite(_))) {
+                    self.tell("Copied, if your terminal allows it (OSC 52).".into());
+                }
             }
             Action::CancelInvite(serial) => {
                 self.dialog = None;
@@ -506,7 +603,7 @@ impl App {
                         self.tell("Cancelled the invite; its certificate is revoked.".into());
                         self.reach_nginx();
                     }
-                    Err(error) => self.fail(format!("{error:#}")),
+                    Err(error) => self.explain("The invite is not cancelled", &error),
                 }
                 self.reload(self.now);
             }
@@ -920,7 +1017,7 @@ impl App {
                     )));
                 }
             }
-            Err(error) => self.fail(format!("{error:#}")),
+            Err(error) => self.explain(format!("{name} is not deleted"), &error),
         }
         self.reload(self.now);
     }
@@ -1019,7 +1116,48 @@ impl App {
         Some(format!("https://{name}/"))
     }
 
+    /// What became of an invite that is no longer open, and when.
+    fn show_closed_invite(&mut self, invite: &Invite) {
+        let when = invite
+            .closed
+            .map(|at| format!("{} {}", date(at), clock(at)))
+            .unwrap_or_default();
+        let mut lines: Vec<Line> = vec![match (invite.state, &invite.collected_by) {
+            (InviteState::Collected, Some(by)) => {
+                format!("Collected {when} by {}.", collector(by)).into()
+            }
+            (InviteState::Collected, None) => format!("Collected {when}.").into(),
+            (InviteState::Expired, _) => {
+                format!("Expired {when}, never collected: its certificate is revoked.").into()
+            }
+            (InviteState::Cancelled, _) => {
+                format!("Cancelled {when}: its certificate is revoked.").into()
+            }
+            (InviteState::Open, _) => "Open.".into(),
+        }];
+        lines.push(Line::default());
+        let made = format!("{} {}", date(invite.created), clock(invite.created));
+        lines.push(vec!["Made         ".dim(), made.into()].into());
+        let serial = invite.serial.to_string()[..8].to_owned();
+        lines.push(vec!["Certificate  ".dim(), serial.into()].into());
+        if invite.state == InviteState::Collected {
+            lines.push(Line::default());
+            lines.push(
+                "If this was not the device it was meant for, revoke that device: r on People & agents."
+                    .dim()
+                    .into(),
+            );
+        }
+        self.dialog = Some(Dialog::Message(Message::new(
+            format!("Invite for {}", invite.holder),
+            lines,
+        )));
+    }
+
     fn show_invite(&mut self, invite: &Invite) {
+        if invite.state != InviteState::Open {
+            return self.show_closed_invite(invite);
+        }
         let Some(enrollment) = &self.config.enrollment else {
             return self.fail("Set the enrollment site on the Nginx tab to show invites.".into());
         };
@@ -1030,6 +1168,7 @@ impl App {
         );
         let link = invite::link(&enrollment.host, &invite.token);
         self.dialog = Some(Dialog::Invite(InviteDialog::new(
+            invite.serial,
             invite.holder.clone(),
             link,
             status,
@@ -1089,7 +1228,7 @@ impl App {
                     "write",
                 )));
             }
-            Err(error) => self.fail(format!("{error:#}")),
+            Err(error) => self.explain("The enrollment site cannot be written", &error),
         }
     }
 
@@ -1105,16 +1244,7 @@ impl App {
         });
         match written {
             Ok(()) => self.tell(format!("{} is up; nginx reloaded.", enrollment.host)),
-            Err(error) => {
-                let lines = format!("{error:#}")
-                    .lines()
-                    .map(|l| Line::from(l.to_owned()))
-                    .collect();
-                self.dialog = Some(Dialog::Message(Message::new(
-                    "The enrollment site is not written",
-                    lines,
-                )));
-            }
+            Err(error) => self.explain("The enrollment site is not written", &error),
         }
         self.reload(self.now);
     }
@@ -1161,6 +1291,16 @@ impl App {
         });
     }
 
+    /// Why something the administrator asked for did not happen: in a dialog, where an error
+    /// of any length is whole and stays until it is read.
+    fn explain(&mut self, title: impl Into<String>, error: &anyhow::Error) {
+        let lines = format!("{error:#}")
+            .lines()
+            .map(|l| Line::from(l.to_owned()))
+            .collect();
+        self.dialog = Some(Dialog::Message(Message::new(title, lines)));
+    }
+
     fn fail(&mut self, text: String) {
         self.notice = Some(Notice {
             text,
@@ -1177,11 +1317,18 @@ impl App {
         }
     }
 
-    fn ca_lines(&self) -> Vec<Line<'static>> {
+    /// The CA tab's lines, each with the indent of the rows it wraps onto: a value continues
+    /// under its start, beside the labels.
+    fn ca_lines(&self) -> Vec<(usize, Line<'static>)> {
+        const VALUES: usize = 16;
         let store = self.ca.store();
-        let row = |label: &str, value: String| -> Line<'static> {
-            vec![format!("  {label:<14}").dim(), value.into()].into()
+        let row = |label: &str, value: String| -> (usize, Line<'static>) {
+            (
+                VALUES,
+                vec![format!("  {label:<14}").dim(), value.into()].into(),
+            )
         };
+        let blank = || (0, Line::default());
         let key_mode = std::fs::metadata(store.path(ca::KEY_FILE))
             .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777);
         let key_note = match key_mode {
@@ -1200,7 +1347,7 @@ impl App {
         let mut lines = vec![
             row("Name", self.ca.name().to_owned()),
             row("Valid until", date(self.ca.not_after())),
-            Line::default(),
+            blank(),
             row("State folder", store.dir().display().to_string()),
             row(
                 "Key",
@@ -1230,9 +1377,9 @@ impl App {
                     .fg(Color::Yellow),
             ]),
         };
-        lines.push(timer);
+        lines.push((VALUES, timer));
         lines.extend([
-            Line::default(),
+            blank(),
             row(
                 "Issued to",
                 format!(
@@ -1243,22 +1390,65 @@ impl App {
                     plural(valid, "certificate", "certificates"),
                 ),
             ),
-            Line::default(),
-            "  Back up the state folder: without the key, every certificate has to be issued again.".fg(Color::Yellow).into(),
+            blank(),
+            (
+                2,
+                "  Back up the state folder: without the key, every certificate has to be issued again."
+                    .fg(Color::Yellow)
+                    .into(),
+            ),
         ]);
         lines
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
-        let [title, tabs, body, notice, hints] = Layout::vertical([
+        let area = frame.area();
+        self.too_small = area.width < MIN_SIZE.0 || area.height < MIN_SIZE.1;
+        if self.too_small {
+            let said = format!(
+                " This terminal is {} by {}, too small to show the CA: make it {} by {} or more. It is made for 80 by 24.",
+                area.width, area.height, MIN_SIZE.0, MIN_SIZE.1
+            );
+            let mut text = vec![Line::from(" Friends and Family CA".bold()), Line::default()];
+            text.extend(hang(said.into(), 1, area.width.into()));
+            text.push(Line::default());
+            let mut quit = hint_line(&[("q", "quit")]);
+            quit.spans.insert(0, " ".into());
+            text.push(quit);
+            return frame.render_widget(Paragraph::new(text), area);
+        }
+        let expired = matches!(self.crl, Some(crl) if crl.next_update <= self.now);
+        // A notice too long for one row takes the rows it needs, up to a few: an error is read
+        // whole, not as far as the screen is wide.
+        let notice_lines: Vec<Line> = match &self.notice {
+            Some(n) if n.error => hang(
+                format!(" ✕ {}", n.text).fg(Color::Red).into(),
+                3,
+                area.width.into(),
+            ),
+            Some(n) => hang(format!(" {}", n.text).into(), 1, area.width.into()),
+            None => Vec::new(),
+        };
+        let notice_rows = notice_lines.len().clamp(1, NOTICE_ROWS) as u16;
+        let [title, alarm, tabs, body, notice, hints] = Layout::vertical([
             Constraint::Length(1),
+            Constraint::Length(u16::from(expired)),
             Constraint::Length(1),
             Constraint::Min(3),
-            Constraint::Length(1),
+            Constraint::Length(notice_rows),
             Constraint::Length(1),
         ])
-        .areas(frame.area());
+        .areas(area);
         self.draw_title(frame, title);
+        // The worst the CA can be in has a row to itself, on every tab.
+        frame.render_widget(
+            Paragraph::new(
+                " CRL EXPIRED: everyone is refused. Press c on the CA tab."
+                    .fg(Color::Red)
+                    .bold(),
+            ),
+            alarm,
+        );
         let titles: Vec<Line> = TABS
             .iter()
             .map(|(tab, name)| match self.tab_count(*tab) {
@@ -1266,17 +1456,33 @@ impl App {
                 None => Line::from(*name),
             })
             .collect();
+        // Each title has a space on either side, and a divider between it and the next.
+        let titles_width = titles.iter().map(Line::width).sum::<usize>() + 3 * TABS.len() - 1;
         let selected = TABS
             .iter()
             .position(|(tab, _)| *tab == self.tab)
             .unwrap_or(0);
+        // The tab that shows is reversed, not only coloured: it reads without colour too.
         frame.render_widget(
             Tabs::new(titles)
                 .select(selected)
-                .highlight_style(Color::Cyan)
-                .bold(),
+                .highlight_style(Style::new().cyan().bold().reversed()),
             tabs,
         );
+        // While the People filter is typed, the shared keys are text: they are not offered.
+        let typing = self.tab == Tab::People && self.people.typing();
+        let free = usize::from(tabs.width).saturating_sub(titles_width);
+        // Two columns between the tabs and the keys, one after them.
+        let shared = SHARED
+            .iter()
+            .find(|keys| !typing && hints_width(keys) + 3 <= free);
+        if let Some(keys) = shared {
+            let row = Rect {
+                width: tabs.width.saturating_sub(1),
+                ..tabs
+            };
+            frame.render_widget(Paragraph::new(hint_line(keys).right_aligned()), row);
+        }
         match self.tab {
             Tab::People => self.people.draw(frame, body),
             Tab::Invites => self.invites.draw(frame, body),
@@ -1284,25 +1490,19 @@ impl App {
             Tab::Users => self.users_tab.draw(frame, body),
             Tab::Ca => self.ca_info.draw(frame, body),
         }
-        if let Some(n) = &self.notice {
-            let text = Span::from(format!(" {}", n.text));
-            let text = if n.error { text.fg(Color::Red) } else { text };
-            frame.render_widget(Paragraph::new(Line::from(text)), notice);
-        }
-        let mut keys: Vec<Hint> = match self.tab {
+        frame.render_widget(Paragraph::new(notice_lines), notice);
+        let keys: Vec<Hint> = match self.tab {
             Tab::People => self.people.hints(),
             Tab::Invites => self.invites.hints(),
             Tab::Nginx => self.nginx.hints(),
             Tab::Users => self.users_tab.hints(),
             Tab::Ca => self.ca_info.hints(),
         };
-        // While the People filter is typed, the shared keys are text: they are not offered.
-        let typing = self.tab == Tab::People && self.people.typing();
-        let always: &[Hint] = if typing {
+        // The way to the help is never lost: where the tab row has no room for it, it is here.
+        let always: &[Hint] = if shared.is_some() || typing {
             &[]
         } else {
-            keys.push(("Tab", "switch"));
-            &[("?", "help"), ("q", "quit")]
+            &[("?", "help")]
         };
         let hints = Rect {
             x: hints.x + 1,
@@ -1345,17 +1545,11 @@ impl App {
         (count > 0).then(|| format!("{count} expiring"))
     }
 
+    /// The title row: the CA's name on the left, how its CRL stands on the right. Each has its
+    /// own columns, and on a narrow screen it is the name that is cut, with an ellipsis.
     fn draw_title(&self, frame: &mut Frame, area: Rect) {
-        let left = Line::from(vec![
-            " Friends and Family CA".bold(),
-            format!(" · {}", self.ca.name()).into(),
-        ]);
         let right: Span = match self.crl {
-            Some(crl) if crl.next_update <= self.now => {
-                "CRL EXPIRED: the web server refuses every client. Press c on the CA tab "
-                    .fg(Color::Red)
-                    .bold()
-            }
+            Some(crl) if crl.next_update <= self.now => "CRL expired ".fg(Color::Red).bold(),
             Some(crl) if crl.next_update - self.now < CRL_WARNING => Span::from(format!(
                 "CRL expires in {} d: is the refresh timer running? ",
                 (crl.next_update - self.now).whole_days()
@@ -1364,8 +1558,22 @@ impl App {
             Some(crl) => Span::from(format!("CRL valid until {} ", date(crl.next_update))).dim(),
             None => "CRL unreadable ".fg(Color::Red),
         };
-        frame.render_widget(Paragraph::new(left), area);
-        frame.render_widget(Paragraph::new(Line::from(right).right_aligned()), area);
+        let [left, status] = Layout::horizontal([
+            Constraint::Min(0),
+            Constraint::Length((right.width() as u16).min(area.width)),
+        ])
+        .areas(area);
+        const PRODUCT: &str = " Friends and Family CA";
+        // A column stays empty between the name and the status.
+        let room = usize::from(left.width).saturating_sub(1);
+        let name = format!(" · {}", self.ca.name());
+        let title: Line = match room.checked_sub(PRODUCT.len()) {
+            Some(rest) if rest >= 4 => vec![PRODUCT.bold(), fit(&name, rest).into()].into(),
+            Some(_) => PRODUCT.bold().into(),
+            None => fit(PRODUCT, room).bold().into(),
+        };
+        frame.render_widget(Paragraph::new(title), left);
+        frame.render_widget(Paragraph::new(Line::from(right).right_aligned()), status);
     }
 
     #[cfg(test)]
@@ -1402,49 +1610,137 @@ fn plural(n: usize, one: &'static str, many: &'static str) -> &'static str {
     if n == 1 { one } else { many }
 }
 
-fn help() -> Message {
-    let key = |key: &'static str, what: &'static str| -> Line<'static> {
-        vec![format!("{key:<12}").bold(), what.into()].into()
+/// The keys, a section to a tab: the one for `tab`, which is showing, comes first, then the keys
+/// that work everywhere and in dialogs, then the other tabs'.
+fn help(tab: Tab) -> Message {
+    /// A section's lines, each with the indent of the rows it wraps onto.
+    type Keys = Vec<(usize, Line<'static>)>;
+    const KEYS: usize = 16;
+    let key = |key: &'static str, what: &'static str| -> (usize, Line<'static>) {
+        (
+            KEYS,
+            vec![format!("{key:<KEYS$}").bold(), what.into()].into(),
+        )
     };
-    Message::new(
-        "Keys",
-        vec![
-            key("↑ ↓  j k", "move"),
-            key("Tab", "switch between People & agents, Invites, Nginx, Users and CA"),
-            key("p", "add a person, with a certificate for their first device"),
-            key("n", "add a device to the selected person"),
-            key("a", "issue a certificate to a new agent"),
-            key(
-                "u",
-                "renew: a new certificate for the selected device or agent",
-            ),
-            key(
-                "r",
-                "revoke the selected device or agent, or every device of a person",
-            ),
-            key("R", "rename the selected person, device or agent"),
-            key("/", "narrow People & agents to the names that contain what is typed"),
-            key("e", "on the Nginx tab: where nginx is, and the enrollment site"),
-            key("s", "on the Nginx tab: a site's client certificate: off, optional, required"),
-            key("l", "on the Nginx tab: a site's HTTP login: off, passthrough, on, and who"),
-            key("n  c  d", "on the Users tab: a new user, change a password, delete"),
-            key("t", "on the Nginx tab: test nginx's configuration"),
-            key("w", "on the Nginx tab: write the enrollment site"),
-            key(
-                "Enter  c  x",
-                "on the Invites tab: show an invite's QR code again, copy its link, cancel it",
-            ),
-            key("c", "on the CA tab: sign a new CRL now"),
-            key("T", "on the CA tab: set up the hourly refresh timer"),
-            key("PgUp PgDn", "scroll a dialog taller than the screen"),
-            key("Ctrl-U  W", "in a form: clear the field, delete a word (Ctrl-A, E: start, end)"),
-            key("Ctrl-S", "in a form: done, from any field"),
-            key("q  Esc", "quit, or close a dialog"),
-            Line::default(),
-            "After a renewal, revoke the device again as \"replaced\": that revokes every certificate but the newest."
-                .into(),
-        ],
-    )
+    let moving = key("↑ ↓  j k", "move");
+    let sections: Vec<(Option<Tab>, &'static str, Keys)> = vec![
+        (
+            Some(Tab::People),
+            "People & agents",
+            vec![
+                moving.clone(),
+                key("Home End  g G", "to the first, to the last"),
+                key("p", "add a person, with a certificate for their first device"),
+                key("n", "add a device to the selected person"),
+                key("a", "issue a certificate to a new agent"),
+                key(
+                    "u",
+                    "renew, after asking: a new certificate for the selected device or agent",
+                ),
+                key(
+                    "r",
+                    "revoke the selected device or agent, or every device of a person",
+                ),
+                key("R", "rename the selected person, device or agent"),
+                key("/", "narrow the tree to the names that contain what is typed"),
+                key("Esc", "drop what the tree is narrowed to"),
+                key("PgUp PgDn", "scroll the details, when they are taller than their pane"),
+                (
+                    0,
+                    "After a renewal, revoke the device again as \"replaced\": that revokes every certificate but the newest."
+                        .dim()
+                        .into(),
+                ),
+            ],
+        ),
+        (
+            Some(Tab::Invites),
+            "Invites",
+            vec![
+                moving.clone(),
+                key("Enter", "show an open invite's QR code again, or a closed one's details"),
+                key("c", "copy an open invite's link"),
+                key("x", "cancel an open invite, after asking: its certificate is revoked"),
+            ],
+        ),
+        (
+            Some(Tab::Nginx),
+            "Nginx",
+            vec![
+                moving.clone(),
+                key("e", "where nginx is, and the enrollment site"),
+                key("s", "the selected site's client certificate: off, optional, required"),
+                key("l", "the selected site's HTTP login: off, passthrough, on, and who"),
+                key("t", "test nginx's configuration"),
+                key("w", "write the enrollment site, after showing it"),
+            ],
+        ),
+        (
+            Some(Tab::Users),
+            "Users",
+            vec![
+                moving.clone(),
+                key("n", "a new user"),
+                key("c", "a new password for the selected user"),
+                key("d", "delete the selected user, after asking"),
+            ],
+        ),
+        (
+            Some(Tab::Ca),
+            "CA",
+            vec![
+                key("c", "sign a new CRL now"),
+                key("T", "set up the hourly refresh timer, after showing it"),
+            ],
+        ),
+        (
+            None,
+            "Everywhere",
+            vec![
+                key("Tab  Shift-Tab", "the next tab, the previous one"),
+                key("1 2 3 4 5", "People & agents, Invites, Nginx, Users, CA"),
+                key("?", "these keys"),
+                key("q  Ctrl-C", "quit"),
+            ],
+        ),
+        (
+            None,
+            "In a dialog",
+            vec![
+                key("Enter", "what its last line says"),
+                key("Esc  q", "close it, changing nothing; where text is typed, q is text"),
+                key("↑ ↓  j k", "choose, where there is a choice; scroll, where there is none"),
+                key("PgUp PgDn", "scroll a dialog taller than the screen"),
+                key("Space", "in a site's login: tick or untick the selected user"),
+                key("c", "in an invite: copy its link"),
+                key("Tab  ↑ ↓", "in a form: the next field, the previous one"),
+                key("Ctrl-U Ctrl-W", "in a form: clear the field, delete a word"),
+                key("Ctrl-A Ctrl-E", "in a form: to the start of the field, to its end"),
+                key("Ctrl-S", "in a form: done, from any field"),
+            ],
+        ),
+    ];
+    let rank = |section: &Option<Tab>| match section {
+        Some(t) if *t == tab => 0,
+        None => 1,
+        Some(_) => 2,
+    };
+    let mut sections = sections;
+    sections.sort_by_key(|(section, _, _)| rank(section));
+    let mut lines: Vec<(usize, Line<'static>)> = Vec::new();
+    for (section, title, keys) in sections {
+        if !lines.is_empty() {
+            lines.push((0, Line::default()));
+        }
+        let title = if section == Some(tab) {
+            format!("{title} - this tab")
+        } else {
+            title.to_owned()
+        };
+        lines.push((0, title.cyan().bold().into()));
+        lines.extend(keys);
+    }
+    Message::hanging("Keys", lines)
 }
 
 #[cfg(test)]

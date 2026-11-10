@@ -28,7 +28,7 @@ use ratatui::style::{Color, Stylize};
 use ratatui::text::Line;
 
 use super::mode_dialog::diff;
-use super::{Component, Scroll, step, text_dialog};
+use super::{Component, Scroll, hang, step, text_dialog, text_width};
 use crate::config;
 use crate::nginx::{self, Auth, Site};
 use crate::tui::action::Action;
@@ -163,6 +163,7 @@ impl Component for AuthDialog {
                 self.names.pop();
             }
             KeyCode::Char(c) if self.kind == PASSTHROUGH => self.names.push(c),
+            KeyCode::Char('q') => return Some(Action::CloseDialog),
             KeyCode::Char('k') => self.move_cursor(false),
             KeyCode::Char('j') => self.move_cursor(true),
             KeyCode::Char(' ') => {
@@ -182,6 +183,8 @@ impl Component for AuthDialog {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        const WIDTH: u16 = 92;
+        let width = text_width(WIDTH, area);
         let mut lines: Vec<Line> = vec!["HTTP login".bold().into()];
         for (i, (kind, description)) in Auth::KINDS.iter().zip(DESCRIPTIONS).enumerate() {
             let marker = if i == self.cursor { "› " } else { "  " };
@@ -196,7 +199,8 @@ impl Component for AuthDialog {
             } else {
                 ""
             };
-            lines.push(vec![marker.into(), name, description.dim(), now.dim()].into());
+            let line: Line = vec![marker.into(), name, description.dim(), now.dim()].into();
+            lines.extend(hang(line, 15, width));
         }
         lines.push(Line::default());
         if self.kind == PASSTHROUGH {
@@ -257,7 +261,7 @@ impl Component for AuthDialog {
             frame,
             area,
             self.site.name().to_string(),
-            92,
+            WIDTH,
             lines,
             match self.kind {
                 PASSTHROUGH => &[

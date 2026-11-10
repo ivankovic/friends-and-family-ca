@@ -105,6 +105,10 @@ fn setting_up_creates_the_ca_and_says_what_comes_next() {
         screen.contains("Next, on the Nginx tab, tell it where nginx is"),
         "{screen}"
     );
+    assert!(
+        screen.contains("certificate and revocation list where nginx reads them"),
+        "one sentence, wrapped where the dialog ends:\n{screen}"
+    );
 
     key(&mut session, KeyCode::Enter);
     assert_shows(&mut session, "No one has a certificate yet");
@@ -150,6 +154,54 @@ fn a_folder_it_may_not_write_says_how_to_go_on() {
     assert!(screen.contains("Permission denied"), "{screen}");
     assert!(screen.contains("sudo"), "{screen}");
     assert!(screen.contains("--state-dir"), "{screen}");
+    assert!(session.app().is_none());
+}
+
+/// Without `sudo`, the CA's folder cannot be read. That is not "no CA here", which would offer
+/// to create one, and not a damaged CA, which would send its administrator to the backups.
+#[test]
+fn a_ca_it_may_not_read_says_to_run_as_root() {
+    let dir = crate::test_dir();
+    let state = dir.path().join("state");
+    Ca::create(&Store::new(&state), "Test", NOW, ca::DEFAULT_CA_VALIDITY).unwrap();
+    let lock = |mode: u32| {
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(mode)).unwrap();
+    };
+    lock(0o000);
+    if std::fs::metadata(state.join(ca::CERTIFICATE_FILE)).is_ok() {
+        return lock(0o700); // Running as root, which may read anywhere.
+    }
+    let mut session = session_in(dir.path());
+    lock(0o700);
+    let screen = screen(&mut session);
+    assert!(
+        screen.contains(&format!("Cannot read {}: run sudo ffca.", state.display())),
+        "{screen}"
+    );
+    assert!(!screen.contains("There is no CA"), "{screen}");
+    assert!(!screen.contains("Create the CA"), "{screen}");
+    assert!(!screen.contains("backup"), "{screen}");
+    assert!(session.app().is_none());
+    key(&mut session, KeyCode::Enter);
+    assert!(!session.should_quit());
+    key(&mut session, KeyCode::Char('q'));
+    assert!(session.should_quit());
+}
+
+/// The same for a key it may not read, in a folder it may.
+#[test]
+fn a_key_it_may_not_read_says_to_run_as_root() {
+    let dir = crate::test_dir();
+    let state = dir.path().join("state");
+    Ca::create(&Store::new(&state), "Test", NOW, ca::DEFAULT_CA_VALIDITY).unwrap();
+    let key_file = state.join(ca::KEY_FILE);
+    std::fs::set_permissions(&key_file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&key_file).is_ok() {
+        return; // Running as root.
+    }
+    let mut session = session_in(dir.path());
+    assert_shows(&mut session, "Cannot read");
+    assert_shows(&mut session, "sudo ffca");
     assert!(session.app().is_none());
 }
 

@@ -75,6 +75,8 @@ pub enum Action {
     },
     NextTab,
     PreviousTab,
+    /// Go to the tab at this place in the tab row, counted from 0.
+    GoToTab(usize),
     Help,
     CloseDialog,
     /// Open the form for a new person and their first device.
@@ -85,6 +87,8 @@ pub enum Action {
     },
     AskNewAgent,
     AskRevoke(Selection),
+    /// Ask before renewing: that issues a certificate, and an invite or files, at once.
+    AskRenew(Selection),
     AskRename(Selection),
     /// Issue a certificate to a device or an agent, created if new, and write it to files.
     Issue(Selection),

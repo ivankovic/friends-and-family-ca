@@ -22,7 +22,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Stylize};
 use ratatui::text::Line;
 
-use super::{Component, Scroll, step, text_dialog};
+use super::{Component, Scroll, hang, step, text_dialog, text_width};
 use crate::nginx::{Mode, Site};
 use crate::tui::action::Action;
 
@@ -93,7 +93,7 @@ impl ModeDialog {
 impl Component for ModeDialog {
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
-            KeyCode::Esc => return Some(Action::CloseDialog),
+            KeyCode::Esc | KeyCode::Char('q') => return Some(Action::CloseDialog),
             KeyCode::Up | KeyCode::Char('k') => {
                 self.selected = step(self.selected, false, Mode::ALL.len())
             }
@@ -114,6 +114,8 @@ impl Component for ModeDialog {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        const WIDTH: u16 = 92;
+        let width = text_width(WIDTH, area);
         let mut lines: Vec<Line> = vec!["Client certificate".bold().into()];
         for (i, (mode, description)) in Mode::ALL.iter().zip(DESCRIPTIONS).enumerate() {
             let marker = if i == self.selected { "› " } else { "  " };
@@ -128,7 +130,8 @@ impl Component for ModeDialog {
             } else {
                 ""
             };
-            lines.push(vec![marker.into(), name, description.dim(), now.dim()].into());
+            let line: Line = vec![marker.into(), name, description.dim(), now.dim()].into();
+            lines.extend(hang(line, 12, width));
         }
         lines.push(Line::default());
         // Requiring a certificate before anyone has one locks everyone out, the administrator
@@ -187,7 +190,7 @@ impl Component for ModeDialog {
             frame,
             area,
             self.site.name().to_string(),
-            92,
+            WIDTH,
             lines,
             &[("Enter", "apply"), ("Esc", "back")],
             &mut self.scroll,

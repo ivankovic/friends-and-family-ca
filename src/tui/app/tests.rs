@@ -134,7 +134,7 @@ fn issuing_to_a_new_person_writes_the_files_and_shows_them_in_the_tree() {
     assert!(fixture.out.join("anna-phone.key").exists());
     key(&mut app, KeyCode::Enter);
     let screen = screen(&mut app);
-    assert!(screen.contains("▾ Anna"), "{screen}");
+    assert!(screen.contains("│ Anna"), "{screen}");
     assert!(screen.contains("● phone          until 2028"), "{screen}");
     assert!(
         screen.contains("CN=Anna (phone),OU=people"),
@@ -225,6 +225,7 @@ fn revoking_a_person_lists_and_retires_every_device() {
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('y'));
     let ledger = fixture.ca().ledger().unwrap();
     assert!(
         ledger.people[0]
@@ -242,6 +243,7 @@ fn renewing_then_revoking_as_replaced_keeps_the_new_certificate() {
     let mut app = fixture.app(NOW);
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Char('u'));
+    key(&mut app, KeyCode::Enter);
     assert_shows(&mut app, "Issued to Anna (phone)");
     key(&mut app, KeyCode::Enter);
     assert_shows(&mut app, "2 valid certificates");
@@ -321,7 +323,7 @@ fn a_certificate_close_to_expiry_is_marked() {
     let fixture = Fixture::new();
     fixture.issue(ANNA_PHONE, NOW, 10);
     let mut app = fixture.app(NOW);
-    assert_shows(&mut app, "◐ phone          expires in 10 d");
+    assert_shows(&mut app, "◐ phone          10 d left");
 }
 
 #[test]
@@ -365,7 +367,7 @@ fn the_selection_survives_changes_by_other_processes() {
     fixture.issue(ANNA_PHONE, NOW, 365);
     app.reload(NOW);
     assert_eq!(app.people.selection(), selected);
-    assert_shows(&mut app, "▾ Anna");
+    assert_shows(&mut app, "│ Anna");
 }
 
 #[test]
@@ -684,8 +686,12 @@ fn the_enrollment_site_never_asks_for_a_certificate() {
     let settings = with_nginx(&fixture, "true", "true", Some("k.example.invalid"));
     let mut app = fixture.app(NOW);
     go_to(&mut app, Tab::Nginx);
-    assert_shows(&mut app, "enrollment site: never asks");
+    assert_shows(&mut app, "login off  enrollment site");
     key(&mut app, KeyCode::Down);
+    assert_shows(
+        &mut app,
+        "k.example.invalid is the enrollment site: it never asks for a certificate or a login.",
+    );
     key(&mut app, KeyCode::Char('s'));
     key(&mut app, KeyCode::Down);
     key(&mut app, KeyCode::Down);
@@ -829,7 +835,7 @@ fn the_invites_tab_shows_an_invite_again_and_cancels_it() {
     .unwrap();
     let mut app = fixture.app(NOW + Duration::hours(3));
     go_to(&mut app, Tab::Invites);
-    assert_shows(&mut app, "◐ Anna (phone)                   open, 21 h left");
+    assert_shows(&mut app, "◌ Anna (phone)   open, 21 h left");
     key(&mut app, KeyCode::Enter);
     assert_eq!(
         format!(
@@ -840,12 +846,19 @@ fn the_invites_tab_shows_an_invite_again_and_cancels_it() {
     );
     key(&mut app, KeyCode::Char('c'));
     assert_eq!(app.take_clipboard().as_deref(), Some(made.link.as_str()));
+    // The dialog covers the line that would say so, and says so itself.
+    assert_shows(&mut app, "✓ Link copied, if your terminal allows it");
     key(&mut app, KeyCode::Enter);
     key(&mut app, KeyCode::Char('c'));
     assert_eq!(
         app.take_clipboard().as_deref(),
         Some(made.link.as_str()),
         "the tab copies the selected invite's link too"
+    );
+    // On the tab no link is on screen: the notice says whose was copied, and how to see it.
+    assert_shows(
+        &mut app,
+        "Link for Anna (phone) copied, if your terminal allows it (OSC 52). Enter shows it.",
     );
     // Cancelling revokes a certificate: it asks first, and Esc leaves the invite open.
     key(&mut app, KeyCode::Char('x'));
@@ -858,10 +871,7 @@ fn the_invites_tab_shows_an_invite_again_and_cancels_it() {
         &mut app,
         "Cancelled the invite; its certificate is revoked.",
     );
-    assert_shows(
-        &mut app,
-        "✕ Anna (phone)                   cancelled 3 Oct 2026",
-    );
+    assert_shows(&mut app, "✕ Anna (phone)   cancelled 3 Oct 2026");
     let ledger = fixture.ca().ledger().unwrap();
     assert_eq!(
         ledger
@@ -899,7 +909,7 @@ fn a_collected_invite_shows_up_by_itself() {
     go_to(&mut app, Tab::Invites);
     assert_shows(
         &mut app,
-        "● Anna (phone)                   collected 3 Oct 2026 by 203.0.113.7, iPhone",
+        "● Anna (phone)   collected 3 Oct 2026 by iPhone at 203.0.113.7",
     );
 }
 
@@ -924,10 +934,7 @@ fn an_invite_never_collected_expires_and_its_certificate_goes() {
     let later = NOW + invite::VALIDITY + Duration::minutes(1);
     let mut app = fixture.app(later);
     go_to(&mut app, Tab::Invites);
-    assert_shows(
-        &mut app,
-        "○ Anna (phone)                   expired 4 Oct 2026",
-    );
+    assert_shows(&mut app, "○ Anna (phone)   expired 4 Oct 2026");
     let ledger = fixture.ca().ledger().unwrap();
     assert_eq!(
         ledger
@@ -998,7 +1005,7 @@ fn w_writes_the_enrollment_site_after_showing_it() {
     assert!(screen.contains("Enter write"), "{screen}");
     key(&mut app, KeyCode::Enter);
     assert_shows(&mut app, "k.example.org is up; nginx reloaded.");
-    assert_shows(&mut app, "enrollment site: never asks");
+    assert_shows(&mut app, "login off  enrollment site");
     let written = std::fs::read_to_string(settings.sites.join(nginx::ENROLLMENT_FILE)).unwrap();
     assert!(
         written.contains("set $ffca_enrollment http://ffca:8080;"),
@@ -1258,16 +1265,53 @@ fn help_scrolls_on_80_by_24_down_to_its_last_line() {
     let first = screen_of(&mut app, 80, 24);
     assert!(first.contains("↓ more"), "{first}");
     assert!(first.contains("Enter close"), "{first}");
-    assert!(!first.contains("but the newest."), "{first}");
+    assert!(!first.contains("hourly refresh timer"), "{first}");
     key(&mut app, KeyCode::End);
     let last = screen_of(&mut app, 80, 24);
     assert!(
-        last.contains("on the CA tab: set up the hourly refresh timer"),
+        last.contains("T               set up the hourly refresh timer, after showing it"),
         "{last}"
     );
-    assert!(last.contains("but the newest."), "{last}");
     assert!(last.contains("↑ more"), "{last}");
     assert!(last.contains("Enter close"), "{last}");
+}
+
+/// The help opens on the keys of the tab that shows, and lists every key there is - the ones
+/// the hint line has no room for most of all.
+#[test]
+fn help_starts_with_the_tab_that_shows_and_lists_every_key() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('?'));
+    let first = screen(&mut app);
+    let heading = |title: &str| {
+        first
+            .find(title)
+            .unwrap_or_else(|| panic!("{title}:\n{first}"))
+    };
+    assert!(
+        heading("Nginx - this tab") < heading("Everywhere"),
+        "{first}"
+    );
+    assert!(
+        heading("Everywhere") < heading("│ People & agents "),
+        "{first}"
+    );
+    key(&mut app, KeyCode::End);
+    let all = format!("{first}\n{}", screen(&mut app));
+    for expected in [
+        "Tab  Shift-Tab  the next tab, the previous one",
+        "1 2 3 4 5       People & agents, Invites, Nginx, Users, CA",
+        "Home End  g G   to the first, to the last",
+        "Space           in a site's login: tick or untick the selected user",
+        "PgUp PgDn       scroll the details",
+        "Esc  q          close it, changing nothing",
+        "Enter           show an open invite's QR code again, or a closed one's",
+        "x               cancel an open invite, after asking",
+    ] {
+        assert!(all.contains(expected), "no {expected:?} in\n{all}");
+    }
 }
 
 #[test]
@@ -1305,16 +1349,692 @@ fn control_u_and_w_clear_a_form_field() {
     assert_shows(&mut app, "Site configs        /srv/sites ");
 }
 
+/// 80 by 24 with a device selected, which has the most keys: all of them are on the hint line,
+/// and the keys every tab shares are at the end of the tab row.
 #[test]
-fn the_hint_line_keeps_help_and_quit_on_80_columns() {
+fn every_key_is_offered_on_80_columns() {
     let fixture = Fixture::new();
     fixture.issue(ANNA_PHONE, NOW, 700);
     let mut app = fixture.app(NOW);
     key(&mut app, KeyCode::Down);
     let screen = screen_of(&mut app, 80, 24);
-    let hints = screen.lines().last().unwrap();
-    assert!(hints.ends_with("? help  q quit"), "{hints:?}");
-    assert!(hints.starts_with(" p new person"), "{hints:?}");
+    let rows: Vec<&str> = screen.lines().collect();
+    assert_eq!(
+        rows[23],
+        " p new person  n new device  a new agent  u renew  r revoke  R rename  / filter"
+    );
+    assert!(
+        rows[1].starts_with(" People & agents │ Invites"),
+        "{screen}"
+    );
+    assert!(
+        rows[1].ends_with("CA      Tab switch  ? help  q quit"),
+        "{screen}"
+    );
+    key(&mut app, KeyCode::Up);
+    let screen = screen_of(&mut app, 80, 24);
+    assert_eq!(
+        screen.lines().last().unwrap(),
+        " p new person  n new device  a new agent  r revoke all  R rename  / filter"
+    );
+    go_to(&mut app, Tab::Nginx);
+    with_enrollment(&fixture);
+    app.reload(NOW);
+    let screen = screen_of(&mut app, 80, 24);
+    assert_eq!(
+        screen.lines().last().unwrap(),
+        " e settings  s client certificate  l login  t test  w rewrite enrollment site"
+    );
+}
+
+/// What the tabs count takes room from the shared keys: they go one by one, the help last, and
+/// where the tab row has no room at all the help is on the hint line.
+#[test]
+fn the_way_to_the_help_is_never_dropped() {
+    let fixture = Fixture::new();
+    with_enrollment(&fixture);
+    fixture.issue(ANNA_LAPTOP, NOW, 10);
+    invite::make(
+        &fixture.ca(),
+        &invites_folder(&fixture),
+        ANNA_PHONE,
+        "k.example.invalid",
+        NOW,
+    )
+    .unwrap();
+    let mut app = fixture.app(NOW);
+    let screen = screen_of(&mut app, 80, 24);
+    let tabs = screen.lines().nth(1).unwrap();
+    assert!(
+        tabs.starts_with(" People & agents · 1 expiring │ Invites · 1 open │ Nginx"),
+        "{screen}"
+    );
+    assert!(tabs.ends_with("CA    ? help"), "{screen}");
+    let narrow = screen_of(&mut app, 60, 20);
+    assert!(
+        narrow.lines().last().unwrap().ends_with("? help"),
+        "{narrow}"
+    );
+    // While the filter is typed, ? is text like any other key: it is not offered.
+    key(&mut app, KeyCode::Char('/'));
+    let typing = screen_of(&mut app, 80, 24);
+    assert!(!typing.contains("? help"), "{typing}");
+}
+
+#[test]
+fn digits_go_straight_to_a_tab() {
+    let fixture = Fixture::new();
+    fixture.issue(ANNA_PHONE, NOW, 700);
+    let mut app = fixture.app(NOW);
+    for (digit, tab) in [
+        ('3', Tab::Nginx),
+        ('5', Tab::Ca),
+        ('2', Tab::Invites),
+        ('4', Tab::Users),
+        ('1', Tab::People),
+    ] {
+        key(&mut app, KeyCode::Char(digit));
+        assert_eq!(app.tab, tab, "after {digit}");
+    }
+    key(&mut app, KeyCode::BackTab);
+    assert_eq!(app.tab, Tab::Ca);
+    key(&mut app, KeyCode::Tab);
+    key(&mut app, KeyCode::Char('/'));
+    key(&mut app, KeyCode::Char('3'));
+    assert_eq!(
+        app.tab,
+        Tab::People,
+        "typed into the filter, a digit is text"
+    );
+    assert_shows(&mut app, "/3");
+}
+
+/// The cells of a drawn screen: for what its text alone does not show.
+fn cells(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    terminal.backend().buffer().clone()
+}
+
+/// On a terminal without colour, or with a faint cyan, the tab that shows still stands out.
+#[test]
+fn the_tab_that_shows_is_marked_by_more_than_colour() {
+    use ratatui::style::Modifier;
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    let tabs = screen(&mut app).lines().nth(1).unwrap().to_owned();
+    let column = |title: &str| tabs[..tabs.find(title).unwrap()].chars().count() as u16;
+    let buffer = cells(&mut app, 110, 40);
+    let style = |title: &str| buffer[(column(title), 1)].modifier;
+    assert!(style("Nginx").contains(Modifier::REVERSED));
+    assert!(style("Nginx").contains(Modifier::BOLD));
+    for other in ["People", "Invites", "Users", "CA"] {
+        assert!(
+            !style(other).intersects(Modifier::REVERSED | Modifier::BOLD),
+            "{other}"
+        );
+    }
+}
+
+/// Esc closes what is open and drops the filter, and stops there: a press too many does not
+/// end the session. `q` closes the dialogs that take no text.
+#[test]
+fn esc_closes_and_clears_but_never_quits() {
+    let fixture = Fixture::new();
+    fixture.issue(ANNA_PHONE, NOW, 700);
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Esc);
+    assert!(!app.should_quit());
+    key(&mut app, KeyCode::Char('/'));
+    type_text(&mut app, "an");
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "╭ /an ");
+    assert_shows(&mut app, "Esc clear");
+    key(&mut app, KeyCode::Esc);
+    let screen = screen(&mut app);
+    assert!(!screen.contains("/an"), "{screen}");
+    key(&mut app, KeyCode::Esc);
+    assert!(!app.should_quit());
+
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Char('r'));
+    assert_shows(&mut app, "Why?");
+    key(&mut app, KeyCode::Char('q'));
+    let screen = self::screen(&mut app);
+    assert!(!screen.contains("Why?"), "q closes the dialog:\n{screen}");
+    assert!(!app.should_quit());
+    key(&mut app, KeyCode::Char('q'));
+    assert!(app.should_quit());
+}
+
+/// Renewing issues a certificate at once, and an invite or a key file with it: it asks first.
+#[test]
+fn renewing_asks_first() {
+    let fixture = Fixture::new();
+    fixture.issue(ANNA_PHONE, NOW - Duration::days(300), 365);
+    let certificates = || {
+        fixture.ca().ledger().unwrap().people[0].devices[0]
+            .certificates
+            .len()
+    };
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Char('u'));
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(screen.contains("Renew Anna · phone"), "{screen}");
+    assert!(
+        screen.contains("A new certificate, written with its key to files in"),
+        "{screen}"
+    );
+    assert!(screen.contains("until you revoke"), "{screen}");
+    assert!(screen.contains("Enter renew  Esc back"), "{screen}");
+    assert_eq!(certificates(), 1, "nothing is issued by asking");
+    key(&mut app, KeyCode::Esc);
+    assert_eq!(certificates(), 1);
+    key(&mut app, KeyCode::Char('u'));
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(certificates(), 2);
+    assert_shows(&mut app, "Issued to Anna (phone)");
+}
+
+/// A revocation cannot be taken back, and the dialog says so. A person's reaches every device
+/// they have: Enter alone does not do it.
+#[test]
+fn revoking_a_person_takes_a_key_that_habit_does_not_press() {
+    let fixture = Fixture::new();
+    fixture.issue(ANNA_PHONE, NOW, 365);
+    fixture.issue(ANNA_LAPTOP, NOW, 365);
+    let revoked = || {
+        let ledger = fixture.ca().ledger().unwrap();
+        ledger
+            .certificates()
+            .filter(|(_, c)| c.status(NOW) == Status::Revoked)
+            .count()
+    };
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Char('r'));
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(screen.contains("It cannot be undone"), "{screen}");
+    assert!(screen.contains("Enter continue  Esc back"), "{screen}");
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(revoked(), 0, "Enter, however often, revokes nobody");
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(
+        screen.contains("Revoke all 2 certificates of Anna? Press y to revoke, Esc to go back."),
+        "{screen}"
+    );
+    assert!(screen.contains("y revoke  Esc back"), "{screen}");
+    // Choosing another reason is thinking again: the question is asked anew.
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Char('y'));
+    assert_eq!(revoked(), 0);
+    // "Replaced" keeps each device's only certificate: nothing to revoke, nothing to ask.
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(
+        screen.contains("Nothing: there is no older certificate"),
+        "{screen}"
+    );
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('y'));
+    assert_eq!(revoked(), 0);
+    key(&mut app, KeyCode::Down);
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('y'));
+    assert_eq!(revoked(), 2);
+}
+
+/// On 80 columns the CRL's warning is as wide as most of the row: the CA's name gives way to
+/// it, visibly, and an expired CRL has a row of its own on every tab.
+#[test]
+fn what_the_crl_says_never_writes_over_the_title() {
+    let fixture = Fixture::new();
+    fixture.issue(ANNA_PHONE, NOW, 700);
+    let mut app = fixture.app(NOW + Duration::days(25));
+    let screen = screen_of(&mut app, 80, 24);
+    assert_eq!(
+        screen.lines().next().unwrap(),
+        " Friends and Family CA · Tes… CRL expires in 5 d: is the refresh timer running?"
+    );
+    let mut app = fixture.app(NOW + Duration::days(40));
+    for tab in [Tab::People, Tab::Ca] {
+        go_to(&mut app, tab);
+        let screen = screen_of(&mut app, 80, 24);
+        let rows: Vec<&str> = screen.lines().collect();
+        assert!(
+            rows[0].starts_with(" Friends and Family CA · Test family "),
+            "{screen}"
+        );
+        assert_eq!(
+            rows[1],
+            " CRL EXPIRED: everyone is refused. Press c on the CA tab."
+        );
+        assert!(rows[2].starts_with(" People & agents"), "{screen}");
+    }
+    key(&mut app, KeyCode::Char('c'));
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(!screen.contains("CRL EXPIRED"), "{screen}");
+    assert!(
+        screen
+            .lines()
+            .nth(1)
+            .unwrap()
+            .starts_with(" People & agents")
+    );
+}
+
+/// A notice longer than the screen is wide takes a second row instead of losing its end.
+#[test]
+fn a_long_notice_wraps_on_80_columns() {
+    let fixture = Fixture::new();
+    with_enrollment(&fixture);
+    let mut app = fixture.app(NOW);
+    for (person, device) in [
+        ("Anna", "phone"),
+        (
+            "Maria-Magdalena Ivankovic-Horvat",
+            "Samsung Galaxy Tab S9 Ultra",
+        ),
+    ] {
+        let made = invite::make(
+            &fixture.ca(),
+            &invites_folder(&fixture),
+            Holder::Device { person, device },
+            "k.example.invalid",
+            NOW,
+        )
+        .unwrap();
+        let token = made.link.rsplit('/').next().unwrap();
+        invite::collect(&invites_folder(&fixture), token, NOW, "203.0.113.7, iPhone").unwrap();
+    }
+    app.reload(NOW + Duration::minutes(1));
+    let screen = screen_of(&mut app, 80, 24);
+    let rows: Vec<&str> = screen.lines().collect();
+    assert!(
+        rows[21].starts_with(" Anna (phone), Maria-Magdalena"),
+        "{screen}"
+    );
+    assert_eq!(rows[22], " collected their invites.");
+    assert!(rows[23].starts_with(" p new person"), "{screen}");
+}
+
+#[test]
+fn an_error_on_the_notice_line_is_marked_as_one() {
+    let fixture = Fixture::new();
+    fixture.issue(ANNA_PHONE, NOW, 365);
+    fixture
+        .ca()
+        .revoke(Target::Person("Anna"), Reason::Retired, NOW)
+        .unwrap();
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Char('r'));
+    assert_shows(&mut app, " ✕ Anna has no valid certificate to revoke");
+}
+
+/// Why something asked for did not happen is shown whole and stays: in a dialog, not on a line
+/// that ends where the screen does.
+#[test]
+fn a_failure_is_shown_whole_on_80_columns() {
+    let fixture = Fixture::new();
+    with_enrollment(&fixture);
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('w'));
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(
+        screen.contains("╭ The enrollment site cannot be written "),
+        "{screen}"
+    );
+    assert!(screen.contains("has no ssl_certificate of its"), "{screen}");
+    assert!(screen.contains("own to copy"), "{screen}");
+    assert!(screen.contains("Enter close"), "{screen}");
+}
+
+/// The dialog that shows an invite covers the notice line, and the device may collect the
+/// invite while it is up: the dialog says so, in place of a code that leads nowhere now.
+#[test]
+fn an_invite_collected_while_its_code_is_up_says_so_there() {
+    let fixture = Fixture::new();
+    with_enrollment(&fixture);
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Char('p'));
+    type_text(&mut app, "Anna");
+    key(&mut app, KeyCode::Enter);
+    type_text(&mut app, "phone");
+    key(&mut app, KeyCode::Enter);
+    let shown = screen_of(&mut app, 80, 24);
+    assert!(shown.contains("▀▀▀"), "{shown}");
+    let token = token_on_screen(&shown);
+    app.reload(NOW + Duration::seconds(30));
+    assert!(screen_of(&mut app, 80, 24).contains("▀▀▀"), "still open");
+    invite::collect(
+        &invites_folder(&fixture),
+        &token,
+        NOW + Duration::minutes(1),
+        "203.0.113.7, iPhone",
+    )
+    .unwrap();
+    app.reload(NOW + Duration::minutes(1));
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(!screen.contains('▀'), "{screen}");
+    assert!(
+        screen.contains("Collected just now, from iPhone at 203.0.113.7."),
+        "{screen}"
+    );
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "● phone          until 2028");
+}
+
+/// A longer host name makes a longer link and a larger code. 80 by 24 still shows the code, and
+/// the link whole, over two rows.
+#[test]
+fn a_long_enrollment_host_still_gets_its_code_on_80_by_24() {
+    let fixture = Fixture::new();
+    let host = "enrollment.family-name.example.org";
+    with_nginx(&fixture, "true", "true", Some(host));
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Char('p'));
+    type_text(&mut app, "Anna");
+    key(&mut app, KeyCode::Enter);
+    type_text(&mut app, "phone");
+    key(&mut app, KeyCode::Enter);
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(screen.contains("▀▀▀"), "{screen}");
+    assert!(screen.contains("Invite for Anna (phone)"), "{screen}");
+    assert!(screen.contains("The link takes 2 rows here"), "{screen}");
+    let rows: Vec<&str> = screen.lines().collect();
+    let first = rows.iter().position(|r| r.starts_with("https://")).unwrap();
+    let link = format!("{}{}", rows[first], rows[first + 1]);
+    let token = link
+        .strip_prefix(&format!("https://{host}/i/"))
+        .expect(&screen);
+    assert_eq!(token.len(), 43, "{screen}");
+    assert_eq!(
+        invite::open(&invites_folder(&fixture), token, NOW)
+            .unwrap()
+            .holder,
+        "Anna (phone)"
+    );
+    assert_eq!(rows[23], "c copy link  Enter close");
+}
+
+/// A value longer than its row - a `docker compose` command, a deep path - stays on its row:
+/// the fields under it, the cursor and the message keep their places.
+#[test]
+fn a_long_value_keeps_its_row_and_the_form_its_message() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Char('e'));
+    (0..3).for_each(|_| key(&mut app, KeyCode::Down));
+    retype(
+        &mut app,
+        "docker compose -f /srv/domaci/docker-compose.yml exec nginx nginx -t",
+    );
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let cursor = terminal.get_cursor_position().unwrap();
+    let screen = screen_of(&mut app, 80, 24);
+    let rows: Vec<&str> = screen.lines().collect();
+    let row = rows
+        .iter()
+        .position(|r| r.contains("Test command"))
+        .unwrap();
+    assert!(
+        rows[row].contains("Test command        …") && rows[row].contains("exec nginx nginx -t"),
+        "the end, where the cursor is:\n{screen}"
+    );
+    assert!(
+        rows[row + 1].contains("Reload command      nginx -s reload"),
+        "{screen}"
+    );
+    assert_eq!(usize::from(cursor.y), row, "{screen}");
+    assert!(screen.contains("serve, running as uid:gid."), "{screen}");
+    // Left behind, the field shows its start.
+    key(&mut app, KeyCode::Up);
+    assert!(
+        screen_of(&mut app, 80, 24).contains("Test command        docker compose -f"),
+        "{screen}"
+    );
+    (0..2).for_each(|_| key(&mut app, KeyCode::Up));
+    retype(
+        &mut app,
+        "/nonexistent/folder/that/is/rather/long/to/make/the/error/wrap/conf.d",
+    );
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL),
+        NOW,
+    );
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(screen.contains("✕ cannot read"), "{screen}");
+    assert!(screen.contains("(os error 2)"), "{screen}");
+    assert!(screen.contains("Page runs as"), "{screen}");
+    assert!(screen.contains("Esc cancel"), "{screen}");
+}
+
+/// On 80 columns the tree is as wide as the details allow, and what a device's state is takes
+/// few words: a name of fifteen characters is whole.
+#[test]
+fn the_tree_gives_names_the_room_there_is_on_80_columns() {
+    let fixture = Fixture::new();
+    fixture.issue(
+        Holder::Device {
+            person: "Anna",
+            device: "work laptop XPS",
+        },
+        NOW,
+        700,
+    );
+    fixture.issue(ANNA_PHONE, NOW, 10);
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Down);
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(screen.contains("● work laptop XPS until 2028"), "{screen}");
+    assert!(screen.contains("◐ phone           10 d left"), "{screen}");
+    assert!(
+        screen.contains("valid until 2 Sep 2028"),
+        "the details keep their line whole:\n{screen}"
+    );
+}
+
+/// Smaller than the UI can draw itself, it says so, and takes no key for what it does not
+/// show.
+#[test]
+fn a_terminal_too_small_says_so_and_takes_no_keys() {
+    let fixture = Fixture::new();
+    fixture.issue(ANNA_PHONE, NOW, 365);
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Down);
+    let screen = screen_of(&mut app, 50, 12);
+    assert!(screen.contains("This terminal is 50 by 12"), "{screen}");
+    assert!(screen.contains("60 by 16 or more"), "{screen}");
+    assert!(!screen.contains("phone"), "{screen}");
+    key(&mut app, KeyCode::Char('r'));
+    key(&mut app, KeyCode::Enter);
+    let ledger = fixture.ca().ledger().unwrap();
+    assert_eq!(
+        ledger.people[0].devices[0].certificates[0].status(NOW),
+        Status::Valid
+    );
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(
+        screen.contains("● phone") && !screen.contains("Why?"),
+        "{screen}"
+    );
+    screen_of(&mut app, 50, 12);
+    key(&mut app, KeyCode::Char('q'));
+    assert!(app.should_quit());
+}
+
+/// The Invites tab on 80 columns: a long holder is cut where its column ends, an open invite
+/// has the mark it has in the tree, and of where an invite was collected the kind of device
+/// comes first - it is the address that the row may have no room for.
+#[test]
+fn the_invites_tab_fits_80_columns_and_tells_the_device_first() {
+    let fixture = Fixture::new();
+    with_enrollment(&fixture);
+    let invite = |person: &str, device: &str| {
+        invite::make(
+            &fixture.ca(),
+            &invites_folder(&fixture),
+            Holder::Device { person, device },
+            "k.example.invalid",
+            NOW,
+        )
+        .unwrap()
+    };
+    invite(
+        "Maria-Magdalena Ivankovic-Horvat",
+        "Samsung Galaxy Tab S9 Ultra",
+    );
+    let made = invite("Anna", "phone");
+    invite::collect(
+        &invites_folder(&fixture),
+        made.link.rsplit('/').next().unwrap(),
+        NOW,
+        "2a02:8108:1234:5678:9abc:def0:1234:5678, iPhone",
+    )
+    .unwrap();
+    let mut app = fixture.app(NOW + Duration::hours(1));
+    go_to(&mut app, Tab::Invites);
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(
+        screen.contains("│ ◌ Maria-Magdalena Ivankovic-Hor… open, 23 h left"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains(
+            "│ ● Anna (phone)                   collected 3 Oct 2026 by iPhone at 2a02:8108…│"
+        ),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Enter show  c copy link  x cancel"),
+        "{screen}"
+    );
+    // A closed invite has nothing to show again, but when and from where it was collected.
+    key(&mut app, KeyCode::Down);
+    assert!(screen_of(&mut app, 80, 24).contains(" Enter details"));
+    key(&mut app, KeyCode::Enter);
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(screen.contains("╭ Invite for Anna (phone) "), "{screen}");
+    assert!(
+        screen.contains("Collected 3 Oct 2026 12:00 UTC by iPhone at"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("2a02:8108:1234:5678:9abc:def0:1234:5678."),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("Made         3 Oct 2026 12:00 UTC"),
+        "{screen}"
+    );
+    assert!(!screen.contains('▀'), "{screen}");
+}
+
+/// A device renewed many times has more certificates than the details have rows.
+#[test]
+fn details_taller_than_their_pane_scroll() {
+    let fixture = Fixture::new();
+    for day in 0..14 {
+        fixture.issue(ANNA_PHONE, NOW - Duration::days(day), 365);
+    }
+    fixture.issue(ANNA_LAPTOP, NOW, 365);
+    let mut app = fixture.app(NOW);
+    key(&mut app, KeyCode::Down);
+    let top = screen_of(&mut app, 80, 24);
+    assert!(top.contains("Anna · phone"), "{top}");
+    assert!(top.contains("↓ more · PgDn"), "{top}");
+    assert!(!top.contains("as replaced."), "{top}");
+    key(&mut app, KeyCode::PageDown);
+    let end = screen_of(&mut app, 80, 24);
+    assert!(end.contains("as replaced."), "{end}");
+    assert!(end.contains("↑ more · PgUp"), "{end}");
+    // Another device's details start at their top.
+    key(&mut app, KeyCode::Down);
+    let other = screen_of(&mut app, 80, 24);
+    assert!(other.contains("Anna · laptop"), "{other}");
+    assert!(!other.contains("more ·"), "{other}");
+}
+
+/// The tree scrolls only when the selection would leave it: moving back up among the rows that
+/// show leaves them where they are.
+#[test]
+fn the_tree_stays_put_while_the_selection_moves_within_it() {
+    let fixture = Fixture::new();
+    for person in 0..8 {
+        for device in ["phone", "laptop", "tablet"] {
+            fixture.issue(
+                Holder::Device {
+                    person: &format!("Person{person}"),
+                    device,
+                },
+                NOW,
+                365,
+            );
+        }
+    }
+    let mut app = fixture.app(NOW);
+    let tree = |screen: &str| -> Vec<String> {
+        screen
+            .lines()
+            .skip(3)
+            .take(18)
+            .map(|row| row.chars().take(30).collect())
+            .collect()
+    };
+    (0..25).for_each(|_| key(&mut app, KeyCode::Down));
+    let down = tree(&screen_of(&mut app, 80, 24));
+    assert!(down[17].contains("phone"), "{down:?}");
+    (0..5).for_each(|_| key(&mut app, KeyCode::Up));
+    assert_eq!(tree(&screen_of(&mut app, 80, 24)), down);
+}
+
+/// What 80 columns used to cut: the Users tab's first line, a site's note, a wrapped option.
+#[test]
+fn text_keeps_to_80_columns_and_wraps_under_itself() {
+    let fixture = Fixture::new();
+    with_enrollment(&fixture);
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Users);
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(screen.contains("is on (Nginx tab, l)."), "{screen}");
+    go_to(&mut app, Tab::Nginx);
+    key(&mut app, KeyCode::Down);
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(screen.contains("login off  enrollment site  "), "{screen}");
+    assert!(
+        screen.contains(
+            " k.example.invalid is the enrollment site: it never asks for a certificate or a"
+        ),
+        "{screen}"
+    );
+    key(&mut app, KeyCode::Up);
+    key(&mut app, KeyCode::Char('s'));
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(
+        screen.contains(
+            "│   optional  asked for; without one you get in, a revoked or broken one is"
+        ),
+        "{screen}"
+    );
+    assert!(screen.contains("│             refused"), "{screen}");
+    // A dialog that would leave a few columns of the tab beside it takes the whole width.
+    assert!(
+        screen
+            .lines()
+            .any(|row| row.starts_with("╭ books.example.org ─")),
+        "{screen}"
+    );
+    key(&mut app, KeyCode::Esc);
+    go_to(&mut app, Tab::Ca);
+    let screen = screen_of(&mut app, 80, 24);
+    assert!(
+        screen.contains("has to be issued\n  again."),
+        "the warning wraps under its margin:\n{screen}"
+    );
 }
 
 #[test]
@@ -1436,7 +2156,7 @@ fn the_tree_shows_an_invite_waiting_then_collected() {
     .unwrap();
     app.reload(NOW + Duration::minutes(6));
     assert_shows(&mut app, "● phone          until 2028");
-    assert_shows(&mut app, "collected 3 Oct 2026 by 203.0.113.7, iPhone");
+    assert_shows(&mut app, "collected 3 Oct 2026 by iPhone at 203.0.113.7");
     assert_shows(&mut app, "issued 3 Oct 2026");
 }
 
@@ -1512,7 +2232,7 @@ fn slash_narrows_the_tree_and_keys_typed_are_text() {
         "{shown}"
     );
     assert!(!shown.contains("tablet"), "{shown}");
-    assert_shows(&mut app, "Esc drop filter");
+    assert_shows(&mut app, "Esc clear");
     // Esc drops the filter rather than quitting.
     key(&mut app, KeyCode::Esc);
     assert!(!app.should_quit());

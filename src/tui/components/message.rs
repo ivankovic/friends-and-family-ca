@@ -16,19 +16,23 @@
  */
 //! A dialog that tells: what was issued and where its files are, the help - or what is about to
 //! happen, for Enter to confirm.
+//!
+//! Each line wraps by words, and may hang: the rows it wraps onto are indented, so that the help's
+//! descriptions stay in their column beside the keys.
 
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
-use super::{Component, Hint, Scroll, text_dialog};
+use super::{Component, Hint, Scroll, hang_all, text_dialog, text_width};
 use crate::tui::action::Action;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Message {
     title: String,
-    lines: Vec<Line<'static>>,
+    /// Each line with the indent of the rows it wraps onto.
+    lines: Vec<(usize, Line<'static>)>,
     /// What Enter does, if it does more than close: the dialog asks before it.
     confirm: Option<(Action, &'static str)>,
     scroll: Scroll,
@@ -36,6 +40,11 @@ pub struct Message {
 
 impl Message {
     pub fn new(title: impl Into<String>, lines: Vec<Line<'static>>) -> Message {
+        Message::hanging(title, lines.into_iter().map(|line| (0, line)).collect())
+    }
+
+    /// A message whose lines each come with the indent of the rows they wrap onto.
+    pub fn hanging(title: impl Into<String>, lines: Vec<(usize, Line<'static>)>) -> Message {
         Message {
             title: title.into(),
             lines,
@@ -75,8 +84,9 @@ impl Component for Message {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        const WIDTH: u16 = 76;
         let mut lines = vec![Line::default()];
-        lines.extend(self.lines.iter().cloned());
+        lines.extend(hang_all(self.lines.clone(), text_width(WIDTH, area)));
         let keys: &[Hint] = match &self.confirm {
             Some((_, what)) => &[("Enter", what), ("Esc", "back")],
             None => &[("Enter", "close")],
@@ -85,7 +95,7 @@ impl Component for Message {
             frame,
             area,
             self.title.clone(),
-            76,
+            WIDTH,
             lines,
             keys,
             &mut self.scroll,
