@@ -77,15 +77,21 @@ pub fn make(ca: &Ca, issued: &Issued, stem: &str) -> Result<Bundle> {
 /// (no 0/o, 1/l/i). About 79 bits.
 fn password() -> Result<String> {
     const ALPHABET: &[u8] = b"abcdefghjkmnpqrstuvwxyz23456789";
-    let mut bytes = [0u8; 16];
-    getrandom::fill(&mut bytes).map_err(|e| anyhow!("no randomness available: {e}"))?;
+    // Rejection sampling: no letter more likely than another.
+    let limit = 256 - 256 % ALPHABET.len();
     let mut password = String::new();
-    for (i, byte) in bytes.iter().enumerate() {
-        if i > 0 && i % 4 == 0 {
+    let mut letters = 0;
+    while letters < 16 {
+        let mut byte = [0u8; 1];
+        getrandom::fill(&mut byte).map_err(|e| anyhow!("no randomness available: {e}"))?;
+        if usize::from(byte[0]) >= limit {
+            continue;
+        }
+        if letters > 0 && letters % 4 == 0 {
             password.push('-');
         }
-        // 256 % 31 leaves a bias of under 3% on a few characters; harmless at 79 bits.
-        password.push(char::from(ALPHABET[usize::from(*byte) % ALPHABET.len()]));
+        password.push(char::from(ALPHABET[usize::from(byte[0]) % ALPHABET.len()]));
+        letters += 1;
     }
     Ok(password)
 }

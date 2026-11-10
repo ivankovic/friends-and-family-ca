@@ -1144,3 +1144,100 @@ fn a_signing_request_whose_signature_does_not_match_its_key_is_refused() {
     }
     assert_eq!(ca.ledger().unwrap().certificates().count(), 0);
 }
+
+/// The key encrypted to the machine: the plain file is gone, the CA opens and signs as before,
+/// and decrypting puts the same key back.
+#[test]
+fn an_encrypted_key_still_signs_and_decrypts_to_the_same_key() {
+    let dir = crate::test_dir();
+    let state = dir.path().join("state");
+    let ca = new_ca(&state);
+    let encrypter = crate::test_encrypter(dir.path());
+    let plain = std::fs::read_to_string(state.join(KEY_FILE)).unwrap();
+    assert!(!ca.key_encrypted());
+
+    ca.encrypt_key(&encrypter).unwrap();
+    assert!(ca.key_encrypted());
+    assert!(!state.join(KEY_FILE).exists());
+    assert_eq!(mode_of(&state.join(ENCRYPTED_KEY_FILE)), 0o600);
+    let on_disk = std::fs::read_to_string(state.join(ENCRYPTED_KEY_FILE)).unwrap();
+    assert!(!on_disk.contains("PRIVATE KEY"), "{on_disk}");
+
+    let reopened = Ca::open_with(&Store::new(&state), &encrypter).unwrap();
+    let issued = reopened
+        .issue(
+            device("Anna", "phone"),
+            Key::Generate,
+            NOW,
+            DEFAULT_CLIENT_VALIDITY,
+        )
+        .unwrap();
+    reopened.refresh_crl(NOW).unwrap();
+    let signed_since = crl(&reopened);
+    verify(&reopened, &issued.certificate_pem, Some(&signed_since), NOW).unwrap();
+
+    reopened.decrypt_key().unwrap();
+    assert!(!reopened.key_encrypted());
+    assert!(!state.join(ENCRYPTED_KEY_FILE).exists());
+    assert_eq!(mode_of(&state.join(KEY_FILE)), 0o600);
+    assert_eq!(
+        std::fs::read_to_string(state.join(KEY_FILE)).unwrap(),
+        plain
+    );
+    Ca::open(&Store::new(&state)).unwrap();
+}
+
+/// Whatever goes wrong while encrypting, the CA keeps a key it can open: a command that fails,
+/// one that hands the key back as it was, one whose output it cannot decrypt again.
+#[test]
+fn a_key_that_cannot_be_encrypted_is_left_as_it_was() {
+    let dir = crate::test_dir();
+    let state = dir.path().join("state");
+    let ca = new_ca(&state);
+    let plain = std::fs::read_to_string(state.join(KEY_FILE)).unwrap();
+    let one_way = dir.path().join("one-way.sh");
+    std::fs::write(
+        &one_way,
+        "#!/bin/sh\ncase \"$1\" in encrypt) cat >/dev/null; echo sealed;; *) exit 1;; esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&one_way, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let as_it_was = dir.path().join("as-it-was.sh");
+    std::fs::write(&as_it_was, "#!/bin/sh\ncat\n").unwrap();
+    std::fs::set_permissions(&as_it_was, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (encrypter, says) in [
+        ("false", "cannot encrypt"),
+        ("/nonexistent/systemd-creds", "cannot encrypt"),
+        (as_it_was.to_str().unwrap(), "did not encrypt"),
+        (one_way.to_str().unwrap(), "does not decrypt"),
+    ] {
+        let error = ca.encrypt_key(encrypter).unwrap_err();
+        assert!(
+            format!("{error:#}").contains(says),
+            "{encrypter}: {error:#}"
+        );
+        assert!(!ca.key_encrypted());
+        assert!(!state.join(ENCRYPTED_KEY_FILE).exists(), "{encrypter}");
+        assert_eq!(
+            std::fs::read_to_string(state.join(KEY_FILE)).unwrap(),
+            plain
+        );
+    }
+    Ca::open(&Store::new(&state)).unwrap();
+}
+
+/// A copy of the folder on another machine, which cannot decrypt the key, says what to do.
+#[test]
+fn an_encrypted_key_opens_only_where_it_was_encrypted() {
+    let dir = crate::test_dir();
+    let state = dir.path().join("state");
+    let ca = new_ca(&state);
+    ca.encrypt_key(&crate::test_encrypter(dir.path())).unwrap();
+    let error = Ca::open_with(&Store::new(&state), "false").err().unwrap();
+    let text = format!("{error:#}");
+    assert!(text.contains("ca.key.cred"), "{text}");
+    assert!(
+        text.contains("restore the copy of the key you kept"),
+        "{text}"
+    );
+}

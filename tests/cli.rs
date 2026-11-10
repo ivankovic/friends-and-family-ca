@@ -50,6 +50,61 @@ fn init_creates_the_ca_and_says_where_to_point_the_web_server() {
     assert!(error.contains("already holds a CA"), "{error}");
 }
 
+/// `ffca key encrypt` and `decrypt`, with a script standing in for `systemd-creds` on the PATH:
+/// every command still opens the CA while its key is encrypted, and decrypting puts the same
+/// key back.
+#[test]
+fn the_key_can_be_encrypted_to_the_machine_and_put_back() {
+    let ffca = Ffca::initialised();
+    let bin = ffca.out.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let creds = bin.join("systemd-creds");
+    std::fs::write(
+        &creds,
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+         encrypt) echo \"encrypted, $2\"; base64 -w0; echo;;\n\
+         decrypt) read -r header; [ \"$header\" = \"encrypted, $2\" ] || exit 1; base64 -d;;\n\
+         esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&creds, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let run = |args: &[&str]| {
+        let output = ffca.command(args).env("PATH", &path).output().unwrap();
+        assert!(
+            output.status.success(),
+            "ffca {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let key = ffca.state.join("ca.key");
+    let plain = std::fs::read_to_string(&key).unwrap();
+
+    let printed = run(&["key", "encrypt"]);
+    assert!(printed.contains("encrypted to this machine"), "{printed}");
+    assert!(!key.exists());
+    assert_eq!(mode(&ffca.state.join("ca.key.cred")), 0o600);
+    run(&["issue", "--person", "Anna", "--device", "phone"]);
+    assert!(run(&["list"]).contains("Anna"));
+    assert!(run(&["crl-refresh"]).contains("Signed a new CRL"));
+    let (_, error) = ffca.fails(&["--state-dir", "/nonexistent", "key", "encrypt"]);
+    assert!(error.contains("there is no CA"), "{error}");
+
+    let printed = run(&["key", "decrypt"]);
+    assert!(printed.contains("plain file again"), "{printed}");
+    assert_eq!(std::fs::read_to_string(&key).unwrap(), plain);
+    assert_eq!(mode(&key), 0o600);
+    assert!(!ffca.state.join("ca.key.cred").exists());
+    assert!(ffca.ok(&["list"]).contains("Anna"));
+}
+
 #[test]
 fn every_command_but_init_needs_a_ca_and_says_how_to_make_one() {
     let ffca = Ffca::new();

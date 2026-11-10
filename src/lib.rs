@@ -34,6 +34,29 @@ pub mod timer;
 pub mod tui;
 pub mod users;
 
+/// What stands in for `systemd-creds` in a test, as a script written into `dir`: it takes the
+/// same arguments, and what it encrypts only it decrypts, under the same name. Returns the
+/// command to run it.
+#[cfg(test)]
+pub(crate) fn test_encrypter(dir: &std::path::Path) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("creds.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         case \"$1\" in\n\
+         encrypt) echo \"encrypted for a test, $2\"; base64 -w0; echo;;\n\
+         decrypt) read -r header\n\
+           [ \"$header\" = \"encrypted for a test, $2\" ] || { echo 'not encrypted here' >&2; exit 1; }\n\
+           base64 -d;;\n\
+         *) exit 2;;\n\
+         esac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    script.display().to_string()
+}
+
 /// A temporary folder for a test, in memory where the system has `/dev/shm`. [`store::Store`]
 /// syncs every write to disk, which on a busy disk makes a test that issues a few certificates
 /// take a second; on tmpfs a sync costs nothing. It is its owner's alone, as the folder the CA

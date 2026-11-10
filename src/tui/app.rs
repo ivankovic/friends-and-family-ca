@@ -596,6 +596,7 @@ impl App {
                 ca_files_in_nginx: config::checked_folder_in_nginx(std::path::Path::new(in_nginx))?,
                 test: test.clone(),
                 reload: reload.clone(),
+                users_group: self.config.nginx.as_ref().and_then(|n| n.users_group),
             };
             std::fs::read_dir(&settings.sites)
                 .map_err(|e| anyhow::anyhow!("cannot read {}: {e}", settings.sites.display()))?;

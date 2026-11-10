@@ -82,6 +82,7 @@ fn settings(dir: &Path) -> config::Nginx {
         ca_files_in_nginx: "/etc/nginx/certs".into(),
         test: "true".into(),
         reload: "true".into(),
+        users_group: None,
     }
 }
 
@@ -547,6 +548,11 @@ server {
     # An invite's link carries its secret, and a request turned away before it reaches a
     # location - by a bot filter, say - is logged here: nothing on this site is.
     access_log off;
+
+    # The page takes no input but the address: the button's request has no body. A browser
+    # that has been here comes back by HTTPS only.
+    client_max_body_size 1k;
+    add_header Strict-Transport-Security \"max-age=31536000\" always;
 
     # Looked up when a request comes (Docker's DNS), so that nginx starts while the page is down.
     resolver 127.0.0.11 valid=30s ipv6=off;
@@ -1417,4 +1423,38 @@ fn a_new_password_or_a_user_gone_reaches_every_password_file() {
     );
     let names = survey(&nginx).unwrap().sites.remove(0).auth;
     assert_eq!(names, Auth::On(vec!["anna".into()]));
+}
+
+/// With nginx's group in the settings, a password file is that group's to read and nobody
+/// else's; naming the group later rewrites the files that are there.
+#[test]
+fn a_password_file_is_for_nginxs_group_only_when_the_settings_name_it() {
+    let (dir, mut nginx) = folder(&[("books.conf", BOOKS), ("pages.conf", PAGES)]);
+    let ca = ca(dir.path());
+    let users = users_with(&["anna", "ben"]);
+    let books = survey(&nginx).unwrap().sites.remove(0);
+    let file = nginx.ca_files.join("ffca-users-books.example.org");
+    let mode = |path: &Path| fs::metadata(path).unwrap().mode() & 0o777;
+    set_auth(&nginx, &ca, &users, &books, &Auth::On(vec!["anna".into()])).unwrap();
+    assert_eq!(mode(&file), 0o644, "readable by all, without a group");
+
+    // The test's own group stands in for nginx's: only root can give a file to another.
+    let group = fs::metadata(dir.path()).unwrap().gid();
+    nginx.users_group = Some(group);
+    assert_eq!(
+        publish_users(&nginx, &ca, &users).unwrap(),
+        [("books.example.org".to_owned(), 1)],
+        "the same users, behind tighter permissions"
+    );
+    assert_eq!(mode(&file), 0o640);
+    assert_eq!(fs::metadata(&file).unwrap().gid(), group);
+    assert!(publish_users(&nginx, &ca, &users).unwrap().is_empty());
+
+    let both = Auth::On(vec!["anna".into(), "ben".into()]);
+    let pages = survey(&nginx).unwrap().sites.remove(1);
+    set_auth(&nginx, &ca, &users, &pages, &both).unwrap();
+    assert_eq!(
+        mode(&nginx.ca_files.join(users_file_name(pages.name()))),
+        0o640
+    );
 }

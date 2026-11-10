@@ -916,12 +916,45 @@ struct UsersFile {
     name: String,
     before: Option<String>,
     written: bool,
+    /// The settings' `users_group`.
+    group: Option<u32>,
+}
+
+/// A password file's permissions when the settings name nginx's group: its owner writes it, the
+/// group reads it, and nobody else does.
+const GROUP_ONLY: u32 = 0o640;
+
+/// Writes the password file `name`: its owner's and `group`'s only, when the settings name the
+/// group nginx reads it as; readable by all otherwise, as nginx's workers must be able to.
+fn write_users_file(store: &Store, name: &str, text: &str, group: Option<u32>) -> Result<()> {
+    match group {
+        Some(gid) => {
+            let owner = fs::metadata(store.dir())?.uid();
+            store
+                .write_owned(name, text.as_bytes(), GROUP_ONLY, Some((owner, gid)))
+                .with_context(|| format!("cannot give the password file to group {gid}"))
+        }
+        None => store.write(name, text.as_bytes(), PUBLIC),
+    }
+}
+
+/// Whether the password file `name` holds `text`, with the owner and permissions
+/// [`write_users_file`] gives it.
+fn users_file_is(store: &Store, name: &str, text: &str, group: Option<u32>) -> bool {
+    let Ok(metadata) = fs::metadata(store.path(name)) else {
+        return false;
+    };
+    let as_written = match group {
+        Some(gid) => metadata.gid() == gid && metadata.mode() & 0o777 == GROUP_ONLY,
+        None => metadata.mode() & 0o777 == PUBLIC,
+    };
+    as_written && store.read(name).is_ok_and(|now| now == text)
 }
 
 impl UsersFile {
     fn put_back(&self) -> Result<()> {
         match &self.before {
-            Some(text) => self.store.write(&self.name, text.as_bytes(), PUBLIC),
+            Some(text) => write_users_file(&self.store, &self.name, text, self.group),
             None => fs::remove_file(self.store.path(&self.name)).map_err(anyhow::Error::from),
         }
     }
@@ -942,15 +975,17 @@ fn apply(
             let store = Store::new(&nginx.ca_files);
             let name = users_file_name(site.name());
             let before = store.exists(&name).then(|| store.read(&name)).transpose()?;
-            let written = before.as_deref() != Some(text.as_str());
+            let group = nginx.users_group;
+            let written = !users_file_is(&store, &name, &text, group);
             if written {
-                store.write(&name, text.as_bytes(), PUBLIC)?;
+                write_users_file(&store, &name, &text, group)?;
             }
             Some(UsersFile {
                 store,
                 name,
                 before,
                 written,
+                group,
             })
         }
         _ => None,
@@ -1169,6 +1204,14 @@ pub fn enrollment_site(
     );
     lines.push("    access_log off;".to_owned());
     lines.push(String::new());
+    lines.push(
+        "    # The page takes no input but the address: the button's request has no body. A browser"
+            .to_owned(),
+    );
+    lines.push("    # that has been here comes back by HTTPS only.".to_owned());
+    lines.push("    client_max_body_size 1k;".to_owned());
+    lines.push("    add_header Strict-Transport-Security \"max-age=31536000\" always;".to_owned());
+    lines.push(String::new());
     if !literal {
         lines.push("    # Looked up when a request comes (Docker's DNS), so that nginx starts while the page is down.".to_owned());
         lines.push("    resolver 127.0.0.11 valid=30s ipv6=off;".to_owned());
@@ -1368,7 +1411,7 @@ fn check_folder(folder: &Path, ca: &Ca) -> Result<()> {
 }
 
 /// Rewrites the password file of every site whose HTTP auth ffca turned on, from `users`: after
-/// a password changed or a user went. A user who is gone is left out of every file. Tests nginx's
+/// a password changed, a user went, or the settings named another group to read the files. A user who is gone is left out of every file. Tests nginx's
 /// configuration and reloads if a file changed; a refusal puts every file back. Returns the sites
 /// whose file changed, each with how many users it still lets in.
 pub fn publish_users(
@@ -1395,15 +1438,17 @@ pub fn publish_users(
         let text = users.password_file(&kept)?;
         let name = users_file_name(site.name());
         let before = store.exists(&name).then(|| store.read(&name)).transpose()?;
-        if before.as_deref() == Some(text.as_str()) {
+        let group = nginx.users_group;
+        if users_file_is(&store, &name, &text, group) {
             continue;
         }
-        store.write(&name, text.as_bytes(), PUBLIC)?;
+        write_users_file(&store, &name, &text, group)?;
         written.push(UsersFile {
             store: Store::new(&nginx.ca_files),
             name,
             before,
             written: true,
+            group,
         });
         changed.push((site.name().to_owned(), kept.len()));
     }

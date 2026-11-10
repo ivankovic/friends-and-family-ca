@@ -28,6 +28,15 @@
 //! snapshots included, as good as the key: whoever has one can mint certificates the ledger never
 //! saw, which only a new CA stops. All files are standard PEM, so `openssl` can carry on if ffca ever cannot.
 //!
+//! The administrator can instead have the key encrypted to the machine ([`Ca::encrypt_key`]),
+//! by `systemd-creds`: `ca.key.cred` replaces `ca.key`, `crl-refresh` still signs unattended, and
+//! a copy of the state folder is no longer the key - on a machine with a TPM, nothing on its
+//! disk is; without one, the folder and systemd's own key (`/var/lib/systemd/credential.secret`)
+//! together are. The price is that no other machine can read it: a restore elsewhere needs a
+//! copy of the plain key, kept offline, or the key decrypted ([`Ca::decrypt_key`]) before the
+//! move. It is a choice, off unless made, because a home server whose disk dies is the likelier
+//! loss.
+//!
 //! The CA certificate itself is limited to client authentication too (extended key usage
 //! `clientAuth`): should it ever end up among a system's trusted authorities, OpenSSL and the
 //! browsers refuse a server certificate under it.
@@ -65,6 +74,13 @@ use crate::store::{PRIVATE, PUBLIC, Store};
 
 pub const CERTIFICATE_FILE: &str = "ca.crt";
 pub const KEY_FILE: &str = "ca.key";
+/// The key encrypted to this machine, in place of [`KEY_FILE`]: see [`Ca::encrypt_key`].
+pub const ENCRYPTED_KEY_FILE: &str = "ca.key.cred";
+/// The command that encrypts the key to this machine and decrypts it: systemd's, which uses the
+/// machine's TPM where it has one and a key of its own under `/var/lib/systemd` otherwise.
+pub const KEY_ENCRYPTER: &str = "systemd-creds";
+/// The name the encrypted key is bound to: `systemd-creds` decrypts it under no other.
+const KEY_CREDENTIAL: &str = "ffca-ca-key";
 pub const CRL_FILE: &str = "crl.pem";
 const ISSUED_DIR: &str = "issued";
 
@@ -175,6 +191,12 @@ impl Ca {
 
     /// Loads the CA in `store`.
     pub fn open(store: &Store) -> Result<Ca> {
+        Ca::open_with(store, KEY_ENCRYPTER)
+    }
+
+    /// As [`Ca::open`], with `encrypter` the command that decrypts an encrypted key (see
+    /// [`Ca::encrypt_key`]): `systemd-creds`, or what stands in for it in a test.
+    pub fn open_with(store: &Store, encrypter: &str) -> Result<Ca> {
         if !store.exists(CERTIFICATE_FILE) {
             bail!(
                 "there is no CA in {} yet; create one with `ffca init`",
@@ -182,8 +204,20 @@ impl Ca {
             );
         }
         let certificate_pem = store.read(CERTIFICATE_FILE)?;
-        let key = KeyPair::from_pem(&store.read(KEY_FILE)?)
-            .with_context(|| format!("{} is not a usable key", store.path(KEY_FILE).display()))?;
+        let (key_file, key_pem) = if store.exists(KEY_FILE) || !store.exists(ENCRYPTED_KEY_FILE) {
+            (KEY_FILE, store.read(KEY_FILE)?)
+        } else {
+            let pem = decrypt(encrypter, &store.read(ENCRYPTED_KEY_FILE)?).with_context(|| {
+                format!(
+                    "cannot decrypt {}, which only the machine it was encrypted on can: on \
+                     another machine, restore the copy of the key you kept",
+                    store.path(ENCRYPTED_KEY_FILE).display()
+                )
+            })?;
+            (ENCRYPTED_KEY_FILE, pem)
+        };
+        let key = KeyPair::from_pem(&key_pem)
+            .with_context(|| format!("{} is not a usable key", store.path(key_file).display()))?;
         let (_, pem) =
             x509_parser::pem::parse_x509_pem(certificate_pem.as_bytes()).map_err(|e| {
                 anyhow::anyhow!("{} is damaged: {e}", store.path(CERTIFICATE_FILE).display())
@@ -192,7 +226,7 @@ impl Ca {
         ensure!(
             certificate.public_key().raw == key.subject_public_key_info(),
             "{} does not belong to {}",
-            store.path(KEY_FILE).display(),
+            store.path(key_file).display(),
             store.path(CERTIFICATE_FILE).display()
         );
         let not_after = certificate.validity().not_after.to_datetime();
@@ -214,6 +248,73 @@ impl Ca {
 
     pub fn store(&self) -> &Store {
         &self.store
+    }
+
+    /// Whether the key on disk is encrypted to this machine: see [`Ca::encrypt_key`].
+    pub fn key_encrypted(&self) -> bool {
+        !self.store.exists(KEY_FILE) && self.store.exists(ENCRYPTED_KEY_FILE)
+    }
+
+    /// Encrypts the key on disk to this machine, with `encrypter` (`systemd-creds`): the plain
+    /// `ca.key` is replaced by `ca.key.cred`, which only this machine can decrypt. The encrypted
+    /// file is written and read back - decrypted, and compared with the key in use - before the
+    /// plain one is deleted, so no failure on the way leaves the CA without a key.
+    ///
+    /// Deleting a file does not erase what a disk, a snapshot or an older backup still holds of
+    /// it: those copies stay as good as the key.
+    pub fn encrypt_key(&self, encrypter: &str) -> Result<()> {
+        let _lock = self.store.lock()?;
+        let pem = self.key.serialize_pem();
+        let encrypted = run_with_input(
+            &format!("{encrypter} encrypt --name={KEY_CREDENTIAL} - -"),
+            pem.as_bytes(),
+        )
+        .context("cannot encrypt the CA's key to this machine; it is left as it was")?;
+        ensure!(
+            !encrypted.trim().is_empty() && !encrypted.contains("PRIVATE KEY"),
+            "`{encrypter}` did not encrypt the key; it is left as it was"
+        );
+        self.store
+            .write(ENCRYPTED_KEY_FILE, encrypted.as_bytes(), PRIVATE)?;
+        let read_back = self
+            .store
+            .read(ENCRYPTED_KEY_FILE)
+            .and_then(|text| decrypt(encrypter, &text))
+            .and_then(|pem| Ok(KeyPair::from_pem(&pem)?));
+        match read_back {
+            Ok(key) if key.serialize_der() == self.key.serialize_der() => {}
+            other => {
+                let _ = std::fs::remove_file(self.store.path(ENCRYPTED_KEY_FILE));
+                let why = other.err().map(|e| format!(": {e:#}")).unwrap_or_default();
+                bail!(
+                    "the encrypted key does not decrypt to the CA's key{why}; the key is left \
+                     as it was"
+                );
+            }
+        }
+        if self.store.exists(KEY_FILE) {
+            std::fs::remove_file(self.store.path(KEY_FILE)).with_context(|| {
+                format!("cannot delete {}", self.store.path(KEY_FILE).display())
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Puts the key back on disk as a plain `ca.key`, its owner's only, and deletes the
+    /// encrypted one: what a move to another machine starts with.
+    pub fn decrypt_key(&self) -> Result<()> {
+        let _lock = self.store.lock()?;
+        self.store
+            .write(KEY_FILE, self.key.serialize_pem().as_bytes(), PRIVATE)?;
+        match std::fs::remove_file(self.store.path(ENCRYPTED_KEY_FILE)) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e).with_context(|| {
+                format!(
+                    "cannot delete {}",
+                    self.store.path(ENCRYPTED_KEY_FILE).display()
+                )
+            }),
+            _ => Ok(()),
+        }
     }
 
     pub fn certificate_pem(&self) -> &str {
@@ -513,6 +614,45 @@ impl Ca {
     fn issuer(&self) -> Result<Issuer<'_, &KeyPair>> {
         Ok(Issuer::from_ca_cert_pem(&self.certificate_pem, &self.key)?)
     }
+}
+
+/// The key in `encrypted`, as `encrypter` decrypts it.
+fn decrypt(encrypter: &str, encrypted: &str) -> Result<String> {
+    run_with_input(
+        &format!("{encrypter} decrypt --name={KEY_CREDENTIAL} - -"),
+        encrypted.as_bytes(),
+    )
+}
+
+/// Runs `command` - a program and its arguments, split at spaces - with `input` on its standard
+/// input, and returns what it printed. The key goes through pipes only: never an argument, which
+/// every user of the machine can list, nor a temporary file.
+fn run_with_input(command: &str, input: &[u8]) -> Result<String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut words = command.split_whitespace();
+    let program = words.next().context("the command is empty")?;
+    let mut child = Command::new(program)
+        .args(words)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("cannot run `{program}`"))?;
+    let written = child
+        .stdin
+        .take()
+        .context("the command's input")?
+        .write_all(input);
+    let output = child.wait_with_output()?;
+    if !output.status.success() || written.is_err() {
+        bail!(
+            "`{program}` failed ({}):\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim_end()
+        );
+    }
+    String::from_utf8(output.stdout).with_context(|| format!("`{program}` printed no text"))
 }
 
 /// Escapes a value for an RFC 4514 distinguished name as OpenSSL's RFC 2253 printing does, which

@@ -24,9 +24,10 @@
 //! Hashes are SHA-512 crypt (`$6$`, 5000 rounds), which nginx checks with the system's `crypt()`:
 //! glibc's and musl's both have it, and nothing weaker is written. nginx checks the password on
 //! every request, and the rounds are what each costs; a password ffca generates is 24 characters
-//! from 56 letters and digits (139 bits), which no number of rounds needs to protect. The
-//! password files are readable by every user of the machine - nginx's workers read them - so a
-//! password a person chooses should be one that is not used anywhere else.
+//! from 56 letters and digits (139 bits), which no number of rounds needs to protect. nginx's
+//! workers read the password files: they are their group's only when the settings name it
+//! (`users_group`), and readable by every user of the machine otherwise - then a password a
+//! person chooses should be one that is not used anywhere else.
 //!
 //! A name is what a browser and nginx's log show, and what goes into the password file as it is:
 //! letters, digits and `.`, `_`, `@`, `-`, at most 64, so it can be neither a separator of the

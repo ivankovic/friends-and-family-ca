@@ -485,6 +485,7 @@ fn settings(nginx: &Nginx, ca_files_in_nginx: &str) -> config::Nginx {
         ca_files_in_nginx: ca_files_in_nginx.into(),
         test: format!("{exec} -t"),
         reload: format!("{exec} -s reload"),
+        users_group: None,
     }
 }
 
@@ -820,9 +821,12 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         "Anna gets in with the certificate the invite handed over",
     );
 
-    // Used up; and the CA learns who collected it.
+    // Used up - the link, pressed again, hands nothing over - and the CA learns who collected it.
     let (status, body) = fetch_through(&nginx, &made.link, &["-X", "POST"]);
-    assert_eq!(status, 404, "{}", String::from_utf8_lossy(&body));
+    let body = String::from_utf8_lossy(&body);
+    assert_eq!(status, 410, "{body}");
+    assert!(body.contains("collected a few minutes ago"), "{body}");
+    assert!(!body.contains(password), "{body}");
     let printed = ffca.ok(&["crl-refresh"]);
     assert!(
         printed.contains("Recorded the invite collected for Anna (phone)."),

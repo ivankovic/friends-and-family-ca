@@ -49,6 +49,11 @@ pub struct Nginx {
     pub test: String,
     /// Makes nginx load the configuration and the CA's files again.
     pub reload: String,
+    /// The group nginx's workers read HTTP logins' password files as, by number: the files are
+    /// then that group's and their owner's only. Without one they are readable by every user of
+    /// the machine, each of whom can then guess at a chosen password for as long as they like.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub users_group: Option<u32>,
 }
 
 /// The site the enrollment page lives on. It never asks for a client certificate: whoever opens
@@ -137,6 +142,7 @@ impl Default for Nginx {
             ca_files_in_nginx: "/etc/nginx/ffca".into(),
             test: "nginx -t".into(),
             reload: "nginx -s reload".into(),
+            users_group: None,
         }
     }
 }
@@ -194,6 +200,7 @@ mod tests {
                 ca_files_in_nginx: "/etc/nginx/certs".into(),
                 test: "docker exec nginx nginx -t".into(),
                 reload: "docker exec nginx nginx -s reload".into(),
+                users_group: Some(101),
             }),
             enrollment: Some(Enrollment {
                 host: "k.domaci.ivankovic.me".into(),

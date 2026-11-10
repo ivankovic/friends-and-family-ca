@@ -539,6 +539,7 @@ fn with_nginx(
         ca_files_in_nginx: "/etc/nginx/certs".into(),
         test: test.into(),
         reload: reload.into(),
+        users_group: None,
     };
     Config {
         nginx: Some(settings.clone()),
@@ -967,6 +968,7 @@ fn w_writes_the_enrollment_site_after_showing_it() {
         ca_files_in_nginx: "/etc/nginx/certs".into(),
         test: "true".into(),
         reload: "true".into(),
+        users_group: None,
     };
     Config {
         nginx: Some(settings.clone()),

@@ -34,7 +34,14 @@ pub const TIMER: &str = "ffca-crl-refresh.timer";
 pub const UNIT_DIR: &str = "/etc/systemd/system";
 
 /// The two units, as file name and text, running `binary` on the CA in `state`.
+///
+/// The service runs as root - it reads the CA's key and reloads nginx - with what it has no use
+/// for taken away: new privileges, the shared `/tmp`, kernel modules and logs, the clock, the
+/// host name. Its files and the commands it runs for nginx (`docker exec`, `nginx -s reload`)
+/// are anywhere the administrator put them, so the file system and the devices stay as they
+/// are.
 pub fn units(binary: &Path, state: &Path) -> [(&'static str, String); 2] {
+    // A path as systemd reads a quoted word: `%` starts a specifier, and so is doubled.
     let quote = |path: &Path| {
         format!(
             "\"{}\"",
@@ -42,8 +49,11 @@ pub fn units(binary: &Path, state: &Path) -> [(&'static str, String); 2] {
                 .to_string()
                 .replace('\\', "\\\\")
                 .replace('"', "\\\"")
+                .replace('%', "%%")
         )
     };
+    // In a command line, `$` starts a variable too.
+    let command = |path: &Path| quote(path).replace('$', "$$");
     [
         (
             SERVICE,
@@ -55,9 +65,18 @@ pub fn units(binary: &Path, state: &Path) -> [(&'static str, String); 2] {
                  Type=oneshot\n\
                  TimeoutStartSec=15min\n\
                  Environment=FFCA_STATE_DIR={state}\n\
-                 ExecStart={binary} crl-refresh\n",
+                 ExecStart={binary} crl-refresh\n\
+                 NoNewPrivileges=true\n\
+                 PrivateTmp=true\n\
+                 ProtectKernelModules=true\n\
+                 ProtectKernelLogs=true\n\
+                 ProtectClock=true\n\
+                 ProtectHostname=true\n\
+                 RestrictSUIDSGID=true\n\
+                 RestrictRealtime=true\n\
+                 LockPersonality=true\n",
                 state = quote(state),
-                binary = quote(binary),
+                binary = command(binary),
             ),
         ),
         (
@@ -153,6 +172,50 @@ mod tests {
         assert!(
             timer_text.contains("OnCalendar=hourly\n") && timer_text.contains("Persistent=true\n")
         );
+        for taken_away in ["NoNewPrivileges=true\n", "PrivateTmp=true\n"] {
+            assert!(service_text.contains(taken_away), "{service_text}");
+        }
+    }
+
+    /// A path is one word to systemd, whatever is in it: no specifier, no variable.
+    #[test]
+    fn a_path_is_written_so_that_systemd_reads_it_as_it_is() {
+        let [(_, service), _] = units(
+            Path::new("/opt/my ffca/100%/$HOME/ffca"),
+            Path::new("/var/lib/ffca %n \"x\""),
+        );
+        assert!(
+            service.contains("ExecStart=\"/opt/my ffca/100%%/$$HOME/ffca\" crl-refresh\n"),
+            "{service}"
+        );
+        assert!(
+            service.contains("Environment=FFCA_STATE_DIR=\"/var/lib/ffca %%n \\\"x\\\"\"\n"),
+            "{service}"
+        );
+    }
+
+    /// systemd's own reading of the units, where it is installed: every line is one it knows.
+    #[test]
+    fn systemd_accepts_the_units() {
+        let dir = crate::test_dir();
+        let binary = fake_binary(dir.path());
+        for (name, text) in units(&binary, dir.path()) {
+            std::fs::write(dir.path().join(name), text).unwrap();
+        }
+        let Ok(output) = std::process::Command::new("systemd-analyze")
+            .args(["verify", "--recursive-errors=no"])
+            .arg(dir.path().join(SERVICE))
+            .arg(dir.path().join(TIMER))
+            .output()
+        else {
+            return;
+        };
+        let said = String::from_utf8_lossy(&output.stderr);
+        let about_ours: Vec<&str> = said
+            .lines()
+            .filter(|line| line.contains(SERVICE) || line.contains(TIMER))
+            .collect();
+        assert!(about_ours.is_empty(), "{said}");
     }
 
     /// A stand-in for the binary, as `make install` leaves it: its owner's, writable by nobody else.

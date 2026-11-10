@@ -119,9 +119,25 @@ enum Command {
     },
     /// List every person, device and agent, with their certificates.
     List,
-    /// Daily, from a timer: re-sign the revocation list before it expires, record collected
+    /// Hourly, from a timer: re-sign the revocation list before it expires, record collected
     /// invites, and revoke the certificates of those that expired uncollected.
     CrlRefresh,
+    /// Keep the CA's key encrypted to this machine, or as a plain file again.
+    Key {
+        #[command(subcommand)]
+        action: KeyAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyAction {
+    /// Encrypt the key to this machine with `systemd-creds`: a copy of the state folder alone
+    /// can then sign nothing, and no other machine can read the key. Keep a copy of the plain
+    /// key somewhere offline first: it is what a restore on another machine needs.
+    Encrypt,
+    /// Put the key back as a plain file, readable by its owner only: before moving the CA to
+    /// another machine.
+    Decrypt,
 }
 
 /// Who a command is about: a person (and one of their devices), or an agent.
@@ -283,6 +299,29 @@ fn main() -> Result<()> {
         Command::List => {
             let ledger = Ca::open(&store)?.ledger()?;
             print!("{}", list(&ledger, now));
+        }
+        Command::Key { action } => {
+            let ca = Ca::open(&store)?;
+            match action {
+                KeyAction::Encrypt => {
+                    ca.encrypt_key(ca::KEY_ENCRYPTER)?;
+                    println!(
+                        "The key is encrypted to this machine: {}.",
+                        store.path(ca::ENCRYPTED_KEY_FILE).display()
+                    );
+                    println!(
+                        "Only this machine can read it. Backups and snapshots made before now \
+                         still hold the plain key."
+                    );
+                }
+                KeyAction::Decrypt => {
+                    ca.decrypt_key()?;
+                    println!(
+                        "The key is a plain file again: {}.",
+                        store.path(ca::KEY_FILE).display()
+                    );
+                }
+            }
         }
         Command::CrlRefresh => {
             let ca = Ca::open(&store)?;
