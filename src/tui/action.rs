@@ -132,4 +132,15 @@ pub enum Action {
     CopyInvite(crate::ledger::Invite),
     /// Put this text on that clipboard.
     Copy(String),
+    /// Ask before encrypting the CA's key to this machine, or putting it back as a plain file.
+    AskKey,
+    /// Encrypt the key to this machine, or decrypt it.
+    SetKeyEncrypted(bool),
+    /// Ask how a certificate's password reaches its person: on the enrollment page, or apart.
+    AskPasswordDelivery,
+    SetPasswordDelivery(crate::invite::Delivery),
+    /// Open the form for the group that reads HTTP logins' password files.
+    AskUsersGroup,
+    /// That group, as typed: a number, or nothing for files every user can read.
+    SetUsersGroup(String),
 }

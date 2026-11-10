@@ -1298,9 +1298,15 @@ fn help_starts_with_the_tab_that_shows_and_lists_every_key() {
         heading("Everywhere") < heading("│ People & agents "),
         "{first}"
     );
-    key(&mut app, KeyCode::End);
-    let all = format!("{first}\n{}", screen(&mut app));
+    let mut all = first.clone();
+    for _ in 0..6 {
+        key(&mut app, KeyCode::PageDown);
+        all.push_str(&screen(&mut app));
+    }
     for expected in [
+        "K               encrypt the key to this machine, or decrypt it",
+        "P               where new invites' passwords go",
+        "g               the group that reads the password files",
         "Tab  Shift-Tab  the next tab, the previous one",
         "1 2 3 4 5       People & agents, Invites, Nginx, Users, CA",
         "Home End  g G   to the first, to the last",
@@ -2271,4 +2277,212 @@ fn with_no_users_the_login_dialog_offers_nothing_to_tick() {
     let shown = screen(&mut app);
     assert!(shown.contains("ffca has no users yet"), "{shown}");
     assert!(!shown.contains("Space tick a user"), "{shown}");
+}
+
+/// K on the CA tab encrypts the key to the machine after saying what that costs, and K again
+/// puts it back; the tab says which of the two the key is.
+#[test]
+fn k_encrypts_the_key_to_this_machine_and_back_after_asking() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    app.encrypter = crate::test_encrypter(&fixture.out);
+    go_to(&mut app, Tab::Ca);
+    let before = screen_of(&mut app, 80, 24);
+    assert!(before.contains("ca.key  (owner only)"), "{before}");
+    assert!(before.contains("K encrypt or decrypt the key"), "{before}");
+
+    key(&mut app, KeyCode::Char('K'));
+    let asked = screen_of(&mut app, 80, 24);
+    assert!(
+        asked.contains("Encrypt the CA's key to this machine"),
+        "{asked}"
+    );
+    assert!(asked.contains("keep a copy of the plain key"), "{asked}");
+    key(&mut app, KeyCode::Esc);
+    assert!(fixture.store.exists(ca::KEY_FILE), "Esc changes nothing");
+
+    key(&mut app, KeyCode::Char('K'));
+    key(&mut app, KeyCode::Enter);
+    assert!(!fixture.store.exists(ca::KEY_FILE));
+    assert!(fixture.store.exists(ca::ENCRYPTED_KEY_FILE));
+    let after = screen(&mut app);
+    assert!(
+        after.contains("The key is encrypted to this machine."),
+        "{after}"
+    );
+    assert!(
+        after.contains("ca.key.cred  (encrypted to this machine)"),
+        "{after}"
+    );
+    assert!(
+        after.contains("keep the plain key you copied offline"),
+        "{after}"
+    );
+    // It still signs.
+    key(&mut app, KeyCode::Char('c'));
+    assert_shows(&mut app, "number 2");
+
+    key(&mut app, KeyCode::Char('K'));
+    assert_shows(&mut app, "Decrypt the CA's key");
+    key(&mut app, KeyCode::Enter);
+    assert!(fixture.store.exists(ca::KEY_FILE));
+    assert!(!fixture.store.exists(ca::ENCRYPTED_KEY_FILE));
+    assert_shows(&mut app, "The key is a plain file again.");
+    fixture.ca();
+}
+
+/// A machine that cannot encrypt says why, in full, and the key stays as it was.
+#[test]
+fn a_key_that_cannot_be_encrypted_says_why() {
+    let fixture = Fixture::new();
+    let mut app = fixture.app(NOW);
+    app.encrypter = "/nonexistent/systemd-creds".into();
+    go_to(&mut app, Tab::Ca);
+    key(&mut app, KeyCode::Char('K'));
+    key(&mut app, KeyCode::Enter);
+    let shown = screen_of(&mut app, 80, 24);
+    assert!(shown.contains("The key is not encrypted"), "{shown}");
+    assert!(shown.contains("it is left as it was"), "{shown}");
+    assert!(fixture.store.exists(ca::KEY_FILE));
+}
+
+/// P on the Invites tab moves the password off the enrollment page: the next invite shows it
+/// to the administrator, who copies it with p, and the page is given none.
+#[test]
+fn a_password_sent_separately_is_shown_in_the_invite_and_copied_with_p() {
+    let fixture = Fixture::new();
+    with_enrollment(&fixture);
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Invites);
+    assert_shows(&mut app, "P where passwords go");
+    key(&mut app, KeyCode::Char('P'));
+    let asked = screen_of(&mut app, 80, 24);
+    assert!(asked.contains("Where certificate passwords go"), "{asked}");
+    assert!(asked.contains("Enter send passwords myself"), "{asked}");
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "New invites keep their password off the page");
+    assert_eq!(
+        Config::load(&fixture.store)
+            .unwrap()
+            .enrollment
+            .unwrap()
+            .password,
+        invite::Delivery::Separate
+    );
+
+    go_to(&mut app, Tab::People);
+    key(&mut app, KeyCode::Char('p'));
+    type_text(&mut app, "Anna");
+    key(&mut app, KeyCode::Enter);
+    type_text(&mut app, "phone");
+    key(&mut app, KeyCode::Enter);
+    let password = fixture.ca().ledger().unwrap().invites[0]
+        .password
+        .clone()
+        .expect("kept for the administrator");
+    let shown = screen_of(&mut app, 80, 24);
+    assert!(shown.contains(&format!("Password: {password}")), "{shown}");
+    assert!(shown.contains("p copy password"), "{shown}");
+    key(&mut app, KeyCode::Char('p'));
+    assert_eq!(app.take_clipboard(), Some(password.clone()));
+
+    let token = token_on_screen(&screen(&mut app));
+    let payload = invite::open(&invites_folder(&fixture), &token, NOW).unwrap();
+    assert_eq!(payload.password, None, "the page has no password to show");
+
+    // Shown again from the Invites tab, while the invite is open.
+    key(&mut app, KeyCode::Enter);
+    go_to(&mut app, Tab::Invites);
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, &format!("Password: {password}"));
+    key(&mut app, KeyCode::Enter);
+
+    // And back: the next invite's password is the page's to show.
+    key(&mut app, KeyCode::Char('P'));
+    assert_shows(&mut app, "Enter show passwords on the page");
+    key(&mut app, KeyCode::Enter);
+    go_to(&mut app, Tab::People);
+    key(&mut app, KeyCode::Char('n'));
+    type_text(&mut app, "laptop");
+    key(&mut app, KeyCode::Enter);
+    let shown = screen_of(&mut app, 80, 24);
+    assert!(shown.contains("Invite for Anna (laptop)"), "{shown}");
+    assert!(!shown.contains("Password:"), "{shown}");
+}
+
+/// g on the Users tab gives the password files to nginx's group, rewriting the ones that are
+/// there; an empty field gives them back to everyone, and what is not a number is refused.
+#[test]
+fn g_gives_the_password_files_to_nginxs_group() {
+    use std::os::unix::fs::MetadataExt;
+    let fixture = Fixture::new();
+    let settings = with_nginx(&fixture, "true", "true", None);
+    let mut app = fixture.app(NOW);
+    go_to(&mut app, Tab::Users);
+    key(&mut app, KeyCode::Char('n'));
+    type_text(&mut app, "anna");
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Enter);
+    let books = nginx::survey(&settings).unwrap().sites.remove(0);
+    nginx::set_auth(
+        &settings,
+        &fixture.ca(),
+        &users(&fixture),
+        &books,
+        &Auth::On(vec!["anna".into()]),
+    )
+    .unwrap();
+    let file = settings.ca_files.join("ffca-users-books.example.org");
+    let mode = |path: &std::path::Path| std::fs::metadata(path).unwrap().mode() & 0o777;
+    assert_eq!(mode(&file), 0o644);
+
+    assert_shows(&mut app, "g who reads the files");
+    key(&mut app, KeyCode::Char('g'));
+    let asked = screen_of(&mut app, 80, 24);
+    assert!(asked.contains("Who reads the password files"), "{asked}");
+    type_text(&mut app, "nginx");
+    key(&mut app, KeyCode::Enter);
+    assert_shows(&mut app, "nginx is not a group's number");
+    assert_eq!(mode(&file), 0o644);
+
+    // The test's own group stands in for nginx's: only root can give a file to another.
+    let group = std::fs::metadata(&fixture.out).unwrap().gid();
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        NOW,
+    );
+    type_text(&mut app, &group.to_string());
+    key(&mut app, KeyCode::Enter);
+    assert_shows(
+        &mut app,
+        &format!("Password files are for group {group} only."),
+    );
+    assert_eq!(mode(&file), 0o640);
+    assert_eq!(
+        Config::load(&fixture.store)
+            .unwrap()
+            .nginx
+            .unwrap()
+            .users_group,
+        Some(group)
+    );
+
+    key(&mut app, KeyCode::Enter);
+    key(&mut app, KeyCode::Char('g'));
+    assert_shows(&mut app, &group.to_string());
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+        NOW,
+    );
+    key(&mut app, KeyCode::Enter);
+    assert_eq!(mode(&file), 0o644);
+    assert_eq!(
+        Config::load(&fixture.store)
+            .unwrap()
+            .nginx
+            .unwrap()
+            .users_group,
+        None
+    );
 }

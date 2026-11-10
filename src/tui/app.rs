@@ -137,6 +137,8 @@ pub struct App {
     timer: String,
     /// How the UI reaches systemd: replaced in tests.
     pub(crate) systemctl: String,
+    /// The command that encrypts the CA's key to this machine; a test stands in for it.
+    pub(crate) encrypter: String,
     pub(crate) unit_dir: PathBuf,
     /// The binary the timer runs: this one.
     pub(crate) binary: PathBuf,
@@ -171,6 +173,7 @@ impl App {
             dns: None,
             timer: timer::state("systemctl"),
             systemctl: "systemctl".into(),
+            encrypter: ca::KEY_ENCRYPTER.into(),
             unit_dir: timer::UNIT_DIR.into(),
             binary: timer::this_binary().unwrap_or_default(),
             tab: Tab::People,
@@ -565,6 +568,21 @@ impl App {
                 self.timer = timer::state(&self.systemctl);
                 self.reload(self.now);
             }
+            Action::AskKey => self.ask_key(),
+            Action::SetKeyEncrypted(encrypted) => self.set_key_encrypted(encrypted),
+            Action::AskPasswordDelivery => self.ask_password_delivery(),
+            Action::SetPasswordDelivery(delivery) => self.set_password_delivery(delivery),
+            Action::AskUsersGroup => {
+                let group = self
+                    .config
+                    .nginx
+                    .as_ref()
+                    .and_then(|n| n.users_group)
+                    .map(|gid| gid.to_string())
+                    .unwrap_or_default();
+                self.dialog = Some(Dialog::Form(Form::users_group(&group)));
+            }
+            Action::SetUsersGroup(typed) => self.set_users_group(&typed),
             Action::WriteEnrollmentSite => self.write_enrollment_site(),
             Action::ShowInvite(invite) => self.show_invite(&invite),
             Action::AskCancelInvite(invite) => {
@@ -1167,12 +1185,176 @@ impl App {
             clock(invite.expires)
         );
         let link = invite::link(&enrollment.host, &invite.token);
-        self.dialog = Some(Dialog::Invite(InviteDialog::new(
-            invite.serial,
-            invite.holder.clone(),
-            link,
-            status,
+        let dialog = InviteDialog::new(invite.serial, invite.holder.clone(), link, status)
+            .with_password(invite.password.clone());
+        self.dialog = Some(Dialog::Invite(dialog));
+    }
+
+    /// Asks before the key changes its form on disk, saying what each form costs.
+    fn ask_key(&mut self) {
+        let store = self.ca.store();
+        let (title, lines, verb): (_, Vec<Line>, _) = if self.ca.key_encrypted() {
+            (
+                "Decrypt the CA's key",
+                vec![
+                    format!(
+                        "The key becomes a plain file again, {}, readable by its owner only.",
+                        store.path(ca::KEY_FILE).display()
+                    )
+                    .into(),
+                    Line::default(),
+                    "Every copy of the state folder is then as good as the key. Do this before moving the CA to another machine: only this one can read the encrypted key."
+                        .into(),
+                ],
+                "decrypt it",
+            )
+        } else {
+            (
+                "Encrypt the CA's key to this machine",
+                vec![
+                    format!(
+                        "{} encrypts the key so that only this machine can read it - with its TPM, if it has one. {} replaces {}.",
+                        self.encrypter,
+                        ca::ENCRYPTED_KEY_FILE,
+                        ca::KEY_FILE
+                    )
+                    .into(),
+                    Line::default(),
+                    "A copy of the state folder alone can then sign nothing. The refresh timer keeps working."
+                        .into(),
+                    Line::default(),
+                    "First keep a copy of the plain key somewhere offline: if this machine dies, it is the only way to restore the CA on another. Without one, every device enrols again."
+                        .fg(Color::Yellow)
+                        .into(),
+                    Line::default(),
+                    "Backups and snapshots made before now still hold the plain key."
+                        .dim()
+                        .into(),
+                ],
+                "encrypt it",
+            )
+        };
+        self.dialog = Some(Dialog::Message(Message::confirm(
+            title,
+            lines,
+            Action::SetKeyEncrypted(!self.ca.key_encrypted()),
+            verb,
         )));
+    }
+
+    fn set_key_encrypted(&mut self, encrypted: bool) {
+        self.dialog = None;
+        let done = match encrypted {
+            true => self.ca.encrypt_key(&self.encrypter),
+            false => self.ca.decrypt_key(),
+        };
+        match (done, encrypted) {
+            (Ok(()), true) => self.tell("The key is encrypted to this machine.".into()),
+            (Ok(()), false) => self.tell("The key is a plain file again.".into()),
+            (Err(error), true) => self.explain("The key is not encrypted", &error),
+            (Err(error), false) => self.explain("The key is still encrypted", &error),
+        }
+        self.reload(self.now);
+    }
+
+    /// Asks where the passwords of new invites go, saying what each choice means.
+    fn ask_password_delivery(&mut self) {
+        let Some(enrollment) = &self.config.enrollment else {
+            return self.fail("Set the enrollment site on the Nginx tab first.".into());
+        };
+        let (now, other, verb, next) = match enrollment.password {
+            invite::Delivery::Page => (
+                "Now: the enrollment page shows the certificate's password beside the downloads. Whoever has an invite's link has everything.",
+                "Instead: the page shows no password. Each invite shows it to you, here, to send another way than the link - a call, another chat. The link alone then hands over a file nobody can open.",
+                "send passwords myself",
+                invite::Delivery::Separate,
+            ),
+            invite::Delivery::Separate => (
+                "Now: you send each certificate's password yourself, another way than the link; the enrollment page shows none.",
+                "Instead: the page shows the password beside the downloads. One thing less to send, and whoever has an invite's link has everything.",
+                "show passwords on the page",
+                invite::Delivery::Page,
+            ),
+        };
+        let lines: Vec<Line> = vec![
+            now.into(),
+            Line::default(),
+            other.into(),
+            Line::default(),
+            "It holds for invites made from now on; an open one stays as it was made."
+                .dim()
+                .into(),
+        ];
+        self.dialog = Some(Dialog::Message(Message::confirm(
+            "Where certificate passwords go",
+            lines,
+            Action::SetPasswordDelivery(next),
+            verb,
+        )));
+    }
+
+    fn set_password_delivery(&mut self, delivery: invite::Delivery) {
+        self.dialog = None;
+        let mut config = self.config.clone();
+        let Some(enrollment) = &mut config.enrollment else {
+            return;
+        };
+        enrollment.password = delivery;
+        match config.save(self.ca.store()) {
+            Ok(()) => {
+                self.config = config;
+                self.tell(match delivery {
+                    invite::Delivery::Page => {
+                        "New invites show their password on the enrollment page.".into()
+                    }
+                    invite::Delivery::Separate => {
+                        "New invites keep their password off the page: each shows it here, for you to send.".into()
+                    }
+                });
+                self.reload(self.now);
+            }
+            Err(error) => self.explain("The setting is not saved", &error),
+        }
+    }
+
+    /// Gives the password files to nginx's group, as typed, or back to everyone; the files that
+    /// are there are rewritten for it.
+    fn set_users_group(&mut self, typed: &str) {
+        let typed = typed.trim();
+        let group = match typed.parse::<u32>() {
+            Ok(gid) => Some(gid),
+            Err(_) if typed.is_empty() => None,
+            Err(_) => {
+                return self.refuse(format!(
+                    "{typed} is not a group's number, such as 101; `id -g nginx` says nginx's"
+                ));
+            }
+        };
+        let mut config = self.config.clone();
+        let Some(settings) = &mut config.nginx else {
+            return self.refuse("Tell ffca where nginx is first: e on the Nginx tab.".into());
+        };
+        settings.users_group = group;
+        let before = std::mem::replace(&mut self.config, config);
+        let users = self.users.clone();
+        let saved = self
+            .save_users(&users)
+            .and_then(|more| self.config.save(self.ca.store()).map(|()| more));
+        match saved {
+            Ok(more) => {
+                self.tell(match group {
+                    Some(gid) => format!("Password files are for group {gid} only."),
+                    None => "Password files are readable by every user of this machine.".into(),
+                });
+                self.dialog = (!more.is_empty())
+                    .then(|| Dialog::Message(Message::new("Password files", more)));
+                self.reload(self.now);
+            }
+            Err(error) => {
+                self.config = before;
+                self.refuse(format!("{error:#}"));
+            }
+        }
     }
 
     /// Records collected invites and closes the rest that are due; a revocation reaches nginx.
@@ -1329,9 +1511,15 @@ impl App {
             )
         };
         let blank = || (0, Line::default());
-        let key_mode = std::fs::metadata(store.path(ca::KEY_FILE))
+        let encrypted = self.ca.key_encrypted();
+        let key_file = match encrypted {
+            true => ca::ENCRYPTED_KEY_FILE,
+            false => ca::KEY_FILE,
+        };
+        let key_mode = std::fs::metadata(store.path(key_file))
             .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777);
         let key_note = match key_mode {
+            Ok(PRIVATE) if encrypted => "encrypted to this machine".to_owned(),
             Ok(PRIVATE) => "owner only".to_owned(),
             Ok(mode) => format!("readable beyond its owner ({mode:o}): chmod 600 it"),
             Err(error) => error.to_string(),
@@ -1351,7 +1539,7 @@ impl App {
             row("State folder", store.dir().display().to_string()),
             row(
                 "Key",
-                format!("{}  ({key_note})", store.path(ca::KEY_FILE).display()),
+                format!("{}  ({key_note})", store.path(key_file).display()),
             ),
             row(
                 "Certificate",
@@ -1393,9 +1581,12 @@ impl App {
             blank(),
             (
                 2,
-                "  Back up the state folder: without the key, every certificate has to be issued again."
-                    .fg(Color::Yellow)
-                    .into(),
+                match encrypted {
+                    true => "  Back up the state folder, and keep the plain key you copied offline: only this machine reads the encrypted one, and without the key every certificate has to be issued again.",
+                    false => "  Back up the state folder: without the key, every certificate has to be issued again.",
+                }
+                .fg(Color::Yellow)
+                .into(),
             ),
         ]);
         lines
@@ -1661,6 +1852,8 @@ fn help(tab: Tab) -> Message {
                 key("Enter", "show an open invite's QR code again, or a closed one's details"),
                 key("c", "copy an open invite's link"),
                 key("x", "cancel an open invite, after asking: its certificate is revoked"),
+                key("p", "in an invite: copy its password, when you send that yourself"),
+                key("P", "where new invites' passwords go: on the page, or sent by you"),
             ],
         ),
         (
@@ -1683,6 +1876,7 @@ fn help(tab: Tab) -> Message {
                 key("n", "a new user"),
                 key("c", "a new password for the selected user"),
                 key("d", "delete the selected user, after asking"),
+                key("g", "the group that reads the password files: nginx's, or everyone"),
             ],
         ),
         (
@@ -1691,6 +1885,7 @@ fn help(tab: Tab) -> Message {
             vec![
                 key("c", "sign a new CRL now"),
                 key("T", "set up the hourly refresh timer, after showing it"),
+                key("K", "encrypt the key to this machine, or decrypt it, after asking"),
             ],
         ),
         (

@@ -40,6 +40,7 @@ impl CaInfo {
         vec![
             ("c", "sign a new CRL now"),
             ("T", "set up the refresh timer"),
+            ("K", "encrypt or decrypt the key"),
         ]
     }
 }
@@ -49,6 +50,7 @@ impl Component for CaInfo {
         match key.code {
             KeyCode::Char('c') => Some(Action::RefreshCrl),
             KeyCode::Char('T') => Some(Action::AskTimer),
+            KeyCode::Char('K') => Some(Action::AskKey),
             _ => None,
         }
     }

@@ -43,7 +43,11 @@ pub enum Purpose {
     NewUser,
     /// A new password for this user.
     NewPassword(String),
+    /// The group that reads HTTP logins' password files.
+    UsersGroup,
 }
+
+const GROUP_NOTE: &str = "The group nginx's workers run as, by number: 101 in nginx's own container image; `id -g nginx` or `id -g www-data` says it for one installed here. The password files are then that group's only. Left empty, every user of this machine can read them.";
 
 /// How a device's certificate reaches it.
 const PASSWORD_NOTE: &str = "Leave the password empty to have one made up: 24 letters and digits, shown once. One typed here is at least 12 characters, and should be used nowhere else: nginx's password files are readable on this machine.";
@@ -165,6 +169,16 @@ impl Form {
         form
     }
 
+    pub fn users_group(group: &str) -> Form {
+        let mut form = Form::new(
+            "Who reads the password files".into(),
+            Purpose::UsersGroup,
+            &[("nginx's group", group)],
+        );
+        form.note = Some(GROUP_NOTE.into());
+        form
+    }
+
     fn new(title: String, purpose: Purpose, fields: &[(&'static str, &str)]) -> Form {
         Form {
             title,
@@ -221,6 +235,7 @@ impl Form {
                 name: name.clone(),
                 password: self.fields[0].value.clone(),
             },
+            Purpose::UsersGroup => Action::SetUsersGroup(value(0)),
         }
     }
 

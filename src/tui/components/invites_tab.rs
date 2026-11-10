@@ -89,13 +89,17 @@ impl InvitesTab {
     }
 
     pub fn hints(&self) -> Vec<Hint> {
-        match self.selected_invite() {
+        let mut hints = match self.selected_invite() {
             Some(invite) if invite.state == InviteState::Open => {
                 vec![("Enter", "show"), ("c", "copy link"), ("x", "cancel")]
             }
             Some(_) => vec![("Enter", "details")],
             None => Vec::new(),
+        };
+        if self.enabled {
+            hints.push(("P", "where passwords go"));
         }
+        hints
     }
 
     /// An invite's row in a list `width` wide. The holder has a column as wide as the longest,
@@ -159,6 +163,7 @@ impl Component for InvitesTab {
             KeyCode::Enter => return selected.map(Action::ShowInvite),
             KeyCode::Char('c') => return open.map(Action::CopyInvite),
             KeyCode::Char('x') => return open.map(Action::AskCancelInvite),
+            KeyCode::Char('P') if self.enabled => return Some(Action::AskPasswordDelivery),
             _ => {}
         }
         None

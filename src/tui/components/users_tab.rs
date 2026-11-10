@@ -67,6 +67,7 @@ impl UsersTab {
             hints.push(("c", "change password"));
             hints.push(("d", "delete"));
         }
+        hints.push(("g", "who reads the files"));
         hints
     }
 }
@@ -75,6 +76,7 @@ impl Component for UsersTab {
     fn handle_key_event(&mut self, key: KeyEvent) -> Option<Action> {
         match key.code {
             KeyCode::Char('n') => return Some(Action::AskNewUser),
+            KeyCode::Char('g') => return Some(Action::AskUsersGroup),
             KeyCode::Char('c') => {
                 return self
                     .selected()
