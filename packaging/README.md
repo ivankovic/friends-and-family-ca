@@ -43,6 +43,15 @@ certificates for any name - `CN=Anna (phone),OU=people` - that are in no ledger,
 serial cannot reach them, and the only cure is a new CA and every device enrolled again. Keep the
 backups encrypted, and snapshots of the folder as private as the folder.
 
+**Or encrypt the key to the machine.** On the **CA** tab, `K` (or `sudo ffca key encrypt`) has
+`systemd-creds` encrypt it: `ca.key.cred` replaces `ca.key`, and the refresh timer still signs
+unattended. On a machine with a TPM, a copy of the disk is then not the key; without one, the
+folder and systemd's own key, `/var/lib/systemd/credential.secret`, together are - keep that
+file out of the backups the folder is in. No other machine can read the encrypted key, so **copy
+the plain `ca.key` somewhere offline first**: it is what a restore on another machine needs. `K`
+again (or `sudo ffca key decrypt`) puts the plain file back, before a move. Backups and snapshots
+made earlier still hold the plain key.
+
 ## 3. Tell it where nginx is
 
 On the **Nginx** tab, press `e`. Each field starts from a default; Ctrl-U clears one, and Ctrl-S
@@ -100,7 +109,13 @@ Pressing `w` again later keeps whatever block another tool wrote into the file. 
 paths, `/i/` and `/d/`, on the enrollment site from the filter, as you would `/.well-known/`: chat
 apps fetch a link to preview it, and Android's download manager fetches the `.p12` without the
 headers a browser sends, and a filter turns both away. A preview does not use the invite up - only
-pressing the button does.
+pressing the button does - and the page itself shows a preview, a scanner or a script nothing of
+the invite: a page that says the link is for a person, with a button for a person it took for a
+program.
+
+The site caps request bodies at 1k and sends `Strict-Transport-Security`. An `add_header` in a
+`server` block replaces those inherited from `http`, so headers you set there for every site are
+not sent on this one; the page sends its own.
 
 If no site on the enrollment site's `listen` address is marked `default_server`, nginx takes the
 first one it reads as the default, and `ffca-enrollment.conf` sorts early: requests for an unknown
@@ -115,7 +130,9 @@ On the **CA** tab, press `T`. It writes `ffca-crl-refresh.service` and `.timer` 
 `make install` put in `/usr/local/bin`: the timer runs it as root, so ffca refuses a binary, or a
 folder, that anyone but root could change. Every hour, the timer re-signs the revocation list (valid
 for 30 days), records collected invites, revokes the certificates of invites that expired
-uncollected, and reloads nginx with the result. The CA tab shows whether it runs; so does
+uncollected, and reloads nginx with the result. The service runs as root with what it has no use
+for taken away (new privileges, the shared `/tmp`, kernel modules); after an update, `T` again
+writes the units as that version has them. The CA tab shows whether it runs; so does
 
 ```sh
 systemctl list-timers ffca-crl-refresh.timer
@@ -126,18 +143,25 @@ systemctl list-timers ffca-crl-refresh.timer
 On **People & agents**, press `p` for a new person (`n` adds a device to the selected one). The
 invite's QR code and link appear: scan it with the device, or send it the link - `c` puts the link
 on the clipboard of the terminal you sit at, if it allows that (most do, over SSH and in tmux
-too). The link works once, for 24 hours. The code fits an 80 by 24 terminal.
+too). The link works once, for 24 hours. The code fits an 80 by 24 terminal; a link longer than
+the terminal is wide is shown over two rows.
 
-* **iPhone, iPad**: open the link, press the button, download the profile, then in Settings tap
-  *Profile Downloaded* and *Install*.
+* **iPhone, iPad**: open the link in Safari - a chat app's own browser cannot install it - press
+  the button, download the profile, then in Settings tap *Profile Downloaded* and *Install*.
 * **Android, Boox**: open the link, press the button, download the `.p12` and install it with
   the password the page shows.
 * **Firefox, Chrome, Edge, other computers**: the same `.p12`, imported in the browser's or the
   system's certificate settings.
 
-The page puts the download for the device that opened it first. Once a site requires
-certificates (step 8), every invite made after that ends with a link to it, *Check that it
-works*: if the site opens, the certificate is installed.
+The page puts the download for the device that opened it first, and can be reloaded, or come
+back to, for ten minutes after the button is pressed. Once a site requires certificates (step
+8), every invite made after that ends with a link to it, *Check that it works*: if the site
+opens, the certificate is installed.
+
+**To send the password yourself**, press `P` on the **Invites** tab: invites made from then on
+keep it off the page. Each shows it to you beside the link - `p` copies it - to send another way
+than the link: a call, another chat. Whoever gets hold of the link alone then has a file they
+cannot open. `P` again puts passwords back on the page.
 
 Until a device collects its invite, People & agents marks it `◌ invite open`; its details then say
 when it was collected, and from where. The **Invites** tab shows each invite: open, collected,
@@ -169,8 +193,18 @@ log_format clients '$remote_addr [$time_local] "$request" $status "$ssl_client_s
 
 ## Revoking
 
-On **People & agents**, select a device, an agent or a person and press `r`. The new revocation
-list reaches nginx at once.
+On **People & agents**, select a device, an agent or a person and press `r`. The dialog lists
+what goes and what stays; a whole person takes Enter and then `y`. The new revocation list
+reaches nginx at once, and a revocation cannot be undone: `u` renews - after asking - with a new
+certificate and invite.
+
+## HTTP logins' password files
+
+For a site whose HTTP login is on, nginx reads a password file ffca writes beside the CA's
+certificate. Every user of the machine can read those files unless you name the group nginx's
+workers run as: on the **Users** tab, press `g` and give its number - 101 in nginx's own container
+image; `id -g nginx` or `id -g www-data` for one installed on the host. The files are then that
+group's only.
 
 ## Updating
 
@@ -178,6 +212,9 @@ list reaches nginx at once.
 cd friends-and-family-ca && git pull && make install
 sudo docker compose up -d --build ffca
 ```
+
+Then, in `sudo ffca`: `w` on the **Nginx** tab and `T` on the **CA** tab write the enrollment site
+and the timer's units as the new version has them; each shows what it writes first.
 
 ## Undoing it
 

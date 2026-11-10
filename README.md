@@ -13,20 +13,20 @@ commands on their own device. Friends and Family CA is made for one administrato
 people who should never need to: you run a terminal UI over SSH, and they scan a QR code.
 
 ```
- Friends and Family CA · Domaci                                  CRL valid until 8 Dec 2026
- People & agents · 1 expiring │ Invites │ Nginx │ Users │ CA
-╭───────────────────────────────────╮╭─────────────────────────────────────────────────────╮
-│▾ Anna                             ││ Anna · phone                                        │
-│  ● phone          until 2028      ││                                                     │
-│  ● laptop         until 2028      ││ Current   678ea0c1   valid until 7 Nov 2028         │
-│▾ Ben                              ││           issued 8 Nov 2026                         │
-│  ✕ tablet         retired         ││           CN=Anna (phone),OU=people                 │
-│▾ Agents                           ││ Earlier   53ac3a73   revoked 8 Nov 2026 · replaced  │
-│  ● backup         until 2028      ││                                                     │
-│  ◐ monitoring     expires in 11 d ││                                                     │
-╰───────────────────────────────────╯╰─────────────────────────────────────────────────────╯
+ Friends and Family CA · Domaci                                CRL valid until 8 Dec 2026
+ People & agents · 1 expiring │ Invites │ Nginx │ Users │ CA   Tab switch  ? help  q quit
+╭─────────────────────────────╮╭────────────────────────────────────────────────────────╮
+│ Anna                        ││ Anna · phone                                           │
+│  ● phone          until 2028││                                                        │
+│  ● laptop         until 2028││ Current   678ea0c1   valid until 7 Nov 2028            │
+│ Ben                         ││           issued 8 Nov 2026                            │
+│  ✕ tablet         retired   ││           CN=Anna (phone),OU=people                    │
+│ Agents                      ││ Earlier   53ac3a73   revoked 8 Nov 2026 · replaced     │
+│  ● backup         until 2028││                                                        │
+│  ◐ monitoring     11 d left ││                                                        │
+╰─────────────────────────────╯╰────────────────────────────────────────────────────────╯
 
- p new person  n new device  a new agent  u renew  r revoke  R rename  ? help  q quit
+ p new person  n new device  a new agent  u renew  r revoke  R rename  / filter
 ```
 
 # What it does
@@ -37,6 +37,8 @@ people who should never need to: you run a terminal UI over SSH, and they scan a
 * **Invites.** A new device gets a link, shown as a QR code, that works once for a day. It opens
   the enrollment page, which hands the device its certificate - a profile for iPhone and iPad, a
   `.p12` and its password for Android, Windows, macOS and the browsers - with how to install it.
+  If you would rather, the password stays off the page and you send it yourself, another way than
+  the link: the link alone then opens nothing.
 * **nginx.** The Nginx tab lists your HTTPS sites and sets each to ask for no certificate, accept
   one, or require one. Every change is shown first, tested with `nginx -t`, and put back if nginx
   refuses it. It also writes the enrollment site.
@@ -51,12 +53,15 @@ certificate signing request, so their key never leaves their machine.
 
 * **The CA's key stays on the host**, readable by root only, with the ledger of every certificate
   issued. All files are standard PEM and TOML: `openssl` can take over, and a person can read them.
+  The key can instead be encrypted to the machine (`systemd-creds`, with its TPM where it has
+  one), so that a copy of the folder alone signs nothing.
 * **The enrollment page** (`ffca serve`), the only part that faces the internet, runs in a
   container next to nginx, as nobody, with the invites folder and nothing else. It cannot issue
   anything: it hands over an invite the administrator made, once.
 * **An invite's link carries a 256-bit secret.** The invite is sealed with a key derived from it,
   and its file is named after the secret's hash, so the folder alone reveals nothing. Opening the
-  link does not use it up - chat apps fetch links to preview them - only pressing the button does.
+  link does not use it up - chat apps fetch links to preview them - only pressing the button does,
+  and a preview is shown nothing of the invite, not even whose it is.
 * **Certificates are ECDSA P-256**, for client authentication only, with subjects nginx can log and
   match: `CN=Anna (phone),OU=people`, `CN=backup,OU=agents`.
 
