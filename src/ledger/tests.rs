@@ -178,6 +178,21 @@ fn names_must_be_printable_and_short() {
             .to_string()
             .contains("control character")
     );
+    for hidden in [
+        "An\u{200B}na",
+        "\u{202E}annA",
+        "Anna\u{FEFF}",
+        "An\u{00AD}na",
+    ] {
+        assert!(
+            try_person(hidden)
+                .unwrap()
+                .to_string()
+                .contains("does not show"),
+            "{hidden:?}"
+        );
+    }
+    assert!(try_person("Čedo Žužić 王").is_none());
     assert!(
         try_person(&"a".repeat(65))
             .unwrap()

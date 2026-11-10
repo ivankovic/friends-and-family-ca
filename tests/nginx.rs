@@ -701,6 +701,7 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         host: "k.example.test".into(),
         upstream: format!("http://127.0.0.1:{}", serve.port),
         user: config::default_page_user(),
+        password: Default::default(),
     };
     Config {
         nginx: Some(settings.clone()),
@@ -726,10 +727,21 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
     )
     .unwrap();
 
-    // Opening the link: the enrollment site asks for no certificate.
+    // Opening the link: the enrollment site asks for no certificate. nginx passes on what a
+    // browser says of itself, which is how the page tells a person from a preview.
+    let browser = [
+        "-A",
+        "Mozilla/5.0 (X11; Linux x86_64; rv:132.0) Gecko/20100101 Firefox/132.0",
+        "-H",
+        "Accept: text/html,application/xhtml+xml,*/*;q=0.8",
+        "-H",
+        "Sec-Fetch-Mode: navigate",
+        "-H",
+        "Sec-Fetch-Dest: document",
+    ];
     let deadline = Instant::now() + RELOAD_TIMEOUT;
     let page = loop {
-        let (status, body) = fetch(&nginx, &made.link, &[]);
+        let (status, body) = fetch(&nginx, &made.link, &browser);
         if status == 200 {
             break String::from_utf8(body).unwrap();
         }
@@ -740,14 +752,18 @@ fn an_invite_through_nginx_gets_a_device_into_a_protected_site() {
         std::thread::sleep(Duration::from_millis(100));
     };
     assert!(page.contains("A certificate for Anna (phone)"), "{page}");
+    let (status, preview) = fetch_through(&nginx, &made.link, &[]);
+    assert_eq!(status, 403, "curl, as itself, is a program");
+    assert!(!String::from_utf8_lossy(&preview).contains("Anna"));
     until(
         || fetch(&nginx, "https://books.example.test/", &[]).0 == 400,
         "the protected site wants a certificate",
     );
 
-    // The button. A refusal by nginx itself (a worker from before the enrollment site existed)
-    // never reached the page, so it used nothing up: ask again.
-    let (status, body) = fetch_through(&nginx, &made.link, &["-X", "POST"]);
+    // The button, and the page it sends the browser on to. A refusal by nginx itself (a worker
+    // from before the enrollment site existed) never reached the page, so it used nothing up:
+    // ask again.
+    let (status, body) = fetch_through(&nginx, &made.link, &["-d", "", "-L"]);
     assert_eq!(status, 200);
     let page = String::from_utf8(body).unwrap();
     let password = page

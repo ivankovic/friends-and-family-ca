@@ -29,6 +29,14 @@
 //!   extend an invite without breaking it.
 //! * Collecting is a rename of the file, which only one request can win; the page then writes a
 //!   receipt - when, from where, on what - and deletes the file. A second click finds nothing.
+//! * The `.p12`'s password is in the sealed file, for the page to show - or, when the
+//!   administrator sends it another way ([`Delivery::Separate`]), only in the ledger, for the UI to
+//!   show: the link alone then hands over a file nobody can open.
+//!
+//! The page reads an invite with the token a visitor brings, so a page that someone has taken
+//! over can copy each certificate and key it is asked for, and still hand them on: that is the
+//! price of generating a device's key for it. It cannot reach an invite nobody opens, and with
+//! the password sent separately what it copies stays locked.
 //!
 //! Whatever needs the key happens on the CA's side, in [`tend`], which the UI and `crl-refresh`
 //! run: receipts go into the ledger, and an invite that expired, was cancelled or whose holder was
@@ -66,7 +74,9 @@ pub struct Payload {
     pub ca: String,
     pub holder: String,
     pub stem: String,
-    pub password: String,
+    /// The `.p12`'s password, for the page to show; none when it is sent another way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
     #[serde(with = "base64_bytes")]
     pub p12: Vec<u8>,
     #[serde(with = "base64_bytes")]
@@ -103,6 +113,29 @@ pub enum Unavailable {
     /// Collected, cancelled, or never made.
     Gone,
     Expired,
+    /// Not a token at all: a link cut short on its way, or mistyped.
+    Malformed,
+}
+
+/// How the `.p12`'s password reaches the person.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Delivery {
+    /// The enrollment page shows it beside the downloads.
+    #[default]
+    Page,
+    /// The administrator sends it another way - a call, another chat - and the page only says
+    /// so: whoever has the link alone gets a file they cannot open.
+    Separate,
+}
+
+/// What an invite is made with, beyond whom it is for.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Options<'a> {
+    /// The address of a site the page sends the person to once the certificate is installed, to
+    /// see that it works.
+    pub check: Option<&'a str>,
+    pub password: Delivery,
 }
 
 /// A new invite: the link to send, and what the ledger now records.
@@ -129,17 +162,17 @@ pub fn make(
     host: &str,
     now: OffsetDateTime,
 ) -> Result<Made> {
-    make_with_check(ca, folder, holder, host, None, now)
+    make_with(ca, folder, holder, host, Options::default(), now)
 }
 
-/// As [`make`], with `check` the address of a site the page sends the person to once the
-/// certificate is installed, to see that it works.
-pub fn make_with_check(
+/// As [`make`], with `options`. A password sent separately is kept in the ledger while the
+/// invite is open, and nowhere the enrollment page can read.
+pub fn make_with(
     ca: &Ca,
     folder: &Path,
     holder: Holder,
     host: &str,
-    check: Option<&str>,
+    options: Options,
     now: OffsetDateTime,
 ) -> Result<Made> {
     prepare_folder(folder)?;
@@ -159,14 +192,18 @@ pub fn make_with_check(
             p12,
             mobileconfig,
         } = bundle::make(ca, &issued, &stem)?;
+        let (shown, kept) = match options.password {
+            Delivery::Page => (Some(password), None),
+            Delivery::Separate => (None, Some(password)),
+        };
         let payload = Payload {
             ca: ca.name().to_owned(),
             holder,
             stem,
-            password,
+            password: shown,
             p12,
             mobileconfig,
-            check: check.map(str::to_owned),
+            check: options.check.map(str::to_owned),
         };
         let token = random_token()?;
         let now = issued.certificate.not_before + crate::ca::BACKDATE;
@@ -180,6 +217,7 @@ pub fn make_with_check(
             state: InviteState::Open,
             closed: None,
             collected_by: None,
+            password: kept,
         };
         // Recorded before the file is written, under one lock: a crash in between leaves an open
         // invite without a file, which `tend` cancels, revoking its certificate. The other order
@@ -205,7 +243,7 @@ pub fn make_with_check(
 
 /// Reads the invite for `token` without collecting it: what the page shows before the button.
 pub fn open(folder: &Path, token: &str, now: OffsetDateTime) -> Result<Payload, Unavailable> {
-    let id = id(token).ok_or(Unavailable::Gone)?;
+    let id = id(token).ok_or(Unavailable::Malformed)?;
     let text = read_invite(&folder.join(format!("{id}.invite")))?;
     unseal(&text, token, &id, now)
 }
@@ -217,7 +255,7 @@ pub fn collect(
     now: OffsetDateTime,
     by: &str,
 ) -> Result<Payload, Unavailable> {
-    let id = id(token).ok_or(Unavailable::Gone)?;
+    let id = id(token).ok_or(Unavailable::Malformed)?;
     let file = folder.join(format!("{id}.invite"));
     let claimed = folder.join(format!("{id}.claimed"));
     let text = read_invite(&file)?;
@@ -343,6 +381,7 @@ pub fn tend(ca: &Ca, folder: &Path, now: OffsetDateTime) -> Result<Tended> {
             let receipt_file = folder.join(format!("{id}.collected"));
             let mut close = |invite: &mut Invite, state| {
                 invite.state = state;
+                invite.password = None;
                 invite.closed = Some(now);
                 tended.closed.push(invite.holder.clone());
             };
@@ -361,6 +400,7 @@ pub fn tend(ca: &Ca, folder: &Path, now: OffsetDateTime) -> Result<Tended> {
                 match read_receipt(&receipt_file) {
                     Ok(Some(receipt)) => {
                         invite.state = InviteState::Collected;
+                        invite.password = None;
                         invite.closed = Some(receipt.at);
                         invite.collected_by = Some(receipt.by);
                         tended.collected.push(invite.holder.clone());

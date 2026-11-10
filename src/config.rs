@@ -64,6 +64,10 @@ pub struct Enrollment {
     /// read invites and delete them once collected.
     #[serde(default = "default_page_user")]
     pub user: String,
+    /// How a `.p12`'s password reaches the person: on the page, or sent by the administrator
+    /// another way, so that the link alone opens nothing.
+    #[serde(default)]
+    pub password: crate::invite::Delivery,
 }
 
 pub fn default_upstream() -> String {
@@ -195,6 +199,7 @@ mod tests {
                 host: "k.domaci.ivankovic.me".into(),
                 upstream: default_upstream(),
                 user: default_page_user(),
+                password: crate::invite::Delivery::Separate,
             }),
         };
         config.save(&store).unwrap();

@@ -123,7 +123,79 @@ fn the_folder_alone_reveals_nothing() {
         Err(Unavailable::Gone),
         "another token opens nothing"
     );
-    assert_eq!(open(&folder, "not a token", NOW), Err(Unavailable::Gone));
+    assert_eq!(
+        open(&folder, "not a token", NOW),
+        Err(Unavailable::Malformed)
+    );
+    assert_eq!(
+        collect(&folder, &token[..42], NOW, "x"),
+        Err(Unavailable::Malformed),
+        "a link cut short is not an invite someone used"
+    );
+}
+
+/// A password sent apart from the link is in the ledger while the invite is open - the UI shows
+/// it - and in nothing the page can read; once the invite is closed it is kept nowhere.
+#[test]
+fn a_password_sent_separately_is_kept_by_the_ca_only_while_the_invite_is_open() {
+    let dir = crate::test_dir();
+    let ca = ca(dir.path());
+    let folder = dir.path().join("invites");
+    let separate = Options {
+        password: Delivery::Separate,
+        ..Default::default()
+    };
+    let made = make_with(&ca, &folder, ANNA_PHONE, "k.example.org", separate, NOW).unwrap();
+    let password = made.invite.password.clone().unwrap();
+    assert_eq!(ca.ledger().unwrap().invites[0].password, Some(password));
+    assert_eq!(open(&folder, &token(&made), NOW).unwrap().password, None);
+
+    let on_the_page = make(
+        &ca,
+        &folder,
+        Holder::Device {
+            person: "Anna",
+            device: "laptop",
+        },
+        "k.example.org",
+        NOW,
+    )
+    .unwrap();
+    assert_eq!(on_the_page.invite.password, None);
+    let shown = open(&folder, &token(&on_the_page), NOW).unwrap().password;
+    assert_eq!(shown.map(|p| p.len()), Some(19));
+
+    collect(&folder, &token(&made), NOW, "203.0.113.7, iPhone").unwrap();
+    tend(&ca, &folder, NOW).unwrap();
+    let invite = ca.ledger().unwrap().invites[0].clone();
+    assert_eq!(
+        (invite.state, invite.password),
+        (InviteState::Collected, None)
+    );
+
+    let expired = make_with(
+        &ca,
+        &folder,
+        Holder::Device {
+            person: "Ben",
+            device: "tablet",
+        },
+        "k.example.org",
+        separate,
+        NOW,
+    )
+    .unwrap();
+    tend(&ca, &folder, NOW + VALIDITY).unwrap();
+    let ledger = ca.ledger().unwrap();
+    let invite = ledger
+        .invites
+        .iter()
+        .find(|i| i.serial == expired.invite.serial)
+        .unwrap();
+    assert_eq!(
+        (invite.state, &invite.password),
+        (InviteState::Expired, &None)
+    );
 }
 
 #[test]

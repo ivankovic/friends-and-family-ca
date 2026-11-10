@@ -354,7 +354,9 @@ fn encode(response: &Response) -> Vec<u8> {
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        303 => "See Other",
         400 => "Bad Request",
+        403 => "Forbidden",
         404 => "Not Found",
         410 => "Gone",
         411 => "Length Required",

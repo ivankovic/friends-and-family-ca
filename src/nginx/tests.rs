@@ -519,6 +519,7 @@ fn enrollment(upstream: &str) -> config::Enrollment {
         host: "k.example.org".into(),
         upstream: upstream.into(),
         user: config::default_page_user(),
+        password: Default::default(),
     }
 }
 

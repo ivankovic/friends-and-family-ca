@@ -80,6 +80,10 @@ pub struct Invite {
     /// Where it was collected from, as the enrollment page saw it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub collected_by: Option<String>,
+    /// The `.p12`'s password, when the administrator sends it apart from the link: kept while
+    /// the invite is open, so the UI can show it again, and never where the page can read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -558,10 +562,32 @@ fn checked_name_with<'a>(what: &str, name: &'a str, holder: bool) -> Result<&'a 
         "the {what} contains a control character"
     );
     ensure!(
+        !name.chars().any(invisible),
+        "the {what} contains a character that does not show - a zero-width one, or one that \
+         turns the writing direction - and would make two names look the same"
+    );
+    ensure!(
         !holder || !name.contains(['(', ')']),
         "the {what} cannot contain parentheses: they mark the device in a certificate's name"
     );
     Ok(name)
+}
+
+/// Whether `c` takes no room on a screen or reorders what is around it: zero-width characters,
+/// the marks and overrides of writing direction, and the byte-order mark. A name with one reads
+/// as another name does, in the UI and in a log.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
 }
 
 /// A certificate serial number: 16 random bytes, the top bit clear so the DER integer is positive.

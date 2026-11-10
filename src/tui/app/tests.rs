@@ -546,6 +546,7 @@ fn with_nginx(
             host: host.into(),
             upstream: config::default_upstream(),
             user: config::default_page_user(),
+            password: Default::default(),
         }),
     }
     .save(&fixture.store)
@@ -973,6 +974,7 @@ fn w_writes_the_enrollment_site_after_showing_it() {
             host: "k.example.org".into(),
             upstream: "http://ffca:8080".into(),
             user: config::default_page_user(),
+            password: Default::default(),
         }),
     }
     .save(&fixture.store)

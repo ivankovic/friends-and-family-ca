@@ -605,6 +605,12 @@ impl App {
                     host: config::checked_host(host)?,
                     upstream: config::checked_upstream(upstream)?,
                     user: user.trim().to_owned(),
+                    password: self
+                        .config
+                        .enrollment
+                        .as_ref()
+                        .map(|e| e.password)
+                        .unwrap_or_default(),
                 }),
             };
             if let Some(enrollment) = &enrollment {
@@ -928,12 +934,16 @@ impl App {
             (&selection, self.config.enrollment.clone())
         {
             let check = self.check_site();
-            match invite::make_with_check(
+            let options = invite::Options {
+                check: check.as_deref(),
+                password: enrollment.password,
+            };
+            match invite::make_with(
                 &self.ca,
                 &invite::dir(self.ca.store()),
                 holder,
                 &enrollment.host,
-                check.as_deref(),
+                options,
                 self.now,
             ) {
                 Ok(made) => {
